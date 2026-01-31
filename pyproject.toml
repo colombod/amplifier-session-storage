@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "amplifier-session-storage"
+version = "0.1.0"
+description = "Session storage system for Amplifier with local and Cosmos DB backends"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "Amplifier Team" }
+]
+keywords = ["amplifier", "session", "storage", "cosmos"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "aiofiles>=23.0.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0.0",
+]
+
+[project.optional-dependencies]
+# Cosmos DB support (azure-cosmos + azure-identity for AAD auth)
+cosmos = [
+    "azure-cosmos>=4.5.0",
+    "azure-identity>=1.15.0",
+    "aiohttp>=3.9.0",  # Required for async Azure identity
+]
+# Full installation (all optional features)
+all = [
+    "amplifier-session-storage[cosmos]",
+]
+dev = [
+    "amplifier-session-storage[cosmos]",
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+    "pyright>=1.1.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["amplifier_session_storage"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportMissingImports = true
+reportMissingTypeStubs = false
+reportMissingModuleSource = false
+# Ignore files with missing type stubs
+ignore = ["**/cosmos.py", "tests/**"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

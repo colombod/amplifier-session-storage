@@ -154,12 +154,59 @@ class SessionStore:
             project_slug: Project identifier. Used if base_dir is None.
                          Defaults to "default" if not provided.
         """
+        self.project_slug = project_slug or "default"
+
         if base_dir is None:
-            project = project_slug or "default"
-            base_dir = Path.home() / ".amplifier" / "projects" / project / "sessions"
+            base_dir = Path.home() / ".amplifier" / "projects" / self.project_slug / "sessions"
 
         self.base_dir = Path(base_dir).expanduser()
         self.base_dir.mkdir(parents=True, exist_ok=True)
+
+    def _normalize_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        """Ensure metadata has all required fields with defaults.
+
+        This ensures parity between local storage and Cosmos DB schema.
+        Missing fields are set to sensible defaults.
+
+        Args:
+            metadata: Input metadata dictionary
+
+        Returns:
+            Normalized metadata with all required fields
+        """
+        now = datetime.now(UTC).isoformat(timespec="milliseconds")
+
+        # Required fields with defaults
+        normalized = {
+            "session_id": metadata.get("session_id", ""),
+            "project_slug": metadata.get("project_slug", self.project_slug),
+            "created": metadata.get("created", now),
+            "updated": metadata.get("updated", now),
+            "turn_count": metadata.get("turn_count", 0),
+            "message_count": metadata.get("message_count", 0),
+            "event_count": metadata.get("event_count", 0),
+        }
+
+        # Optional fields (only include if present or explicitly set)
+        optional_fields = [
+            "name",
+            "description",
+            "bundle",
+            "model",
+            "parent_id",
+            "forked_from_turn",
+            "tags",
+        ]
+        for field in optional_fields:
+            if field in metadata:
+                normalized[field] = metadata[field]
+
+        # Preserve any additional fields from the input
+        for key, value in metadata.items():
+            if key not in normalized:
+                normalized[key] = value
+
+        return normalized
 
     def _validate_session_id(self, session_id: str) -> None:
         """Validate session ID to prevent path traversal attacks.
@@ -195,11 +242,17 @@ class SessionStore:
         session_dir = self.base_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
 
+        # Ensure session_id is in metadata
+        metadata["session_id"] = session_id
+
+        # Normalize metadata to ensure all required fields are present
+        normalized_metadata = self._normalize_metadata(metadata)
+
         # Save transcript with atomic write
         self._save_transcript(session_dir, transcript)
 
         # Save metadata with atomic write
-        self._save_metadata(session_dir, metadata)
+        self._save_metadata(session_dir, normalized_metadata)
 
         logger.debug(f"Session {session_id} saved successfully")
 

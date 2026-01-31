@@ -14,13 +14,25 @@ A block-based session storage system for Amplifier with local and Cosmos DB back
 
 ```bash
 # Basic installation (local storage only)
-pip install amplifier-session-storage
+uv pip install git+https://github.com/colombod/amplifier-session-storage
 
 # With Cosmos DB support (includes azure-identity for AAD auth)
-pip install amplifier-session-storage[cosmos]
+uv pip install "amplifier-session-storage[cosmos] @ git+https://github.com/colombod/amplifier-session-storage"
 
-# Full installation
-pip install amplifier-session-storage[all]
+# With real-time sync support
+uv pip install "amplifier-session-storage[sync] @ git+https://github.com/colombod/amplifier-session-storage"
+
+# Full installation (all features)
+uv pip install "amplifier-session-storage[all] @ git+https://github.com/colombod/amplifier-session-storage"
+```
+
+### Development Setup
+
+```bash
+git clone https://github.com/colombod/amplifier-session-storage
+cd amplifier-session-storage
+uv sync --all-extras
+uv run pytest tests/ -v
 ```
 
 ## Quick Start

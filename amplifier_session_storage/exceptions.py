@@ -18,13 +18,35 @@ class SessionStorageError(Exception):
 class SessionNotFoundError(SessionStorageError):
     """Raised when a session is not found."""
 
-    def __init__(self, session_id: str, user_id: str | None = None):
-        details = {"session_id": session_id}
-        if user_id:
-            details["user_id"] = user_id
-        super().__init__(f"Session not found: {session_id}", details)
-        self.session_id = session_id
+    def __init__(self, message_or_session_id: str, user_id: str | None = None):
+        # Support both simple message and structured session_id
+        if user_id is not None or not message_or_session_id.startswith("Session"):
+            # Structured form: session_id passed directly
+            session_id = message_or_session_id
+            details = {"session_id": session_id}
+            if user_id:
+                details["user_id"] = user_id
+            super().__init__(f"Session not found: {session_id}", details)
+            self.session_id = session_id
+        else:
+            # Simple message form: message passed directly
+            super().__init__(message_or_session_id, {})
+            # Try to extract session_id from message
+            self.session_id = message_or_session_id.replace("Session '", "").replace(
+                "' not found", ""
+            )
         self.user_id = user_id
+
+
+class SessionValidationError(SessionStorageError):
+    """Raised when session validation fails (e.g., invalid session_id)."""
+
+    def __init__(self, message: str, field: str | None = None):
+        details = {}
+        if field:
+            details["field"] = field
+        super().__init__(message, details)
+        self.field = field
 
 
 class SessionExistsError(SessionStorageError):

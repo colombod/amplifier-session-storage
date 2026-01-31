@@ -1,56 +1,54 @@
 """
 Amplifier Session Storage
 
-A block-based session storage system for Amplifier with:
-- Event-sourced session blocks for efficient sync
-- Local file-based storage for offline operation
+A session storage system for Amplifier with:
+- Drop-in compatible SessionStore for amplifier-app-cli
+- Local file-based storage (same format as session-analyst expects)
 - Cosmos DB cloud storage for multi-tenant persistence
+- Block-based sync for efficient multi-device operation
 - Identity management for user/org/team access control
-- Migration tools for existing sessions
 
-Architecture Overview:
-    Sessions are stored as streams of immutable blocks:
-    - SESSION_CREATED: Initial session metadata
-    - SESSION_UPDATED: Metadata changes
-    - MESSAGE: Conversation messages
-    - EVENT: Tool calls, LLM responses, etc.
-    - EVENT_CHUNK: Large event continuations
-    - REWIND: History truncation markers
+PRIMARY API (Compatible with amplifier-app-cli):
 
-    This design enables:
-    - Efficient sync (only new blocks transferred)
-    - Offline-first operation (local + cloud)
-    - Multi-device support (sequence-based merging)
-    - Team visibility (access control at block level)
+    >>> from amplifier_session_storage import SessionStore
+    >>> store = SessionStore()  # Uses ~/.amplifier/projects/default/sessions/
+    >>> store.save(session_id, transcript, metadata)
+    >>> transcript, metadata = store.load(session_id)
 
-Basic Usage:
+    This SessionStore is a drop-in replacement for amplifier-app-cli's
+    SessionStore and maintains full compatibility with session-analyst.
+
+Events Logging:
+
+    >>> from amplifier_session_storage import EventsLog
+    >>> with EventsLog(session_dir, session_id) as log:
+    ...     log.append_session_start(bundle="foundation")
+    ...     log.append_llm_request(model="claude-sonnet", message_count=5)
+
+BLOCK-BASED API (For sync operations):
+
     >>> from amplifier_session_storage import LocalBlockStorage, StorageConfig
     >>> config = StorageConfig(user_id="user-123")
     >>> storage = LocalBlockStorage(config)
     >>> # Write blocks via BlockWriter, read via storage.read_blocks()
 
 Cloud Storage:
+
     >>> from amplifier_session_storage import CosmosBlockStorage, StorageConfig
     >>> config = StorageConfig(
     ...     user_id="user-123",
     ...     cosmos_endpoint="https://example.cosmos.azure.com",
-    ...     cosmos_key="secret-key",
     ... )
     >>> storage = CosmosBlockStorage(config)
 
 Identity Management:
+
     >>> from amplifier_session_storage import IdentityContext
     >>> IdentityContext.initialize()
     >>> user_id = IdentityContext.get_user_id()
-
-Migration from Legacy Format:
-    >>> from amplifier_session_storage import SessionMigrator, LocalBlockStorage
-    >>> storage = LocalBlockStorage(config)
-    >>> migrator = SessionMigrator(storage, user_id="user-123")
-    >>> sources = await migrator.discover_sessions(Path("~/.amplifier/sessions"))
-    >>> batch = await migrator.migrate_batch(sources)
 """
 
+# Local storage - compatible with amplifier-app-cli and session-analyst
 # Blocks module - session block types and utilities
 # Analyst module - session query and analysis
 from .analyst import SessionAnalyst, SessionQuery, SessionSummary
@@ -74,6 +72,13 @@ from .identity import (
     IdentityContext,
     IdentityProvider,
     UserIdentity,
+)
+from .local import (
+    EventsLog,
+    SessionStore,
+    extract_session_mode,
+    is_top_level_session,
+    read_events_summary,
 )
 
 # Migration module - legacy session migration
@@ -105,6 +110,12 @@ from .storage import (
 from .sync import SyncClient, SyncEvent, SyncEventType, SyncHandler, SyncServer
 
 __all__ = [
+    # Primary API - compatible with amplifier-app-cli
+    "SessionStore",
+    "EventsLog",
+    "read_events_summary",
+    "is_top_level_session",
+    "extract_session_mode",
     # Identity
     "IdentityProvider",
     "UserIdentity",

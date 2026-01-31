@@ -156,10 +156,13 @@ cosmos = [
     { name = "azure-cosmos" },
     { name = "azure-identity" },
 ]
-dev = [
+sync = [
     { name = "aiohttp" },
-    { name = "azure-cosmos" },
-    { name = "azure-identity" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "amplifier-session-storage", extra = ["cosmos", "sync"] },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -171,19 +174,24 @@ dev = [
 requires-dist = [
     { name = "aiofiles", specifier = ">=23.0.0" },
     { name = "aiohttp", marker = "extra == 'cosmos'", specifier = ">=3.9.0" },
-    { name = "amplifier-session-storage", extras = ["cosmos"], marker = "extra == 'all'" },
-    { name = "amplifier-session-storage", extras = ["cosmos"], marker = "extra == 'dev'" },
+    { name = "aiohttp", marker = "extra == 'sync'", specifier = ">=3.9.0" },
+    { name = "amplifier-session-storage", extras = ["cosmos", "sync"], marker = "extra == 'all'" },
     { name = "azure-cosmos", marker = "extra == 'cosmos'", specifier = ">=4.5.0" },
     { name = "azure-identity", marker = "extra == 'cosmos'", specifier = ">=1.15.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
-    { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
-    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "pyyaml", specifier = ">=6.0.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
 ]
-provides-extras = ["cosmos", "all", "dev"]
+provides-extras = ["cosmos", "sync", "all"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "amplifier-session-storage", extras = ["cosmos", "sync"] },
+    { name = "pyright", specifier = ">=1.1.0" },
+    { name = "pytest", specifier = ">=8.0.0" },
+    { name = "pytest-asyncio", specifier = ">=0.23.0" },
+    { name = "pytest-cov", specifier = ">=4.0.0" },
+    { name = "ruff", specifier = ">=0.4.0" },
+]
 
 [[package]]
 name = "annotated-types"

@@ -8,7 +8,7 @@ and offline-first usage.
 import platform
 import socket
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +57,7 @@ class ConfigFileIdentityProvider(IdentityProvider):
         if self._identity is not None:
             # Update last_seen on the device
             if self._identity.device:
-                self._identity.device.last_seen = datetime.utcnow()
+                self._identity.device.last_seen = datetime.now(UTC)
             return self._identity
 
         # Load config
@@ -72,8 +72,8 @@ class ConfigFileIdentityProvider(IdentityProvider):
             device_id=device_id,
             device_name=identity_config.get("device_name", self._get_hostname()),
             os_type=self._get_os_type(),
-            first_seen=datetime.utcnow(),
-            last_seen=datetime.utcnow(),
+            first_seen=datetime.now(UTC),
+            last_seen=datetime.now(UTC),
         )
 
         # Build identity - use config values or generate defaults

@@ -123,6 +123,7 @@ class EventsLog:
         if self._file is None:
             # Auto-open if not already open
             self.open()
+            assert self._file is not None  # For type narrowing
 
         if "event" not in event:
             raise ValueError("Event dict must contain 'event' key")

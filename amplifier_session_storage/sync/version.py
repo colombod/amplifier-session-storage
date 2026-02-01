@@ -11,7 +11,7 @@ Key concepts:
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 
@@ -45,7 +45,7 @@ class VersionVector:
         """
         new_entries = self.entries.copy()
         new_entries[device_id] = new_entries.get(device_id, 0) + 1
-        return VersionVector(entries=new_entries, timestamp=datetime.utcnow())
+        return VersionVector(entries=new_entries, timestamp=datetime.now(UTC))
 
     def get_sequence(self, device_id: str) -> int:
         """Get the sequence number for a device.
@@ -172,7 +172,7 @@ class VersionVector:
         if isinstance(timestamp, str):
             timestamp = datetime.fromisoformat(timestamp)
         elif timestamp is None:
-            timestamp = datetime.utcnow()
+            timestamp = datetime.now(UTC)
 
         return cls(
             entries=data.get("entries", {}),
@@ -189,7 +189,7 @@ class VersionVector:
         Returns:
             VersionVector with sequence 1 for the device
         """
-        return cls(entries={device_id: 1}, timestamp=datetime.utcnow())
+        return cls(entries={device_id: 1}, timestamp=datetime.now(UTC))
 
 
 @dataclass
@@ -217,7 +217,7 @@ class VersionedData:
             version=self.version.increment(self.device_id),
             data=new_data,
             device_id=self.device_id,
-            modified_at=datetime.utcnow(),
+            modified_at=datetime.now(UTC),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -236,7 +236,7 @@ class VersionedData:
         if isinstance(modified_at, str):
             modified_at = datetime.fromisoformat(modified_at)
         elif modified_at is None:
-            modified_at = datetime.utcnow()
+            modified_at = datetime.now(UTC)
 
         return cls(
             version=VersionVector.from_dict(data.get("version", {})),

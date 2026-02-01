@@ -10,7 +10,7 @@ Stores sessions in the local filesystem with backward compatibility:
 
 import json
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,7 @@ from ..protocol import (
     TranscriptMessage,
     UserMembership,
 )
+from ..utils import extract_event_summary as _extract_event_summary
 from .file_ops import (
     append_jsonl,
     ensure_directory,
@@ -138,7 +139,7 @@ class LocalFileStorage(SessionStorage):
             raise SessionNotFoundError(metadata.session_id, metadata.user_id)
 
         # Update the updated timestamp
-        metadata.updated = datetime.utcnow()
+        metadata.updated = datetime.now(UTC)
 
         await write_json_atomic(metadata_path, metadata.to_dict())
         return metadata
@@ -284,7 +285,7 @@ class LocalFileStorage(SessionStorage):
         events_path = self._events_path(metadata.project_slug, session_id)
 
         # Create event record
-        ts = datetime.utcnow()
+        ts = datetime.now(UTC)
         event_record = {
             "event_id": event_id,
             "event_type": event_type,
@@ -605,7 +606,7 @@ class LocalFileStorage(SessionStorage):
         return SyncStatus(
             is_synced=True,
             pending_changes=0,
-            last_sync=datetime.utcnow(),
+            last_sync=datetime.now(UTC),
             conflict_count=0,
         )
 
@@ -621,7 +622,7 @@ class LocalFileStorage(SessionStorage):
         return SyncStatus(
             is_synced=True,
             pending_changes=0,
-            last_sync=datetime.utcnow(),
+            last_sync=datetime.now(UTC),
             conflict_count=0,
         )
 
@@ -688,36 +689,3 @@ class LocalFileStorage(SessionStorage):
         Local storage does not support memberships - returns None.
         """
         return None
-
-
-def _extract_event_summary(data: dict[str, Any]) -> dict[str, Any]:
-    """Extract safe summary fields from event data.
-
-    CRITICAL: Never include 'data' or 'content' fields.
-    Only extract small, known-safe fields.
-    """
-    summary: dict[str, Any] = {}
-
-    # Safe fields to extract
-    safe_fields = [
-        "model",
-        "duration_ms",
-        "has_tool_calls",
-        "has_error",
-        "error_type",
-        "tool_name",
-    ]
-
-    for field in safe_fields:
-        if field in data:
-            summary[field] = data[field]
-
-    # Extract usage summary
-    if "usage" in data:
-        usage = data["usage"]
-        summary["usage"] = {
-            "input_tokens": usage.get("input_tokens", 0),
-            "output_tokens": usage.get("output_tokens", 0),
-        }
-
-    return summary

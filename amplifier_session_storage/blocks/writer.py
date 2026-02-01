@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from .sequence import SequenceAllocator, SimpleSequenceAllocator
@@ -95,7 +95,7 @@ class BlockWriter:
             session_id=self.session_id,
             user_id=self.user_id,
             sequence=self.allocator.next_sequence(),
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(UTC),
             device_id=self.device_id,
             block_type=block_type,
             data=data,
@@ -205,7 +205,7 @@ class BlockWriter:
             turn=turn,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(UTC),
         )
         return self._create_block(BlockType.MESSAGE, data.to_dict())
 
@@ -316,5 +316,5 @@ class BlockWriter:
             The SESSION_DELETED block
         """
         return self._create_block(
-            BlockType.SESSION_DELETED, {"deleted_at": datetime.utcnow().isoformat()}
+            BlockType.SESSION_DELETED, {"deleted_at": datetime.now(UTC).isoformat()}
         )

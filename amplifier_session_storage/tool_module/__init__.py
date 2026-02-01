@@ -13,9 +13,11 @@ tools:
 ```
 """
 
-from .tool import SessionToolModule, create_tool
+from .tool import SessionToolModule, ToolResult, create_tool, mount
 
 __all__ = [
     "SessionToolModule",
+    "ToolResult",
     "create_tool",
+    "mount",
 ]

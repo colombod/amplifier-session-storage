@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
@@ -26,7 +26,7 @@ class TestSessionBlock:
 
     def test_create_block(self) -> None:
         """Test creating a basic block."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         block = SessionBlock(
             block_id="blk-123",
             session_id="sess-456",
@@ -47,7 +47,7 @@ class TestSessionBlock:
 
     def test_to_dict(self) -> None:
         """Test serialization to dictionary."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         block = SessionBlock(
             block_id="blk-123",
             session_id="sess-456",
@@ -70,7 +70,7 @@ class TestSessionBlock:
 
     def test_from_dict(self) -> None:
         """Test deserialization from dictionary."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         data = {
             "id": "blk-123",
             "block_id": "blk-123",
@@ -93,7 +93,7 @@ class TestSessionBlock:
 
     def test_checksum_computed(self) -> None:
         """Test that checksum is computed on creation."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         block1 = SessionBlock(
             block_id="blk-1",
             session_id="sess-1",

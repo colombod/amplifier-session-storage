@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import tempfile
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -28,7 +28,7 @@ class TestDeviceInfo:
 
     def test_to_dict(self) -> None:
         """Test serialization to dictionary."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         device = DeviceInfo(
             device_id="dev-123",
             device_name="Test Device",
@@ -47,7 +47,7 @@ class TestDeviceInfo:
 
     def test_from_dict(self) -> None:
         """Test deserialization from dictionary."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         data = {
             "device_id": "dev-456",
             "device_name": "Another Device",
@@ -64,7 +64,7 @@ class TestDeviceInfo:
 
     def test_roundtrip(self) -> None:
         """Test serialization roundtrip."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         original = DeviceInfo(
             device_id="dev-789",
             device_name="Roundtrip Device",
@@ -101,7 +101,7 @@ class TestUserIdentity:
 
     def test_full_identity(self) -> None:
         """Test identity with all fields."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         device = DeviceInfo(
             device_id="dev-123",
             device_name="Test Device",
@@ -147,7 +147,7 @@ class TestUserIdentity:
         """Test authentication check with valid token."""
         from datetime import timedelta
 
-        future = datetime.utcnow() + timedelta(hours=1)
+        future = datetime.now(UTC) + timedelta(hours=1)
         identity = UserIdentity(
             user_id="user-123",
             display_name="Token User",
@@ -162,7 +162,7 @@ class TestUserIdentity:
         """Test authentication check with expired token."""
         from datetime import timedelta
 
-        past = datetime.utcnow() - timedelta(hours=1)
+        past = datetime.now(UTC) - timedelta(hours=1)
         identity = UserIdentity(
             user_id="user-123",
             display_name="Expired User",
@@ -188,7 +188,7 @@ class TestUserIdentity:
 
     def test_roundtrip(self) -> None:
         """Test serialization roundtrip."""
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         device = DeviceInfo(
             device_id="dev-123",
             device_name="Test Device",

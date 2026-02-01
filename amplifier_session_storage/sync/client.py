@@ -12,11 +12,12 @@ import json
 import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
 from ..blocks.types import SessionBlock
+from ..exceptions import StorageConnectionError
 from ..storage.base import BlockStorage
 
 logger = logging.getLogger(__name__)
@@ -42,7 +43,7 @@ class SyncEvent:
     session_id: str | None = None
     block: SessionBlock | None = None
     data: dict[str, Any] = field(default_factory=dict)
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     error: str | None = None
 
 
@@ -198,7 +199,7 @@ class SyncClient:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as response:
                 if response.status != 200:
-                    raise ConnectionError(f"SSE connection failed: {response.status}")
+                    raise StorageConnectionError(f"SSE connection failed: {response.status}")
 
                 if self.on_connected:
                     self.on_connected()
@@ -240,7 +241,7 @@ class SyncClient:
                         event = self._parse_event(data)
                         await self._handle_event(event)
                     elif msg.type == aiohttp.WSMsgType.ERROR:
-                        raise ConnectionError(f"WebSocket error: {ws.exception()}")
+                        raise StorageConnectionError(f"WebSocket error: {ws.exception()}")
 
     async def _parse_sse_stream(
         self,

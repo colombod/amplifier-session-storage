@@ -8,7 +8,7 @@ Implements the SessionStorage ABC using Azure Cosmos DB with:
 - Transactional batch operations where possible
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from ..access.controller import AccessController
@@ -30,6 +30,7 @@ from ..protocol import (
     TranscriptMessage,
     UserMembership,
 )
+from ..utils import extract_event_summary as _extract_event_summary
 from .chunking import (
     EventChunk,
     chunk_event,
@@ -138,7 +139,7 @@ class CosmosDBStorage(SessionStorage):
         if existing is None:
             raise SessionNotFoundError(metadata.session_id, metadata.user_id)
 
-        metadata.updated = datetime.utcnow()
+        metadata.updated = datetime.now(UTC)
 
         doc = metadata.to_dict()
         doc["id"] = metadata.session_id
@@ -346,7 +347,7 @@ class CosmosDBStorage(SessionStorage):
             raise SessionNotFoundError(session_id, user_id)
 
         partition_key = make_partition_key(user_id, session_id)
-        ts = datetime.utcnow()
+        ts = datetime.now(UTC)
         data_size = get_data_size(data)
 
         # Check if we need to chunk the event
@@ -772,7 +773,7 @@ class CosmosDBStorage(SessionStorage):
         return SyncStatus(
             is_synced=True,
             pending_changes=0,
-            last_sync=datetime.utcnow(),
+            last_sync=datetime.now(UTC),
             conflict_count=0,
         )
 
@@ -788,7 +789,7 @@ class CosmosDBStorage(SessionStorage):
         return SyncStatus(
             is_synced=True,
             pending_changes=0,
-            last_sync=datetime.utcnow(),
+            last_sync=datetime.now(UTC),
             conflict_count=0,
         )
 
@@ -823,7 +824,7 @@ class CosmosDBStorage(SessionStorage):
 
         # Set shared_at timestamp when first sharing
         if old_visibility == SessionVisibility.PRIVATE and visibility != SessionVisibility.PRIVATE:
-            session.shared_at = datetime.utcnow()
+            session.shared_at = datetime.now(UTC)
 
         # Update session in sessions container
         await self.update_session(session)
@@ -1063,33 +1064,3 @@ class CosmosDBStorage(SessionStorage):
     ) -> UserMembership | None:
         """Get user's organization and team memberships."""
         return await self._membership_store.get_membership(user_id)
-
-
-def _extract_event_summary(data: dict[str, Any]) -> dict[str, Any]:
-    """Extract safe summary fields from event data.
-
-    CRITICAL: Never include 'data' or 'content' fields.
-    """
-    summary: dict[str, Any] = {}
-
-    safe_fields = [
-        "model",
-        "duration_ms",
-        "has_tool_calls",
-        "has_error",
-        "error_type",
-        "tool_name",
-    ]
-
-    for field in safe_fields:
-        if field in data:
-            summary[field] = data[field]
-
-    if "usage" in data:
-        usage = data["usage"]
-        summary["usage"] = {
-            "input_tokens": usage.get("input_tokens", 0),
-            "output_tokens": usage.get("output_tokens", 0),
-        }
-
-    return summary

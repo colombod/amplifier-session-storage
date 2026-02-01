@@ -3,15 +3,38 @@ Amplifier tool module implementation for session operations.
 
 This module provides the `session` tool that can be registered with Amplifier
 agents for safe, structured access to session data.
+
+Implements the Amplifier Tool protocol:
+- name: str property
+- description: str property
+- async execute(input: dict[str, Any]) -> ToolResult
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ..tools import SessionTool, SessionToolConfig
+
+
+@dataclass
+class ToolResult:
+    """Result from tool execution, matching Amplifier's ToolResult contract."""
+
+    success: bool
+    output: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        result: dict[str, Any] = {"success": self.success}
+        if self.success:
+            result["output"] = self.output
+        if self.error:
+            result["error"] = self.error
+        return result
 
 
 class SessionToolModule:
@@ -171,41 +194,56 @@ class SessionToolModule:
             "required": ["operation"],
         }
 
-    def execute(self, **params: Any) -> dict[str, Any]:
+    async def execute(self, input: dict[str, Any]) -> ToolResult:
         """Execute a session tool operation.
 
+        Implements the Amplifier Tool protocol.
+
         Args:
-            **params: Operation parameters from the tool call.
+            input: Operation parameters from the tool call.
 
         Returns:
-            Operation result as a dictionary.
+            ToolResult with success status and output/error.
         """
-        operation = params.get("operation")
+        operation = input.get("operation")
 
-        if operation == "list_sessions":
-            return self._list_sessions(params)
-        elif operation == "get_session":
-            return self._get_session(params)
-        elif operation == "search_sessions":
-            return self._search_sessions(params)
-        elif operation == "get_events":
-            return self._get_events(params)
-        elif operation == "analyze_events":
-            return self._analyze_events(params)
-        elif operation == "rewind_session":
-            return self._rewind_session(params)
-        else:
-            return {
-                "error": f"Unknown operation: {operation}",
-                "available_operations": [
-                    "list_sessions",
-                    "get_session",
-                    "search_sessions",
-                    "get_events",
-                    "analyze_events",
-                    "rewind_session",
-                ],
-            }
+        try:
+            if operation == "list_sessions":
+                output = self._list_sessions(input)
+            elif operation == "get_session":
+                output = self._get_session(input)
+            elif operation == "search_sessions":
+                output = self._search_sessions(input)
+            elif operation == "get_events":
+                output = self._get_events(input)
+            elif operation == "analyze_events":
+                output = self._analyze_events(input)
+            elif operation == "rewind_session":
+                output = self._rewind_session(input)
+            else:
+                return ToolResult(
+                    success=False,
+                    error=f"Unknown operation: {operation}",
+                    output={
+                        "available_operations": [
+                            "list_sessions",
+                            "get_session",
+                            "search_sessions",
+                            "get_events",
+                            "analyze_events",
+                            "rewind_session",
+                        ]
+                    },
+                )
+
+            # Check if operation returned an error
+            if "error" in output:
+                return ToolResult(success=False, error=output["error"], output=output)
+
+            return ToolResult(success=True, output=output)
+
+        except Exception as e:
+            return ToolResult(success=False, error=str(e))
 
     def _list_sessions(self, params: dict[str, Any]) -> dict[str, Any]:
         """Execute list_sessions operation."""
@@ -337,3 +375,19 @@ def create_tool(**config: Any) -> SessionToolModule:
         max_results=config.get("max_results", 50),
         max_excerpt_length=config.get("max_excerpt_length", 500),
     )
+
+
+def mount(coordinator: Any = None, config: dict[str, Any] | None = None) -> SessionToolModule:
+    """Standard Amplifier module entry point.
+
+    This function follows the Amplifier module protocol for tool loading.
+
+    Args:
+        coordinator: Amplifier coordinator instance (unused, for protocol compliance).
+        config: Tool configuration dictionary.
+
+    Returns:
+        Configured SessionToolModule instance.
+    """
+    config = config or {}
+    return create_tool(**config)

@@ -8,7 +8,7 @@ Combines LocalFileStorage + CosmosDBStorage for offline-first operation:
 - Triggers sync on connectivity changes
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -479,7 +479,7 @@ class SyncedCosmosStorage(SessionStorage):
         return SyncStatus(
             is_synced=result.success and result.conflicts == 0,
             pending_changes=result.pushed + result.pulled,
-            last_sync=datetime.utcnow() if result.success else None,
+            last_sync=datetime.now(UTC) if result.success else None,
             conflict_count=result.conflicts,
         )
 

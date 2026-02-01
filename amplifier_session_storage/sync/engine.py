@@ -12,7 +12,7 @@ Orchestrates synchronization between local and cloud storage:
 import asyncio
 import socket
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -174,7 +174,7 @@ class SyncEngine:
             return SyncResult(success=False, errors=["No network connectivity"])
 
         self._state = SyncState.SYNCING
-        start_time = datetime.utcnow()
+        start_time = datetime.now(UTC)
 
         try:
             # Push local changes
@@ -183,10 +183,10 @@ class SyncEngine:
             # Pull remote changes
             pull_result = await self._pull_changes(user_id, session_id)
 
-            self._last_sync = datetime.utcnow()
+            self._last_sync = datetime.now(UTC)
             self._state = SyncState.IDLE
 
-            duration = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+            duration = int((datetime.now(UTC) - start_time).total_seconds() * 1000)
 
             return SyncResult(
                 success=len(push_result["errors"]) == 0 and len(pull_result["errors"]) == 0,

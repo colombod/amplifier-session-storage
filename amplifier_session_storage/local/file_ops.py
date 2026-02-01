@@ -12,7 +12,7 @@ import os
 import shutil
 import tempfile
 from collections.abc import AsyncIterator, Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -232,7 +232,7 @@ async def create_backup(path: Path, backup_dir: Path | None = None) -> Path:
     if not await aiofiles.os.path.exists(path):
         raise StorageIOError("backup", str(path), FileNotFoundError(f"File not found: {path}"))
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     if backup_dir is None:
         backup_path = path.with_suffix(f".{timestamp}.backup{path.suffix}")
     else:

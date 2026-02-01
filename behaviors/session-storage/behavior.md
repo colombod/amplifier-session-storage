@@ -1,5 +1,5 @@
 ---
-behavior:
+bundle:
   name: session-storage
   version: "0.1.0"
   description: |
@@ -8,11 +8,11 @@ behavior:
     without direct file system access.
 
 context:
-  - context/session-tool-instructions.md
+  - session-storage:context/session-tool-instructions.md
 
 tools:
   - module: tool-session
-    source: amplifier-session-storage
+    source: git+https://github.com/colombod/amplifier-session-storage
     config:
       enable_cloud: false  # Set to true when Cosmos is configured
       max_results: 50

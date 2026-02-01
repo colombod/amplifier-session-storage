@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +52,7 @@ class SessionMigrator:
         """
         self.storage = storage
         self.user_id = user_id
-        self.device_id = device_id or f"migration-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        self.device_id = device_id or f"migration-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
 
     async def discover_sessions(
         self,
@@ -144,7 +144,7 @@ class SessionMigrator:
             source_path=str(source.path),
             source_size_bytes=source.total_size_bytes,
         )
-        result.started_at = datetime.utcnow()
+        result.started_at = datetime.now(UTC)
 
         try:
             # Check if already migrated
@@ -152,7 +152,7 @@ class SessionMigrator:
                 existing = await self.storage.read_blocks(source.session_id, limit=1)
                 if existing:
                     result.status = MigrationStatus.SKIPPED
-                    result.completed_at = datetime.utcnow()
+                    result.completed_at = datetime.now(UTC)
                     return result
 
             result.status = MigrationStatus.IN_PROGRESS
@@ -198,7 +198,7 @@ class SessionMigrator:
             result.error_message = str(e)
             result.error_details = {"type": type(e).__name__}
 
-        result.completed_at = datetime.utcnow()
+        result.completed_at = datetime.now(UTC)
         return result
 
     async def migrate_batch(
@@ -219,7 +219,7 @@ class SessionMigrator:
         """
         batch = MigrationBatch(
             total_sessions=len(sources),
-            started_at=datetime.utcnow(),
+            started_at=datetime.now(UTC),
         )
 
         for i, source in enumerate(sources):
@@ -229,7 +229,7 @@ class SessionMigrator:
             if on_progress:
                 on_progress(result, i + 1, len(sources))
 
-        batch.completed_at = datetime.utcnow()
+        batch.completed_at = datetime.now(UTC)
         return batch
 
     async def _create_session_block(

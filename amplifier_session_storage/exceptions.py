@@ -141,8 +141,11 @@ class ConflictError(SessionStorageError):
         self.remote_version = remote_version
 
 
-class ConnectionError(SessionStorageError):
-    """Raised when connection to remote storage fails."""
+class StorageConnectionError(SessionStorageError):
+    """Raised when connection to remote storage fails.
+
+    Note: Named StorageConnectionError to avoid shadowing the builtin ConnectionError.
+    """
 
     def __init__(self, endpoint: str, cause: Exception | None = None):
         details = {"endpoint": endpoint}

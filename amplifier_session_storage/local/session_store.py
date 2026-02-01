@@ -79,8 +79,10 @@ def _sanitize_message(message: dict[str, Any] | Any) -> dict[str, Any]:
     Returns:
         Sanitized message dict safe for JSON serialization
     """
+    msg_dict: dict[str, Any]
     if hasattr(message, "model_dump"):
-        msg_dict = message.model_dump()
+        # Pydantic models have model_dump()
+        msg_dict = message.model_dump()  # type: ignore[union-attr]
     elif isinstance(message, dict):
         msg_dict = message.copy()
     else:

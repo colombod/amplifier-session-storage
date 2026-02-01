@@ -5,7 +5,12 @@ Sessions are stored as streams of immutable blocks, enabling
 efficient sync, natural audit trails, and simple conflict resolution.
 """
 
-from .reader import SessionStateReader
+from .reader import (
+    ReconstructedEventSummary,
+    ReconstructedMessage,
+    ReconstructedMetadata,
+    SessionStateReader,
+)
 from .sequence import SequenceAllocator
 from .types import (
     BlockType,
@@ -32,6 +37,10 @@ __all__ = [
     "EventDataChunk",
     "RewindData",
     "ForkData",
+    # Reconstructed state types (from block stream)
+    "ReconstructedMetadata",
+    "ReconstructedMessage",
+    "ReconstructedEventSummary",
     # Utilities
     "SequenceAllocator",
     "SessionStateReader",

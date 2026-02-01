@@ -6,7 +6,7 @@ and authentication state.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -91,7 +91,7 @@ class UserIdentity:
             return self.auth_provider == AuthProvider.CONFIG
         if self.token_expiry is None:
             return True
-        return datetime.utcnow() < self.token_expiry
+        return datetime.now(UTC) < self.token_expiry
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dictionary."""

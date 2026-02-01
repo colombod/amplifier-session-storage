@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -58,7 +58,7 @@ class SyncConflict:
         self.local_blocks = local_blocks
         self.remote_blocks = remote_blocks
         self.conflict_sequence = conflict_sequence
-        self.detected_at = datetime.utcnow()
+        self.detected_at = datetime.now(UTC)
 
     def __repr__(self) -> str:
         return (

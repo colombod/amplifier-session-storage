@@ -26,8 +26,13 @@ from .types import (
 
 
 @dataclass
-class SessionMetadata:
-    """Reconstructed session metadata from blocks."""
+class ReconstructedMetadata:
+    """Session metadata reconstructed from block stream.
+
+    Note: This is distinct from protocol.ReconstructedMetadata which is for
+    the SessionStorage protocol. This type represents state computed
+    from applying blocks, with optional fields for incremental building.
+    """
 
     session_id: str
     user_id: str
@@ -50,8 +55,13 @@ class SessionMetadata:
 
 
 @dataclass
-class TranscriptMessage:
-    """A message in the transcript."""
+class ReconstructedMessage:
+    """A transcript message reconstructed from block stream.
+
+    Note: This is distinct from protocol.ReconstructedMessage which is for
+    the SessionStorage protocol. This type includes block sequence for
+    ordering during reconstruction.
+    """
 
     role: str
     content: Any
@@ -63,8 +73,13 @@ class TranscriptMessage:
 
 
 @dataclass
-class EventSummary:
-    """Summary of an event (without full data)."""
+class ReconstructedEventSummary:
+    """Event summary reconstructed from block stream.
+
+    Note: This is distinct from protocol.ReconstructedEventSummary which is for
+    the SessionStorage protocol. This type tracks chunking state
+    during reconstruction.
+    """
 
     event_id: str
     event_type: str
@@ -86,7 +101,7 @@ class SessionStateReader:
     def compute_current_state(
         self,
         blocks: list[SessionBlock],
-    ) -> tuple[SessionMetadata, list[TranscriptMessage], list[EventSummary]]:
+    ) -> tuple[ReconstructedMetadata, list[ReconstructedMessage], list[ReconstructedEventSummary]]:
         """Compute current state from block stream.
 
         Process:
@@ -198,7 +213,7 @@ class SessionStateReader:
     def _build_state(
         self,
         blocks: list[SessionBlock],
-    ) -> tuple[SessionMetadata, list[TranscriptMessage], list[EventSummary]]:
+    ) -> tuple[ReconstructedMetadata, list[ReconstructedMessage], list[ReconstructedEventSummary]]:
         """Build state from a list of blocks.
 
         Args:
@@ -207,15 +222,15 @@ class SessionStateReader:
         Returns:
             Tuple of (metadata, messages, events)
         """
-        metadata: SessionMetadata | None = None
-        messages: list[TranscriptMessage] = []
-        events: list[EventSummary] = []
+        metadata: ReconstructedMetadata | None = None
+        messages: list[ReconstructedMessage] = []
+        events: list[ReconstructedEventSummary] = []
         max_turn = 0
 
         for block in blocks:
             if block.block_type == BlockType.SESSION_CREATED:
                 created_data = SessionCreatedData.from_dict(block.data)
-                metadata = SessionMetadata(
+                metadata = ReconstructedMetadata(
                     session_id=block.session_id,
                     user_id=block.user_id,
                     name=created_data.name,
@@ -252,7 +267,7 @@ class SessionStateReader:
             elif block.block_type == BlockType.MESSAGE:
                 msg_data = MessageData.from_dict(block.data)
                 messages.append(
-                    TranscriptMessage(
+                    ReconstructedMessage(
                         role=msg_data.role,
                         content=msg_data.content,
                         turn=msg_data.turn,
@@ -267,7 +282,7 @@ class SessionStateReader:
             elif block.block_type == BlockType.EVENT:
                 event_data = EventData.from_dict(block.data)
                 events.append(
-                    EventSummary(
+                    ReconstructedEventSummary(
                         event_id=event_data.event_id,
                         event_type=event_data.event_type,
                         turn=event_data.turn,
@@ -294,7 +309,7 @@ class SessionStateReader:
         # Handle case where no SESSION_CREATED block exists
         if metadata is None and blocks:
             first_block = blocks[0]
-            metadata = SessionMetadata(
+            metadata = ReconstructedMetadata(
                 session_id=first_block.session_id,
                 user_id=first_block.user_id,
                 created=first_block.timestamp,

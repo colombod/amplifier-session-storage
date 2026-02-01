@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from amplifier_session_storage.local import SessionStore
-from amplifier_session_storage.tool_module import SessionToolModule, create_tool
+from amplifier_session_storage.tool_module import SessionToolModule, ToolResult, create_tool, mount
 
 
 @pytest.fixture
@@ -89,109 +89,166 @@ class TestToolModuleInterface:
         assert "properties" in schema
         assert "operation" in schema["properties"]
 
-    def test_has_execute_method(self, tool_module):
-        """Tool has an execute method."""
+    def test_has_async_execute_method(self, tool_module):
+        """Tool has an async execute method."""
+        import asyncio
+
         assert callable(tool_module.execute)
+        assert asyncio.iscoroutinefunction(tool_module.execute)
 
 
 class TestToolModuleOperations:
     """Tests for tool module operations via execute()."""
 
-    def test_list_sessions(self, populated_store):
+    @pytest.mark.asyncio
+    async def test_list_sessions(self, populated_store):
         """list_sessions operation works."""
-        result = populated_store.execute(operation="list_sessions")
+        result = await populated_store.execute({"operation": "list_sessions"})
 
-        assert result["operation"] == "list_sessions"
-        assert result["count"] == 2
-        assert len(result["sessions"]) == 2
+        assert isinstance(result, ToolResult)
+        assert result.success is True
+        assert result.output["operation"] == "list_sessions"
+        assert result.output["count"] == 2
+        assert len(result.output["sessions"]) == 2
 
-    def test_get_session(self, populated_store):
+    @pytest.mark.asyncio
+    async def test_get_session(self, populated_store):
         """get_session operation works."""
-        result = populated_store.execute(operation="get_session", session_id="session-000")
+        result = await populated_store.execute(
+            {
+                "operation": "get_session",
+                "session_id": "session-000",
+            }
+        )
 
-        assert result["operation"] == "get_session"
-        assert result["session_id"] == "session-000"
-        assert "metadata" in result
+        assert result.success is True
+        assert result.output["operation"] == "get_session"
+        assert result.output["session_id"] == "session-000"
+        assert "metadata" in result.output
 
-    def test_get_session_with_transcript(self, populated_store):
+    @pytest.mark.asyncio
+    async def test_get_session_with_transcript(self, populated_store):
         """get_session with transcript included."""
-        result = populated_store.execute(
-            operation="get_session",
-            session_id="session-000",
-            include_transcript=True,
+        result = await populated_store.execute(
+            {
+                "operation": "get_session",
+                "session_id": "session-000",
+                "include_transcript": True,
+            }
         )
 
-        assert "transcript" in result
-        assert len(result["transcript"]) == 2
+        assert result.success is True
+        assert "transcript" in result.output
+        assert len(result.output["transcript"]) == 2
 
-    def test_get_session_missing_id(self, populated_store):
+    @pytest.mark.asyncio
+    async def test_get_session_missing_id(self, populated_store):
         """get_session requires session_id."""
-        result = populated_store.execute(operation="get_session")
+        result = await populated_store.execute({"operation": "get_session"})
 
-        assert "error" in result
-        assert "session_id" in result["error"]
+        assert result.success is False
+        assert result.error is not None
+        assert "session_id" in result.error
 
-    def test_search_sessions(self, populated_store):
+    @pytest.mark.asyncio
+    async def test_search_sessions(self, populated_store):
         """search_sessions operation works."""
-        result = populated_store.execute(operation="search_sessions", query="Hello")
-
-        assert result["operation"] == "search_sessions"
-        assert result["query"] == "Hello"
-        assert result["count"] >= 1
-
-    def test_search_sessions_missing_query(self, populated_store):
-        """search_sessions requires query."""
-        result = populated_store.execute(operation="search_sessions")
-
-        assert "error" in result
-        assert "query" in result["error"]
-
-    def test_get_events(self, populated_store):
-        """get_events operation works."""
-        result = populated_store.execute(operation="get_events", session_id="session-000")
-
-        assert result["operation"] == "get_events"
-        assert "events" in result
-        assert len(result["events"]) >= 1
-
-    def test_get_events_missing_id(self, populated_store):
-        """get_events requires session_id."""
-        result = populated_store.execute(operation="get_events")
-
-        assert "error" in result
-
-    def test_analyze_events(self, populated_store):
-        """analyze_events operation works."""
-        result = populated_store.execute(operation="analyze_events", session_id="session-000")
-
-        assert result["operation"] == "analyze_events"
-        assert "total_events" in result
-
-    def test_rewind_session_dry_run(self, populated_store):
-        """rewind_session in dry_run mode."""
-        result = populated_store.execute(
-            operation="rewind_session",
-            session_id="session-000",
-            to_turn=0,
-            dry_run=True,
+        result = await populated_store.execute(
+            {
+                "operation": "search_sessions",
+                "query": "Hello",
+            }
         )
 
-        assert result["operation"] == "rewind_session"
-        assert result["dry_run"] is True
+        assert result.success is True
+        assert result.output["operation"] == "search_sessions"
+        assert result.output["query"] == "Hello"
+        assert result.output["count"] >= 1
 
-    def test_rewind_session_missing_target(self, populated_store):
+    @pytest.mark.asyncio
+    async def test_search_sessions_missing_query(self, populated_store):
+        """search_sessions requires query."""
+        result = await populated_store.execute({"operation": "search_sessions"})
+
+        assert result.success is False
+        assert result.error is not None
+        assert "query" in result.error
+
+    @pytest.mark.asyncio
+    async def test_get_events(self, populated_store):
+        """get_events operation works."""
+        result = await populated_store.execute(
+            {
+                "operation": "get_events",
+                "session_id": "session-000",
+            }
+        )
+
+        assert result.success is True
+        assert result.output["operation"] == "get_events"
+        assert "events" in result.output
+        assert len(result.output["events"]) >= 1
+
+    @pytest.mark.asyncio
+    async def test_get_events_missing_id(self, populated_store):
+        """get_events requires session_id."""
+        result = await populated_store.execute({"operation": "get_events"})
+
+        assert result.success is False
+        assert result.error is not None
+
+    @pytest.mark.asyncio
+    async def test_analyze_events(self, populated_store):
+        """analyze_events operation works."""
+        result = await populated_store.execute(
+            {
+                "operation": "analyze_events",
+                "session_id": "session-000",
+            }
+        )
+
+        assert result.success is True
+        assert result.output["operation"] == "analyze_events"
+        assert "total_events" in result.output
+
+    @pytest.mark.asyncio
+    async def test_rewind_session_dry_run(self, populated_store):
+        """rewind_session in dry_run mode."""
+        result = await populated_store.execute(
+            {
+                "operation": "rewind_session",
+                "session_id": "session-000",
+                "to_turn": 0,
+                "dry_run": True,
+            }
+        )
+
+        assert result.success is True
+        assert result.output["operation"] == "rewind_session"
+        assert result.output["dry_run"] is True
+
+    @pytest.mark.asyncio
+    async def test_rewind_session_missing_target(self, populated_store):
         """rewind_session requires to_turn or to_message."""
-        result = populated_store.execute(operation="rewind_session", session_id="session-000")
+        result = await populated_store.execute(
+            {
+                "operation": "rewind_session",
+                "session_id": "session-000",
+            }
+        )
 
-        assert "error" in result
-        assert "to_turn" in result["error"] or "to_message" in result["error"]
+        assert result.success is False
+        assert result.error is not None
+        assert "to_turn" in result.error or "to_message" in result.error
 
-    def test_unknown_operation(self, tool_module):
+    @pytest.mark.asyncio
+    async def test_unknown_operation(self, tool_module):
         """Unknown operation returns error with available operations."""
-        result = tool_module.execute(operation="unknown_op")
+        result = await tool_module.execute({"operation": "unknown_op"})
 
-        assert "error" in result
-        assert "available_operations" in result
+        assert result.success is False
+        assert result.error is not None
+        assert "available_operations" in result.output
 
 
 class TestCreateToolFactory:
@@ -215,21 +272,88 @@ class TestCreateToolFactory:
         assert isinstance(tool, SessionToolModule)
 
 
+class TestMountFunction:
+    """Tests for the mount() entry point."""
+
+    def test_mount_with_no_args(self):
+        """mount() works with no arguments."""
+        tool = mount()
+        assert isinstance(tool, SessionToolModule)
+        assert tool.name == "session"
+
+    def test_mount_with_config(self, temp_dir):
+        """mount() accepts config dict."""
+        tool = mount(config={"base_dir": temp_dir, "project_slug": "test"})
+        assert isinstance(tool, SessionToolModule)
+
+    def test_mount_with_coordinator(self, temp_dir):
+        """mount() accepts coordinator (for protocol compliance)."""
+        # Coordinator is unused but accepted for protocol compliance
+        tool = mount(coordinator=None, config={"base_dir": temp_dir})
+        assert isinstance(tool, SessionToolModule)
+
+
 class TestToolModuleSafety:
     """Safety tests for the tool module."""
 
-    def test_get_events_never_returns_data_field(self, populated_store):
+    @pytest.mark.asyncio
+    async def test_get_events_never_returns_data_field(self, populated_store):
         """get_events results never contain 'data' field."""
-        result = populated_store.execute(operation="get_events", session_id="session-000")
+        result = await populated_store.execute(
+            {
+                "operation": "get_events",
+                "session_id": "session-000",
+            }
+        )
 
-        for event in result.get("events", []):
+        assert result.success is True
+        for event in result.output.get("events", []):
             assert "data" not in event
             assert "content" not in event
 
-    def test_error_handling_returns_dict(self, populated_store):
-        """Errors are returned as dict, not raised."""
-        result = populated_store.execute(operation="get_session", session_id="nonexistent")
+    @pytest.mark.asyncio
+    async def test_error_handling_returns_tool_result(self, populated_store):
+        """Errors are returned as ToolResult, not raised."""
+        result = await populated_store.execute(
+            {
+                "operation": "get_session",
+                "session_id": "nonexistent",
+            }
+        )
 
-        # Should return error dict, not raise
-        assert isinstance(result, dict)
-        assert "error" in result
+        # Should return ToolResult with success=False, not raise
+        assert isinstance(result, ToolResult)
+        assert result.success is False
+        assert result.error is not None
+
+
+class TestToolResultContract:
+    """Tests for the ToolResult contract."""
+
+    def test_tool_result_success(self):
+        """ToolResult for successful operations."""
+        result = ToolResult(success=True, output={"data": "test"})
+        assert result.success is True
+        assert result.output == {"data": "test"}
+        assert result.error is None
+
+    def test_tool_result_failure(self):
+        """ToolResult for failed operations."""
+        result = ToolResult(success=False, error="Something went wrong")
+        assert result.success is False
+        assert result.error == "Something went wrong"
+
+    def test_tool_result_to_dict(self):
+        """ToolResult converts to dict correctly."""
+        result = ToolResult(success=True, output={"key": "value"})
+        d = result.to_dict()
+        assert d["success"] is True
+        assert d["output"] == {"key": "value"}
+        assert "error" not in d
+
+    def test_tool_result_to_dict_with_error(self):
+        """ToolResult with error converts to dict correctly."""
+        result = ToolResult(success=False, error="Failed")
+        d = result.to_dict()
+        assert d["success"] is False
+        assert d["error"] == "Failed"

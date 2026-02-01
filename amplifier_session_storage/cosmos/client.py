@@ -17,7 +17,7 @@ from azure.cosmos import PartitionKey
 from azure.cosmos.aio import ContainerProxy, CosmosClient, DatabaseProxy
 from azure.cosmos.exceptions import CosmosHttpResponseError, CosmosResourceNotFoundError
 
-from ..exceptions import AuthenticationError, ConnectionError, StorageIOError
+from ..exceptions import AuthenticationError, StorageConnectionError, StorageIOError
 
 # Container names
 SESSIONS_CONTAINER = "sessions"
@@ -138,9 +138,9 @@ class CosmosClientWrapper:
         except CosmosHttpResponseError as e:
             if e.status_code == 401:
                 raise AuthenticationError(self.config.endpoint, str(e)) from e
-            raise ConnectionError(self.config.endpoint, e) from e
+            raise StorageConnectionError(self.config.endpoint, e) from e
         except Exception as e:
-            raise ConnectionError(self.config.endpoint, e) from e
+            raise StorageConnectionError(self.config.endpoint, e) from e
 
     async def _ensure_container(self, name: str, partition_key_path: str) -> None:
         """Ensure a container exists, creating if necessary."""

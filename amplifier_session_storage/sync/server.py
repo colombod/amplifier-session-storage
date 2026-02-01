@@ -12,7 +12,7 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from ..blocks.types import SessionBlock
@@ -28,8 +28,8 @@ class ConnectedClient:
     client_id: str
     user_id: str
     subscribed_sessions: set[str] = field(default_factory=set)
-    connected_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    last_activity: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    connected_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    last_activity: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     # Queue for outgoing messages
     message_queue: asyncio.Queue[dict[str, Any]] = field(default_factory=lambda: asyncio.Queue())
@@ -135,7 +135,7 @@ class SyncHandler:
             "type": "block_added",
             "session_id": block.session_id,
             "block": block.to_dict(),
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
 
         await self._broadcast_to_session(
@@ -159,7 +159,7 @@ class SyncHandler:
         event = {
             "type": "session_deleted",
             "session_id": session_id,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
 
         await self._broadcast_to_session(session_id, user_id, event)
@@ -184,7 +184,7 @@ class SyncHandler:
             "session_id": session_id,
             "local_sequence": local_sequence,
             "remote_sequence": remote_sequence,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
 
         await self._broadcast_to_session(session_id, user_id, event)
@@ -389,7 +389,7 @@ class SyncServer:
         elif msg_type == "ping":
             # Update last activity
             if client_id in self.handler._clients:
-                self.handler._clients[client_id].last_activity = datetime.utcnow().isoformat()
+                self.handler._clients[client_id].last_activity = datetime.now(UTC).isoformat()
 
     def validate_auth(self, auth_header: str | None) -> str | None:
         """Validate authentication header.

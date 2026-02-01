@@ -1,6 +1,19 @@
 # Amplifier Session Storage
 
-A block-based session storage system for Amplifier with local and Cosmos DB backends.
+A foundational library for session persistence in Amplifier applications.
+
+## What This Library Is
+
+This is a **foundational library** (like `amplifier-core` and `amplifier-foundation`) that provides session storage infrastructure for building Amplifier applications. It is **not** a dynamically-loaded module.
+
+**How to use this library:**
+- Applications **import** it directly: `from amplifier_session_storage import ...`
+- Applications **instantiate** storage backends based on their configuration
+- Applications **inject** storage where session persistence is needed
+
+**This is NOT:**
+- A tool module with `mount()` (that pattern is for plugins like `tool-filesystem`)
+- Something you load via bundle YAML
 
 ## Features
 
@@ -9,6 +22,7 @@ A block-based session storage system for Amplifier with local and Cosmos DB back
 - **Multi-device support**: Sequence-based merging handles concurrent edits
 - **Multi-tenant**: Team/org visibility controls for shared sessions
 - **Flexible authentication**: Supports key-based and Azure AD authentication
+- **Drop-in compatible**: Works with existing Amplifier session file format
 
 ## Installation
 
@@ -334,6 +348,122 @@ Blocks are partitioned by `{user_id}_{session_id}`:
 2. Background sync uploads new blocks to Cosmos
 3. Sequence numbers enable conflict-free merging
 4. Hybrid storage combines both for offline-first with cloud backup
+
+## Building Amplifier Applications
+
+This library is designed to be used by Amplifier applications (like `amplifier-app-cli`) to provide session persistence. Here's how to integrate it.
+
+### Basic Application Integration
+
+```python
+"""Example: Building an Amplifier application with session storage."""
+
+from amplifier_core import AmplifierSession
+from amplifier_session_storage import (
+    LocalBlockStorage,
+    HybridBlockStorage,
+    StorageConfig,
+    SessionStore,
+)
+import os
+
+def create_storage():
+    """Create appropriate storage backend based on environment."""
+    user_id = os.getenv("USER", "default-user")
+    
+    # Check if Cosmos DB is configured
+    if os.getenv("AMPLIFIER_COSMOS_ENDPOINT"):
+        # Hybrid mode: local + cloud sync
+        config = StorageConfig(
+            user_id=user_id,
+            cosmos_endpoint=os.getenv("AMPLIFIER_COSMOS_ENDPOINT"),
+            enable_sync=True,
+        )
+        return HybridBlockStorage(config)
+    else:
+        # Local only (default)
+        config = StorageConfig(user_id=user_id)
+        return LocalBlockStorage(config)
+
+# In your application startup:
+storage = create_storage()
+
+# Use the drop-in compatible SessionStore for simple cases
+store = SessionStore(storage=storage)
+
+# Save a session
+await store.save(
+    session_id="sess-123",
+    transcript=[{"role": "user", "content": "Hello"}],
+    metadata={"project": "my-project"},
+)
+
+# Load a session
+transcript, metadata = await store.load("sess-123")
+```
+
+### Advanced: Custom Session Tool for Agents
+
+If you want agents to query session data, create a tool in your application:
+
+```python
+"""Example: Creating a session query tool for agents."""
+
+from amplifier_session_storage.tools import SessionTool, SessionToolConfig
+
+# Create the tool with your configuration
+session_tool = SessionTool(
+    SessionToolConfig(
+        project_slug="my-project",
+        max_results=50,
+        max_excerpt_length=500,
+    )
+)
+
+# Register with your agent/coordinator (application-specific)
+# This depends on how your application handles tool registration
+coordinator.register_tool(session_tool)
+```
+
+### Integration Pattern with amplifier-app-cli
+
+For `amplifier-app-cli` or similar applications, the integration follows this pattern:
+
+```python
+"""Proposed integration pattern for amplifier-app-cli."""
+
+from amplifier_session_storage import (
+    StorageConfig,
+    LocalBlockStorage,
+    CosmosBlockStorage,
+    HybridBlockStorage,
+)
+
+def load_storage_from_settings(settings: dict, user_id: str):
+    """Load storage backend from settings.yaml configuration."""
+    storage_config = settings.get("session_storage", {})
+    mode = storage_config.get("mode", "local")
+    
+    config = StorageConfig(user_id=user_id)
+    
+    if mode == "local":
+        return LocalBlockStorage(config)
+    
+    elif mode == "cloud":
+        cloud = storage_config.get("cloud", {})
+        config.cosmos_endpoint = cloud.get("endpoint")
+        config.cosmos_database = cloud.get("database", "amplifier-db")
+        config.cosmos_container = cloud.get("container", "items")
+        return CosmosBlockStorage(config)
+    
+    elif mode == "hybrid":
+        cloud = storage_config.get("cloud", {})
+        config.cosmos_endpoint = cloud.get("endpoint")
+        config.enable_sync = storage_config.get("sync", {}).get("enabled", True)
+        return HybridBlockStorage(config)
+    
+    raise ValueError(f"Unknown storage mode: {mode}")
+```
 
 ## Integration with Amplifier CLI (Proposed)
 

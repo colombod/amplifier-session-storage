@@ -5,11 +5,27 @@ This module defines the SessionStorage protocol and all associated data types
 that storage implementations must work with.
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
+
+if TYPE_CHECKING:
+    from .facets import SessionFacets
+
+
+def _parse_facets(data: dict[str, Any] | None) -> SessionFacets | None:
+    """Parse facets from dict, handling import to avoid circular dependency."""
+    if data is None:
+        return None
+    # Import here to avoid circular import at module load time
+    from .facets import SessionFacets
+
+    return SessionFacets.from_dict(data)
+
 
 # =============================================================================
 # Session Visibility
@@ -88,6 +104,8 @@ class SessionMetadata:
     team_ids: list[str] | None = None
     shared_at: datetime | None = None
     tags: list[str] | None = None
+    # Facets for server-side filtering (computed from events)
+    facets: SessionFacets | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -111,10 +129,11 @@ class SessionMetadata:
             "team_ids": self.team_ids,
             "shared_at": self.shared_at.isoformat() if self.shared_at else None,
             "tags": self.tags,
+            "facets": self.facets.to_dict() if self.facets else None,
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "SessionMetadata":
+    def from_dict(cls, data: dict[str, Any]) -> SessionMetadata:
         """Create from dictionary."""
         # Parse visibility
         visibility_str = data.get("visibility", "private")
@@ -160,6 +179,7 @@ class SessionMetadata:
             team_ids=data.get("team_ids"),
             shared_at=shared_at,
             tags=data.get("tags"),
+            facets=_parse_facets(data.get("facets")),
         )
 
 
@@ -188,7 +208,7 @@ class TranscriptMessage:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "TranscriptMessage":
+    def from_dict(cls, data: dict[str, Any]) -> TranscriptMessage:
         """Create from dictionary."""
         return cls(
             sequence=data["sequence"],
@@ -290,7 +310,7 @@ class Organization:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Organization":
+    def from_dict(cls, data: dict[str, Any]) -> Organization:
         """Create from dictionary."""
         return cls(
             org_id=data["org_id"],
@@ -326,7 +346,7 @@ class Team:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Team":
+    def from_dict(cls, data: dict[str, Any]) -> Team:
         """Create from dictionary."""
         return cls(
             team_id=data["team_id"],
@@ -361,7 +381,7 @@ class UserMembership:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "UserMembership":
+    def from_dict(cls, data: dict[str, Any]) -> UserMembership:
         """Create from dictionary."""
         return cls(
             user_id=data["user_id"],
@@ -414,7 +434,7 @@ class SharedSessionSummary:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "SharedSessionSummary":
+    def from_dict(cls, data: dict[str, Any]) -> SharedSessionSummary:
         """Create from dictionary."""
         visibility_str = data.get("visibility", "private")
         visibility = (

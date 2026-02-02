@@ -66,6 +66,20 @@ from .blocks import (
     SessionUpdatedData,
 )
 
+# Facets module - server-side queryable aggregates
+from .facets import (
+    BackfillProgress,
+    BackfillResult,
+    FacetQuery,
+    FacetsRebuilder,
+    FacetsUpdater,
+    RebuildResult,
+    SessionFacets,
+    UpdateResult,
+    WorkflowPattern,
+    rebuild_facets,
+)
+
 # Identity module - user/device/org management
 from .identity import (
     ConfigFileIdentityProvider,
@@ -163,6 +177,17 @@ __all__ = [
     "MigrationResult",
     "SessionSource",
     "SessionMigrator",
+    # Facets
+    "SessionFacets",
+    "FacetQuery",
+    "WorkflowPattern",
+    "FacetsUpdater",
+    "UpdateResult",
+    "FacetsRebuilder",
+    "RebuildResult",
+    "BackfillProgress",
+    "BackfillResult",
+    "rebuild_facets",
 ]
 
 __version__ = "0.1.0"

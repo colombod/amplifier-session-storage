@@ -37,6 +37,8 @@ from .hybrid import (
     ConflictResolution,
     HybridBlockStorage,
     SyncConflict,
+    SyncFilter,
+    SyncPolicy,
     SyncState,
 )
 from .local import LocalBlockStorage
@@ -54,6 +56,8 @@ __all__ = [
     "SyncState",
     "SyncConflict",
     "ConflictResolution",
+    "SyncPolicy",
+    "SyncFilter",
     # Exceptions
     "StorageError",
     "SessionNotFoundError",

@@ -3,6 +3,13 @@ Hybrid block storage with local + cloud sync.
 
 Provides offline-first operation with background sync to Cosmos DB.
 Handles multi-device scenarios with conflict resolution.
+
+Sync Filtering:
+    Host applications can control which sessions get synced to Cosmos DB
+    using sync policies and custom filter functions. This is useful for:
+    - Keeping sensitive sessions local-only
+    - Syncing only production/important sessions
+    - Excluding test/development sessions from cloud storage
 """
 
 from __future__ import annotations
@@ -24,6 +31,24 @@ from .cosmos import CosmosBlockStorage
 from .local import LocalBlockStorage
 
 logger = logging.getLogger(__name__)
+
+
+class SyncPolicy(Enum):
+    """Policy for controlling which sessions get synced to cloud storage.
+
+    SYNC_ALL: Sync all sessions to cloud (default behavior)
+    SYNC_NONE: Never sync to cloud (local-only mode)
+    SYNC_FILTER: Use custom filter function to decide per session
+    """
+
+    SYNC_ALL = "sync_all"
+    SYNC_NONE = "sync_none"
+    SYNC_FILTER = "sync_filter"
+
+
+# Type alias for sync filter function
+# Takes (session_id, metadata) and returns True if session should be synced
+SyncFilter = Callable[[str, dict[str, Any]], bool]
 
 
 class SyncState(Enum):
@@ -98,6 +123,8 @@ class HybridBlockStorage(BlockStorage):
         sync_interval: float = 5.0,
         on_conflict: Callable[[SyncConflict], None] | None = None,
         on_sync_error: Callable[[Exception], None] | None = None,
+        sync_policy: SyncPolicy = SyncPolicy.SYNC_ALL,
+        sync_filter: SyncFilter | None = None,
     ) -> None:
         """Initialize hybrid storage.
 
@@ -107,12 +134,19 @@ class HybridBlockStorage(BlockStorage):
             sync_interval: Seconds between sync attempts
             on_conflict: Callback when conflict detected (for MANUAL mode)
             on_sync_error: Callback when sync fails
+            sync_policy: Policy for controlling which sessions sync to cloud
+            sync_filter: Custom filter function when sync_policy is SYNC_FILTER
+                         Takes (session_id, metadata) and returns True to sync
         """
         self.config = config
         self.conflict_resolution = conflict_resolution
         self.sync_interval = sync_interval
         self.on_conflict = on_conflict
         self.on_sync_error = on_sync_error
+
+        # Sync filtering
+        self.sync_policy = sync_policy
+        self.sync_filter = sync_filter
 
         # Initialize storage backends
         self._local = LocalBlockStorage(config)
@@ -128,6 +162,10 @@ class HybridBlockStorage(BlockStorage):
 
         # Track sync state per session
         self._sync_states: dict[str, SyncState] = {}
+
+        # Sync filtering state
+        self._session_metadata: dict[str, dict[str, Any]] = {}
+        self._local_only_sessions: set[str] = set()
 
     async def start(self) -> None:
         """Start the hybrid storage and background sync.
@@ -167,30 +205,31 @@ class HybridBlockStorage(BlockStorage):
             self._sync_task = None
 
     async def write_block(self, block: SessionBlock) -> None:
-        """Write a block to local storage and queue for sync."""
+        """Write a block to local storage and queue for sync if eligible."""
         # Always write to local first
         await self._local.write_block(block)
 
-        # Queue for sync if remote available
-        if self._remote_available:
+        # Queue for sync if eligible
+        if self._remote_available and self._should_sync_session(block.session_id):
             await self._sync_queue.put(block)
             self._pending_sessions.add(block.session_id)
             self._sync_states[block.session_id] = SyncState.PENDING
 
     async def write_blocks(self, blocks: list[SessionBlock]) -> None:
-        """Write multiple blocks to local and queue for sync."""
+        """Write multiple blocks to local and queue eligible ones for sync."""
         if not blocks:
             return
 
         # Write all to local
         await self._local.write_blocks(blocks)
 
-        # Queue all for sync
+        # Queue eligible blocks for sync
         if self._remote_available:
             for block in blocks:
-                await self._sync_queue.put(block)
-                self._pending_sessions.add(block.session_id)
-            self._sync_states[blocks[0].session_id] = SyncState.PENDING
+                if self._should_sync_session(block.session_id):
+                    await self._sync_queue.put(block)
+                    self._pending_sessions.add(block.session_id)
+                    self._sync_states[block.session_id] = SyncState.PENDING
 
     async def read_blocks(
         self,
@@ -315,6 +354,106 @@ class HybridBlockStorage(BlockStorage):
         else:
             for sid in list(self._pending_sessions):
                 await self._sync_session(sid)
+
+    # Sync filtering methods
+
+    def set_session_metadata(self, session_id: str, metadata: dict[str, Any]) -> None:
+        """Set metadata for a session (used by sync filter).
+
+        The host application should call this to provide metadata that
+        the sync filter can use to decide whether to sync.
+
+        Args:
+            session_id: Session ID
+            metadata: Session metadata (bundle, model, project_slug, etc.)
+        """
+        self._session_metadata[session_id] = metadata
+
+    def get_session_metadata(self, session_id: str) -> dict[str, Any]:
+        """Get metadata for a session.
+
+        Returns:
+            Session metadata, or empty dict if not set.
+        """
+        return self._session_metadata.get(session_id, {})
+
+    def mark_session_local_only(self, session_id: str) -> None:
+        """Mark a session as local-only (never sync to cloud).
+
+        This is a runtime override that takes precedence over sync policy.
+        Use this for sensitive sessions that should never leave the device.
+
+        Args:
+            session_id: Session ID to mark as local-only
+        """
+        self._local_only_sessions.add(session_id)
+
+    def unmark_session_local_only(self, session_id: str) -> None:
+        """Remove local-only mark from a session.
+
+        After calling this, the session will be subject to normal
+        sync policy rules.
+
+        Args:
+            session_id: Session ID to unmark
+        """
+        self._local_only_sessions.discard(session_id)
+
+    def is_session_local_only(self, session_id: str) -> bool:
+        """Check if a session is marked as local-only.
+
+        Args:
+            session_id: Session ID to check
+
+        Returns:
+            True if session is marked as local-only.
+        """
+        return session_id in self._local_only_sessions
+
+    def _should_sync_session(self, session_id: str) -> bool:
+        """Determine if a session should be synced to cloud.
+
+        Checks in order:
+        1. Local-only override (always prevents sync)
+        2. Sync policy (SYNC_ALL, SYNC_NONE, SYNC_FILTER)
+        3. Custom filter function (if policy is SYNC_FILTER)
+
+        Args:
+            session_id: Session ID to check
+
+        Returns:
+            True if session should be synced to cloud.
+        """
+        # Local-only override takes precedence
+        if session_id in self._local_only_sessions:
+            return False
+
+        # Apply sync policy
+        if self.sync_policy == SyncPolicy.SYNC_NONE:
+            return False
+
+        if self.sync_policy == SyncPolicy.SYNC_ALL:
+            return True
+
+        # SYNC_FILTER - use custom filter function
+        if self.sync_policy == SyncPolicy.SYNC_FILTER:
+            if self.sync_filter is None:
+                # No filter provided - default to sync
+                logger.warning(
+                    "SyncPolicy.SYNC_FILTER set but no sync_filter provided, defaulting to sync"
+                )
+                return True
+
+            # Get session metadata for filter
+            metadata = self._session_metadata.get(session_id, {})
+            try:
+                return self.sync_filter(session_id, metadata)
+            except Exception as e:
+                logger.error(f"Sync filter raised exception for {session_id}: {e}")
+                # On error, default to NOT sync (fail safe)
+                return False
+
+        return True
 
     # Private sync methods
 

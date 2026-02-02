@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from ..facets import FacetQuery, SessionFacets
 from ..local import SessionStore, read_events_summary
 
 
@@ -466,6 +467,208 @@ class SessionTool:
             analysis.duration_seconds = (last_ts - first_ts).total_seconds()
 
         return analysis
+
+    def query_sessions(
+        self,
+        *,
+        # Basic filters
+        bundle: str | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+        # Tool/agent filters
+        tool_used: str | None = None,
+        agent_delegated_to: str | None = None,
+        # Status filters
+        has_errors: bool | None = None,
+        has_child_sessions: bool | None = None,
+        has_recipes: bool | None = None,
+        # Token filters
+        min_tokens: int | None = None,
+        max_tokens: int | None = None,
+        # Workflow pattern
+        workflow_pattern: str | None = None,
+        # Date filters
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        # Pagination
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[SessionInfo]:
+        """Query sessions using facet-based filters.
+
+        This method enables powerful server-side filtering when using Cosmos DB,
+        or in-memory filtering for local storage. Use this for finding sessions
+        by their characteristics rather than text search.
+
+        Args:
+            bundle: Filter by bundle name (e.g., "amplifier-dev")
+            model: Filter by model used (e.g., "claude-sonnet-4-20250514")
+            provider: Filter by provider (e.g., "anthropic")
+            tool_used: Filter by tool that was used (e.g., "delegate", "bash")
+            agent_delegated_to: Filter by agent that was delegated to
+            has_errors: Filter by whether session had errors
+            has_child_sessions: Filter by whether session spawned child sessions
+            has_recipes: Filter by whether session used recipes
+            min_tokens: Minimum total tokens used
+            max_tokens: Maximum total tokens used
+            workflow_pattern: Filter by detected workflow pattern
+            created_after: Sessions created after this datetime
+            created_before: Sessions created before this datetime
+            limit: Maximum results (default from config)
+            offset: Pagination offset
+
+        Returns:
+            List of SessionInfo objects matching the filters.
+
+        Example:
+            # Find multi-agent sessions with errors
+            sessions = tool.query_sessions(
+                has_child_sessions=True,
+                has_errors=True,
+                created_after=datetime.now() - timedelta(days=7)
+            )
+
+            # Find sessions using specific tools
+            sessions = tool.query_sessions(
+                tool_used="delegate",
+                bundle="amplifier-dev"
+            )
+        """
+        limit = limit or self.config.max_results
+
+        # Build FacetQuery for filtering
+        query = FacetQuery(
+            bundle=bundle,
+            model=model,
+            provider=provider,
+            tool_used=tool_used,
+            agent_delegated_to=agent_delegated_to,
+            has_errors=has_errors,
+            has_child_sessions=has_child_sessions,
+            has_recipes=has_recipes,
+            min_tokens=min_tokens,
+            max_tokens=max_tokens,
+            workflow_pattern=workflow_pattern,
+            created_after=created_after,
+            created_before=created_before,
+            limit=limit,
+            offset=offset,
+        )
+
+        # For local storage, filter in Python
+        # (Cosmos backend would use FacetQueryBuilder for server-side filtering)
+        sessions: list[SessionInfo] = []
+        session_ids = self.store.list_sessions(top_level_only=True)
+
+        for session_id in session_ids:
+            if len(sessions) >= limit:
+                break
+
+            try:
+                metadata = self.store.get_metadata(session_id)
+
+                # Apply facet filters
+                if not self._matches_facet_query(metadata, query):
+                    continue
+
+                sessions.append(
+                    SessionInfo(
+                        session_id=session_id,
+                        project=metadata.get("project_slug", self.config.project_slug),
+                        created=metadata.get("created"),
+                        modified=metadata.get("updated"),
+                        bundle=metadata.get("bundle"),
+                        model=metadata.get("model"),
+                        turn_count=metadata.get("turn_count", 0),
+                        message_count=metadata.get("message_count", 0),
+                        source="local",
+                        name=metadata.get("name"),
+                        path=str(self.store.get_session_dir(session_id)),
+                    )
+                )
+            except Exception:
+                continue
+
+        return sessions
+
+    def _matches_facet_query(self, metadata: dict[str, Any], query: FacetQuery) -> bool:
+        """Check if session metadata matches a facet query.
+
+        Used for local filtering. Cosmos uses FacetQueryBuilder for
+        server-side filtering.
+        """
+        # Get facets from metadata (may be None for old sessions)
+        facets_data = metadata.get("facets", {})
+        facets = SessionFacets.from_dict(facets_data) if facets_data else None
+
+        # Basic metadata filters (always available)
+        if query.bundle and metadata.get("bundle") != query.bundle:
+            return False
+
+        if query.model and metadata.get("model") != query.model:
+            return False
+
+        # Date filters
+        if query.created_after:
+            created = metadata.get("created")
+            if created:
+                try:
+                    created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    if created_dt < query.created_after:
+                        return False
+                except (ValueError, TypeError):
+                    pass
+
+        if query.created_before:
+            created = metadata.get("created")
+            if created:
+                try:
+                    created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    if created_dt > query.created_before:
+                        return False
+                except (ValueError, TypeError):
+                    pass
+
+        # Facet-based filters (require facets to be computed)
+        if facets:
+            if query.provider:
+                if (
+                    query.provider != facets.initial_provider
+                    and query.provider not in facets.providers_used
+                ):
+                    return False
+
+            if query.tool_used and query.tool_used not in facets.tools_used:
+                return False
+
+            if (
+                query.agent_delegated_to
+                and query.agent_delegated_to not in facets.agents_delegated_to
+            ):
+                return False
+
+            if query.has_errors is not None and facets.has_errors != query.has_errors:
+                return False
+
+            if (
+                query.has_child_sessions is not None
+                and facets.has_child_sessions != query.has_child_sessions
+            ):
+                return False
+
+            if query.has_recipes is not None and facets.has_recipes != query.has_recipes:
+                return False
+
+            if query.min_tokens is not None and facets.total_tokens < query.min_tokens:
+                return False
+
+            if query.max_tokens is not None and facets.total_tokens > query.max_tokens:
+                return False
+
+            if query.workflow_pattern and facets.workflow_pattern != query.workflow_pattern:
+                return False
+
+        return True
 
     def rewind_session(
         self,

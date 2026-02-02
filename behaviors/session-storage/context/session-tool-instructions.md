@@ -13,6 +13,37 @@ The `session` tool provides **safe projections** that never return full event pa
 
 ## Available Operations
 
+### query_sessions (Facet-Based Filtering)
+
+Query sessions using facet-based filters for powerful server-side filtering.
+This is the **recommended** method for finding sessions by characteristics.
+
+```
+session query_sessions [bundle=<name>] [model=<name>] [tool_used=<name>] [has_errors=true|false] ...
+```
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `bundle` | Filter by bundle name | `bundle=amplifier-dev` |
+| `model` | Filter by model | `model=claude-sonnet-4-20250514` |
+| `provider` | Filter by provider | `provider=anthropic` |
+| `tool_used` | Sessions that used this tool | `tool_used=delegate` |
+| `agent_delegated_to` | Sessions that delegated to this agent | `agent_delegated_to=foundation:explorer` |
+| `has_errors` | Filter by error presence | `has_errors=true` |
+| `has_child_sessions` | Multi-agent sessions | `has_child_sessions=true` |
+| `has_recipes` | Sessions that used recipes | `has_recipes=true` |
+| `min_tokens` | Minimum token usage | `min_tokens=10000` |
+| `max_tokens` | Maximum token usage | `max_tokens=100000` |
+| `workflow_pattern` | Filter by detected pattern | `workflow_pattern=multi_agent` |
+| `created_after` | Sessions after this date | `created_after=2025-01-01T00:00:00Z` |
+| `created_before` | Sessions before this date | `created_before=2025-01-31T23:59:59Z` |
+| `limit` | Max results (default 50) | `limit=10` |
+
+**Returns**: List of session summaries matching all specified filters.
+
+**Key benefit**: When using Cosmos DB, filtering happens server-side before data transfer.
+For local storage, filtering happens in-memory but uses the same API.
+
 ### list_sessions
 
 List sessions with optional filtering.
@@ -118,6 +149,28 @@ session rewind_session session_id=<id> [to_turn=<n>] [to_message=<n>] [dry_run=t
 **SAFETY**: Defaults to dry_run=true. Always preview before executing.
 
 ## Common Patterns
+
+### Finding Sessions by Characteristics (Facet Queries)
+
+```
+# Find multi-agent sessions (sessions that delegated to other agents)
+session query_sessions has_child_sessions=true
+
+# Find sessions with errors in the last week
+session query_sessions has_errors=true created_after=2025-01-25T00:00:00Z
+
+# Find high-token sessions for cost analysis
+session query_sessions min_tokens=50000 limit=20
+
+# Find sessions using specific tools
+session query_sessions tool_used=delegate bundle=amplifier-dev
+
+# Find sessions that used recipes
+session query_sessions has_recipes=true
+
+# Find sessions by workflow pattern
+session query_sessions workflow_pattern=multi_agent
+```
 
 ### Investigating a Failed Session
 

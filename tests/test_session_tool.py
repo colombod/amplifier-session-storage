@@ -396,3 +396,215 @@ class TestSessionToolSafety:
         if matches:
             # Excerpt should be bounded
             assert len(matches[0].excerpt) <= tool.config.max_excerpt_length
+
+
+class TestSessionToolQuerySessions:
+    """Tests for query_sessions operation (facet-based filtering)."""
+
+    @pytest.fixture
+    def store_with_facets(self, temp_dir):
+        """Create a store with sessions that have facets computed."""
+        store = SessionStore(base_dir=temp_dir, project_slug="test-project")
+
+        # Session 1: Multi-agent session with errors
+        session_id_1 = "faceted-session-001"
+        transcript_1 = [
+            {"role": "user", "content": "Hello", "turn": 1},
+            {"role": "assistant", "content": "Hi!", "turn": 1},
+        ]
+        metadata_1 = {
+            "session_id": session_id_1,
+            "created": "2025-01-15T10:00:00Z",
+            "bundle": "amplifier-dev",
+            "model": "claude-sonnet-4-20250514",
+            "turn_count": 1,
+            "facets": {
+                "bundle": "amplifier-dev",
+                "initial_model": "claude-sonnet-4-20250514",
+                "initial_provider": "anthropic",
+                "tools_used": ["delegate", "bash", "read_file"],
+                "agents_delegated_to": ["foundation:explorer", "foundation:git-ops"],
+                "has_errors": True,
+                "error_count": 2,
+                "has_child_sessions": True,
+                "child_session_count": 3,
+                "has_recipes": False,
+                "total_tokens": 50000,
+                "workflow_pattern": "multi_agent",
+                "last_computed": datetime.now(UTC).isoformat(),
+            },
+        }
+        store.save(session_id_1, transcript_1, metadata_1)
+
+        # Session 2: Simple session, no errors
+        session_id_2 = "faceted-session-002"
+        transcript_2 = [
+            {"role": "user", "content": "Quick question", "turn": 1},
+            {"role": "assistant", "content": "Quick answer", "turn": 1},
+        ]
+        metadata_2 = {
+            "session_id": session_id_2,
+            "created": "2025-01-20T14:00:00Z",
+            "bundle": "foundation",
+            "model": "claude-haiku-*",
+            "turn_count": 1,
+            "facets": {
+                "bundle": "foundation",
+                "initial_model": "claude-haiku-*",
+                "initial_provider": "anthropic",
+                "tools_used": ["web_search"],
+                "agents_delegated_to": [],
+                "has_errors": False,
+                "error_count": 0,
+                "has_child_sessions": False,
+                "child_session_count": 0,
+                "has_recipes": False,
+                "total_tokens": 5000,
+                "workflow_pattern": "simple",
+                "last_computed": datetime.now(UTC).isoformat(),
+            },
+        }
+        store.save(session_id_2, transcript_2, metadata_2)
+
+        # Session 3: Recipe-based session
+        session_id_3 = "faceted-session-003"
+        transcript_3 = [
+            {"role": "user", "content": "Run code review", "turn": 1},
+            {"role": "assistant", "content": "Running recipe...", "turn": 1},
+        ]
+        metadata_3 = {
+            "session_id": session_id_3,
+            "created": "2025-01-25T09:00:00Z",
+            "bundle": "amplifier-dev",
+            "model": "claude-sonnet-4-20250514",
+            "turn_count": 1,
+            "facets": {
+                "bundle": "amplifier-dev",
+                "initial_model": "claude-sonnet-4-20250514",
+                "initial_provider": "anthropic",
+                "tools_used": ["recipes", "delegate"],
+                "agents_delegated_to": ["foundation:zen-architect"],
+                "has_errors": False,
+                "error_count": 0,
+                "has_child_sessions": True,
+                "child_session_count": 2,
+                "has_recipes": True,
+                "recipe_names": ["code-review.yaml"],
+                "total_tokens": 25000,
+                "workflow_pattern": "recipe_driven",
+                "last_computed": datetime.now(UTC).isoformat(),
+            },
+        }
+        store.save(session_id_3, transcript_3, metadata_3)
+
+        return store
+
+    @pytest.fixture
+    def tool_with_facets(self, temp_dir, store_with_facets):
+        """Create a SessionTool with faceted sessions."""
+        config = SessionToolConfig(
+            base_dir=temp_dir,
+            project_slug="test-project",
+            max_results=50,
+        )
+        return SessionTool(config)
+
+    def test_query_sessions_no_filters(self, tool_with_facets):
+        """Query with no filters returns all sessions."""
+        sessions = tool_with_facets.query_sessions()
+        assert len(sessions) == 3
+
+    def test_query_sessions_by_bundle(self, tool_with_facets):
+        """Filter sessions by bundle."""
+        sessions = tool_with_facets.query_sessions(bundle="amplifier-dev")
+        assert len(sessions) == 2
+        for s in sessions:
+            assert s.bundle == "amplifier-dev"
+
+    def test_query_sessions_by_has_errors(self, tool_with_facets):
+        """Filter sessions by error presence."""
+        # Sessions with errors
+        sessions = tool_with_facets.query_sessions(has_errors=True)
+        assert len(sessions) == 1
+        assert sessions[0].session_id == "faceted-session-001"
+
+        # Sessions without errors
+        sessions = tool_with_facets.query_sessions(has_errors=False)
+        assert len(sessions) == 2
+
+    def test_query_sessions_by_tool_used(self, tool_with_facets):
+        """Filter sessions by tool usage."""
+        sessions = tool_with_facets.query_sessions(tool_used="delegate")
+        assert len(sessions) == 2
+        # Should include sessions 001 and 003
+
+    def test_query_sessions_by_has_child_sessions(self, tool_with_facets):
+        """Filter multi-agent sessions."""
+        sessions = tool_with_facets.query_sessions(has_child_sessions=True)
+        assert len(sessions) == 2
+        # Sessions 001 and 003 have child sessions
+
+    def test_query_sessions_by_has_recipes(self, tool_with_facets):
+        """Filter sessions that used recipes."""
+        sessions = tool_with_facets.query_sessions(has_recipes=True)
+        assert len(sessions) == 1
+        assert sessions[0].session_id == "faceted-session-003"
+
+    def test_query_sessions_by_min_tokens(self, tool_with_facets):
+        """Filter sessions by minimum token usage."""
+        sessions = tool_with_facets.query_sessions(min_tokens=20000)
+        assert len(sessions) == 2
+        # Sessions with 50000 and 25000 tokens
+
+    def test_query_sessions_by_max_tokens(self, tool_with_facets):
+        """Filter sessions by maximum token usage."""
+        sessions = tool_with_facets.query_sessions(max_tokens=10000)
+        assert len(sessions) == 1
+        assert sessions[0].session_id == "faceted-session-002"
+
+    def test_query_sessions_by_workflow_pattern(self, tool_with_facets):
+        """Filter sessions by workflow pattern."""
+        sessions = tool_with_facets.query_sessions(workflow_pattern="multi_agent")
+        assert len(sessions) == 1
+        assert sessions[0].session_id == "faceted-session-001"
+
+    def test_query_sessions_by_agent_delegated_to(self, tool_with_facets):
+        """Filter sessions by agent delegation."""
+        sessions = tool_with_facets.query_sessions(agent_delegated_to="foundation:explorer")
+        assert len(sessions) == 1
+        assert sessions[0].session_id == "faceted-session-001"
+
+    def test_query_sessions_combined_filters(self, tool_with_facets):
+        """Combine multiple filters."""
+        sessions = tool_with_facets.query_sessions(
+            bundle="amplifier-dev",
+            has_errors=False,
+        )
+        assert len(sessions) == 1
+        assert sessions[0].session_id == "faceted-session-003"
+
+    def test_query_sessions_with_limit(self, tool_with_facets):
+        """Limit number of results."""
+        sessions = tool_with_facets.query_sessions(limit=2)
+        assert len(sessions) == 2
+
+    def test_query_sessions_date_filter(self, tool_with_facets):
+        """Filter sessions by creation date."""
+        # Sessions created after Jan 18
+
+        sessions = tool_with_facets.query_sessions(
+            created_after=datetime(2025, 1, 18, tzinfo=UTC)
+        )
+        assert len(sessions) == 2  # Sessions 002 and 003
+
+    def test_query_sessions_returns_session_info(self, tool_with_facets):
+        """Query returns proper SessionInfo objects."""
+        sessions = tool_with_facets.query_sessions(bundle="amplifier-dev")
+        assert len(sessions) >= 1
+
+        session = sessions[0]
+        assert session.session_id is not None
+        assert session.project == "test-project"
+        assert session.bundle == "amplifier-dev"
+        assert session.source == "local"
+        assert session.path is not None

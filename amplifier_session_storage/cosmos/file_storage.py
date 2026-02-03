@@ -229,12 +229,14 @@ class CosmosFileStorage:
     async def upsert_session_metadata(
         self,
         user_id: str,
+        host_id: str,
         metadata: dict[str, Any],
     ) -> None:
         """Upsert session metadata to Cosmos.
 
         Args:
             user_id: User ID (partition key)
+            host_id: Host/machine ID where session originated
             metadata: Session metadata dict (mirrors metadata.json)
         """
         container = self._get_container(SESSIONS_CONTAINER)
@@ -243,6 +245,7 @@ class CosmosFileStorage:
             **metadata,
             "id": metadata.get("session_id"),
             "user_id": user_id,
+            "host_id": host_id,
             "_type": "session",
             "synced_at": datetime.now(UTC).isoformat(),
         }
@@ -361,6 +364,7 @@ class CosmosFileStorage:
     async def sync_transcript_lines(
         self,
         user_id: str,
+        host_id: str,
         project_slug: str,
         session_id: str,
         lines: list[dict[str, Any]],
@@ -370,6 +374,7 @@ class CosmosFileStorage:
 
         Args:
             user_id: User ID
+            host_id: Host/machine ID where session originated
             project_slug: Project slug
             session_id: Session ID
             lines: List of message dicts (each = one JSONL line)
@@ -392,6 +397,7 @@ class CosmosFileStorage:
                 "id": f"{session_id}_msg_{sequence}",
                 "partition_key": partition_key,
                 "user_id": user_id,
+                "host_id": host_id,
                 "project_slug": project_slug,
                 "session_id": session_id,
                 "sequence": sequence,
@@ -467,6 +473,7 @@ class CosmosFileStorage:
     async def sync_event_lines(
         self,
         user_id: str,
+        host_id: str,
         project_slug: str,
         session_id: str,
         lines: list[dict[str, Any]],
@@ -478,6 +485,7 @@ class CosmosFileStorage:
 
         Args:
             user_id: User ID
+            host_id: Host/machine ID where session originated
             project_slug: Project slug
             session_id: Session ID
             lines: List of event dicts (each = one JSONL line)
@@ -506,6 +514,7 @@ class CosmosFileStorage:
                     "id": f"{session_id}_evt_{sequence}",
                     "partition_key": partition_key,
                     "user_id": user_id,
+                    "host_id": host_id,
                     "project_slug": project_slug,
                     "session_id": session_id,
                     "sequence": sequence,
@@ -525,6 +534,7 @@ class CosmosFileStorage:
                     "id": f"{session_id}_evt_{sequence}",
                     "partition_key": partition_key,
                     "user_id": user_id,
+                    "host_id": host_id,
                     "project_slug": project_slug,
                     "session_id": session_id,
                     "sequence": sequence,

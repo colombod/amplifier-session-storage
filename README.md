@@ -1,48 +1,24 @@
 # Amplifier Session Storage
 
-A foundational library for session persistence in Amplifier applications.
+A library for syncing Amplifier CLI session data to Azure Cosmos DB.
 
-## What This Library Is
+## Overview
 
-This is a **foundational library** (like `amplifier-core` and `amplifier-foundation`) that provides session storage infrastructure for building Amplifier applications. It is **not** a dynamically-loaded module.
+This library provides `CosmosFileStorage` - a storage backend that mirrors the Amplifier CLI's local session file format to Azure Cosmos DB. It enables syncing session data from multiple machines to a central cloud store while maintaining complete data parity.
 
-**How to use this library:**
-- Applications **import** it directly: `from amplifier_session_storage import ...`
-- Applications **instantiate** storage backends based on their configuration
-- Applications **inject** storage where session persistence is needed
-
-**This is NOT:**
-- A tool module with `mount()` (that pattern is for plugins like `tool-filesystem`)
-- Something you load via bundle YAML
-
-## Features
-
-- **Event-sourced architecture**: Sessions stored as immutable blocks for efficient sync
-- **Offline-first**: Works locally, syncs when connected
-- **Multi-device support**: Sequence-based merging handles concurrent edits
-- **Multi-tenant**: Team/org visibility controls for shared sessions
-- **Flexible authentication**: Supports key-based and Azure AD authentication
-- **Drop-in compatible**: Works with existing Amplifier session file format
+**Key Features:**
+- **CLI-compatible format**: Mirrors `metadata.json`, `transcript.jsonl`, and `events.jsonl` structure
+- **Multi-device tracking**: Every document includes `user_id` and `host_id` for origin tracking
+- **Incremental sync**: Supports delta sync via sequence numbers
+- **Separate containers**: Sessions, transcripts, and events in dedicated containers for efficient queries
 
 ## Installation
 
 ```bash
-# Basic installation (local storage only)
+# Basic installation
 uv pip install git+https://github.com/colombod/amplifier-session-storage
 
-# With Cosmos DB support (includes azure-identity for AAD auth)
-uv pip install "amplifier-session-storage[cosmos] @ git+https://github.com/colombod/amplifier-session-storage"
-
-# With real-time sync support
-uv pip install "amplifier-session-storage[sync] @ git+https://github.com/colombod/amplifier-session-storage"
-
-# Full installation (all features)
-uv pip install "amplifier-session-storage[all] @ git+https://github.com/colombod/amplifier-session-storage"
-```
-
-### Development Setup
-
-```bash
+# Development setup
 git clone https://github.com/colombod/amplifier-session-storage
 cd amplifier-session-storage
 uv sync --all-extras
@@ -51,579 +27,294 @@ uv run pytest tests/ -v
 
 ## Quick Start
 
-### Local Storage
-
 ```python
-from amplifier_session_storage import (
-    LocalBlockStorage,
-    StorageConfig,
-    BlockWriter,
-)
+from amplifier_session_storage import CosmosFileStorage, CosmosFileConfig
 
-# Create storage config
-config = StorageConfig(user_id="user-123")
+# Create config from environment variables
+config = CosmosFileConfig.from_env()
 
-# Create local storage
-storage = LocalBlockStorage(config)
+# Use as async context manager
+async with CosmosFileStorage(config) as storage:
+    # Upsert session metadata
+    await storage.upsert_session_metadata(
+        user_id="user-123",
+        host_id="laptop-01",
+        metadata={
+            "session_id": "sess-abc",
+            "project_slug": "my-project",
+            "bundle": "foundation",
+            "created": "2024-01-15T10:00:00Z",
+            "turn_count": 5,
+        },
+    )
 
-# Create a block writer for a session
-writer = BlockWriter(
-    session_id="sess-abc",
-    user_id="user-123",
-    device_id="device-001",
-)
+    # Sync transcript lines (incremental)
+    await storage.sync_transcript_lines(
+        user_id="user-123",
+        host_id="laptop-01",
+        project_slug="my-project",
+        session_id="sess-abc",
+        lines=[
+            {"role": "user", "content": "Hello", "turn": 0},
+            {"role": "assistant", "content": "Hi!", "turn": 0},
+        ],
+        start_sequence=0,
+    )
 
-# Write session blocks
-block = writer.create_session(project_slug="my-project", name="My Session")
-await storage.write_block(block)
-
-# Add messages
-msg_block = writer.add_message(role="user", content="Hello!", turn=1)
-await storage.write_block(msg_block)
-
-# Read blocks back
-blocks = await storage.read_blocks("sess-abc")
-
-# Clean up
-await storage.close()
+    # Sync event lines (incremental)
+    await storage.sync_event_lines(
+        user_id="user-123",
+        host_id="laptop-01",
+        project_slug="my-project",
+        session_id="sess-abc",
+        lines=[
+            {"event": "session.start", "ts": "2024-01-15T10:00:00Z", "lvl": "info"},
+            {"event": "llm.request", "ts": "2024-01-15T10:00:01Z", "lvl": "debug"},
+        ],
+        start_sequence=0,
+    )
 ```
 
-### Cosmos DB Storage
+## Configuration
 
-```python
-from amplifier_session_storage import (
-    CosmosBlockStorage,
-    StorageConfig,
-    CosmosAuthMethod,
-)
-
-# Using Azure AD authentication (recommended)
-config = StorageConfig(
-    user_id="user-123",
-    cosmos_endpoint="https://your-account.documents.azure.com:443/",
-    cosmos_auth_method=CosmosAuthMethod.DEFAULT_CREDENTIAL,
-    cosmos_database="amplifier-db",
-    cosmos_container="items",
-)
-
-storage = CosmosBlockStorage(config)
-# ... use like local storage
-await storage.close()
-```
-
-## Authentication Methods
-
-### 1. Azure AD DefaultAzureCredential (Recommended)
-
-Uses the Azure Identity SDK to automatically try multiple authentication methods:
-- Azure CLI credentials
-- Environment variables
-- Managed Identity
-- Visual Studio Code credentials
-- And more...
-
-```python
-config = StorageConfig(
-    user_id="user-123",
-    cosmos_endpoint="https://your-account.documents.azure.com:443/",
-    cosmos_auth_method=CosmosAuthMethod.DEFAULT_CREDENTIAL,
-)
-```
-
-**Required Azure RBAC role**: `Cosmos DB Built-in Data Contributor`
-
-To assign the role:
-```bash
-# Get your user object ID
-az ad signed-in-user show --query id -o tsv
-
-# Assign role (replace with your values)
-az cosmosdb sql role assignment create \
-    --account-name your-cosmos-account \
-    --resource-group your-resource-group \
-    --role-definition-name "Cosmos DB Built-in Data Contributor" \
-    --principal-id YOUR_USER_OBJECT_ID \
-    --scope "/"
-```
-
-### 2. Managed Identity
-
-For Azure-hosted services (App Service, Functions, AKS, VMs):
-
-```python
-# System-assigned managed identity
-config = StorageConfig(
-    user_id="user-123",
-    cosmos_endpoint="https://your-account.documents.azure.com:443/",
-    cosmos_auth_method=CosmosAuthMethod.MANAGED_IDENTITY,
-)
-
-# User-assigned managed identity
-config = StorageConfig(
-    user_id="user-123",
-    cosmos_endpoint="https://your-account.documents.azure.com:443/",
-    cosmos_auth_method=CosmosAuthMethod.MANAGED_IDENTITY,
-    azure_client_id="your-managed-identity-client-id",
-)
-```
-
-### 3. Service Principal
-
-For CI/CD pipelines and automation:
-
-```python
-config = StorageConfig(
-    user_id="user-123",
-    cosmos_endpoint="https://your-account.documents.azure.com:443/",
-    cosmos_auth_method=CosmosAuthMethod.SERVICE_PRINCIPAL,
-    azure_tenant_id="your-tenant-id",
-    azure_client_id="your-client-id",
-    azure_client_secret="your-client-secret",  # Keep secure!
-)
-```
-
-**⚠️ Security Note**: Never commit secrets to source control. Use environment variables or a secret manager.
-
-### 4. Key-Based Authentication
-
-For development/testing (if organization policy allows):
-
-```python
-config = StorageConfig(
-    user_id="user-123",
-    cosmos_endpoint="https://your-account.documents.azure.com:443/",
-    cosmos_auth_method=CosmosAuthMethod.KEY,
-    cosmos_key="your-cosmos-key",  # Keep secure!
-)
-```
-
-## Environment Variables
-
-All configuration can be provided via environment variables:
+### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `AMPLIFIER_COSMOS_ENDPOINT` | Cosmos DB endpoint URL | - |
-| `AMPLIFIER_COSMOS_AUTH_METHOD` | Auth method: `default_credential`, `managed_identity`, `service_principal`, `key` | `default_credential` |
-| `AMPLIFIER_COSMOS_KEY` | Cosmos DB key (for key auth) | - |
+| `AMPLIFIER_COSMOS_ENDPOINT` | Cosmos DB endpoint URL | **Required** |
 | `AMPLIFIER_COSMOS_DATABASE` | Database name | `amplifier-db` |
-| `AMPLIFIER_COSMOS_CONTAINER` | Container name | `items` |
-| `AMPLIFIER_COSMOS_PARTITION_KEY` | Partition key path | `/partitionKey` |
-| `AMPLIFIER_LOCAL_STORAGE_PATH` | Local storage path | `~/.amplifier/sessions` |
-| `AMPLIFIER_ENABLE_SYNC` | Enable cloud sync | `false` |
-| `AZURE_TENANT_ID` | Azure tenant ID (for service principal) | - |
-| `AZURE_CLIENT_ID` | Azure client ID (for service principal/managed identity) | - |
-| `AZURE_CLIENT_SECRET` | Azure client secret (for service principal) | - |
-
-Example using environment variables:
-
-```python
-from amplifier_session_storage import StorageConfig
-
-# Load from environment
-config = StorageConfig.from_environment(user_id="user-123")
-```
-
-## Cosmos DB Setup
-
-### Container Configuration
-
-The storage expects a container with the following configuration:
-
-| Setting | Value |
-|---------|-------|
-| Partition Key | `/partitionKey` |
-| Indexing Policy | Automatic (see below for optimization) |
-
-### Recommended Indexing Policy
-
-```json
-{
-    "indexingMode": "consistent",
-    "automatic": true,
-    "includedPaths": [{"path": "/*"}],
-    "excludedPaths": [
-        {"path": "/data/*"},
-        {"path": "/\"_etag\"/?"}
-    ],
-    "compositeIndexes": [
-        [
-            {"path": "/user_id", "order": "ascending"},
-            {"path": "/timestamp", "order": "descending"}
-        ],
-        [
-            {"path": "/session_id", "order": "ascending"},
-            {"path": "/sequence", "order": "ascending"}
-        ],
-        [
-            {"path": "/org_id", "order": "ascending"},
-            {"path": "/visibility", "order": "ascending"},
-            {"path": "/timestamp", "order": "descending"}
-        ]
-    ]
-}
-```
-
-## Session Visibility
-
-Sessions can be shared with different visibility levels:
-
-| Visibility | Who Can Access |
-|------------|----------------|
-| `private` | Only the owner |
-| `team` | Owner + users in specified teams |
-| `org` | All users in the organization |
-| `public` | Anyone |
-
-```python
-# Create a team-visible session
-block = writer.create_session(
-    project_slug="my-project",
-    name="Team Session",
-    visibility="team",
-    org_id="org-123",
-    team_ids=["team-a", "team-b"],
-)
-```
-
-## Migration from Legacy Sessions
-
-Migrate existing `events.jsonl` sessions to block format:
-
-```python
-from pathlib import Path
-from amplifier_session_storage import (
-    SessionMigrator,
-    LocalBlockStorage,
-    StorageConfig,
-)
-
-# Create storage
-config = StorageConfig(user_id="user-123")
-storage = LocalBlockStorage(config)
-
-# Create migrator
-migrator = SessionMigrator(storage, user_id="user-123")
-
-# Discover existing sessions
-sources = await migrator.discover_sessions(
-    Path("~/.amplifier/sessions").expanduser()
-)
-
-print(f"Found {len(sources)} sessions to migrate")
-
-# Migrate with progress callback
-def on_progress(result, index, total):
-    print(f"[{index}/{total}] {result.session_id}: {result.status.value}")
-
-batch = await migrator.migrate_batch(sources, on_progress=on_progress)
-
-print(f"Completed: {batch.completed}, Failed: {batch.failed}")
-```
-
-## Architecture
-
-### Block Types
-
-| Type | Description |
-|------|-------------|
-| `SESSION_CREATED` | Initial session metadata |
-| `SESSION_UPDATED` | Metadata changes |
-| `MESSAGE` | Conversation messages |
-| `EVENT` | Tool calls, LLM responses, etc. |
-| `EVENT_CHUNK` | Large event continuations |
-| `REWIND` | History truncation markers |
-| `FORK` | Session fork points |
-
-### Partition Strategy
-
-Blocks are partitioned by `{user_id}_{session_id}`:
-- All blocks for a session in one partition (efficient reads)
-- User-scoped queries without cross-partition scans
-- Team/org access via secondary queries
-
-### Sync Protocol
-
-1. Local writes are immediate
-2. Background sync uploads new blocks to Cosmos
-3. Sequence numbers enable conflict-free merging
-4. Hybrid storage combines both for offline-first with cloud backup
-
-## Building Amplifier Applications
-
-This library is designed to be used by Amplifier applications (like `amplifier-app-cli`) to provide session persistence. Here's how to integrate it.
-
-### Basic Application Integration
-
-```python
-"""Example: Building an Amplifier application with session storage."""
-
-from amplifier_core import AmplifierSession
-from amplifier_session_storage import (
-    LocalBlockStorage,
-    HybridBlockStorage,
-    StorageConfig,
-    SessionStore,
-)
-import os
-
-def create_storage():
-    """Create appropriate storage backend based on environment."""
-    user_id = os.getenv("USER", "default-user")
-    
-    # Check if Cosmos DB is configured
-    if os.getenv("AMPLIFIER_COSMOS_ENDPOINT"):
-        # Hybrid mode: local + cloud sync
-        config = StorageConfig(
-            user_id=user_id,
-            cosmos_endpoint=os.getenv("AMPLIFIER_COSMOS_ENDPOINT"),
-            enable_sync=True,
-        )
-        return HybridBlockStorage(config)
-    else:
-        # Local only (default)
-        config = StorageConfig(user_id=user_id)
-        return LocalBlockStorage(config)
-
-# In your application startup:
-storage = create_storage()
-
-# Use the drop-in compatible SessionStore for simple cases
-store = SessionStore(storage=storage)
-
-# Save a session
-await store.save(
-    session_id="sess-123",
-    transcript=[{"role": "user", "content": "Hello"}],
-    metadata={"project": "my-project"},
-)
-
-# Load a session
-transcript, metadata = await store.load("sess-123")
-```
-
-### Advanced: Custom Session Tool for Agents
-
-If you want agents to query session data, create a tool in your application:
-
-```python
-"""Example: Creating a session query tool for agents."""
-
-from amplifier_session_storage.tools import SessionTool, SessionToolConfig
-
-# Create the tool with your configuration
-session_tool = SessionTool(
-    SessionToolConfig(
-        project_slug="my-project",
-        max_results=50,
-        max_excerpt_length=500,
-    )
-)
-
-# Register with your agent/coordinator (application-specific)
-# This depends on how your application handles tool registration
-coordinator.register_tool(session_tool)
-```
-
-### Integration Pattern with amplifier-app-cli
-
-For `amplifier-app-cli` or similar applications, the integration follows this pattern:
-
-```python
-"""Proposed integration pattern for amplifier-app-cli."""
-
-from amplifier_session_storage import (
-    StorageConfig,
-    LocalBlockStorage,
-    CosmosBlockStorage,
-    HybridBlockStorage,
-)
-
-def load_storage_from_settings(settings: dict, user_id: str):
-    """Load storage backend from settings.yaml configuration."""
-    storage_config = settings.get("session_storage", {})
-    mode = storage_config.get("mode", "local")
-    
-    config = StorageConfig(user_id=user_id)
-    
-    if mode == "local":
-        return LocalBlockStorage(config)
-    
-    elif mode == "cloud":
-        cloud = storage_config.get("cloud", {})
-        config.cosmos_endpoint = cloud.get("endpoint")
-        config.cosmos_database = cloud.get("database", "amplifier-db")
-        config.cosmos_container = cloud.get("container", "items")
-        return CosmosBlockStorage(config)
-    
-    elif mode == "hybrid":
-        cloud = storage_config.get("cloud", {})
-        config.cosmos_endpoint = cloud.get("endpoint")
-        config.enable_sync = storage_config.get("sync", {}).get("enabled", True)
-        return HybridBlockStorage(config)
-    
-    raise ValueError(f"Unknown storage mode: {mode}")
-```
-
-## Integration with Amplifier CLI (Proposed)
-
-This section describes the proposed integration with `amplifier-app-cli` via `settings.yaml`. This will be implemented in a future pass.
-
-### Settings.yaml Schema
-
-```yaml
-# ~/.amplifier/settings.yaml
-
-providers:
-  - module: provider-anthropic
-    config:
-      priority: 1
-
-# Session storage configuration
-session_storage:
-  # Storage mode: "local", "cloud", or "hybrid"
-  mode: hybrid
-  
-  # Local storage settings
-  local:
-    path: ~/.amplifier/sessions
-    
-  # Cloud storage settings (Cosmos DB)
-  cloud:
-    endpoint: https://your-account.documents.azure.com:443/
-    database: amplifier-db
-    container: items
-    # Auth method: default_credential, managed_identity, service_principal
-    auth_method: default_credential
-  
-  # Sync settings (for hybrid mode)
-  sync:
-    enabled: true
-    interval: 5.0
-    conflict_resolution: merge  # local_wins, remote_wins, merge
-```
-
-### Configuration Examples
-
-#### Local Only (Default)
-
-```yaml
-session_storage:
-  mode: local
-```
-
-#### Cloud with Azure AD (Recommended)
-
-No secrets needed - uses `az login` credentials:
-
-```yaml
-session_storage:
-  mode: cloud
-  cloud:
-    endpoint: https://your-account.documents.azure.com:443/
-    # auth_method: default_credential (this is the default)
-```
-
-#### Hybrid for Multi-Device
-
-```yaml
-session_storage:
-  mode: hybrid
-  cloud:
-    endpoint: https://your-account.documents.azure.com:443/
-  sync:
-    enabled: true
-    conflict_resolution: merge
-```
-
-#### CI/CD with Service Principal
-
-Secrets via environment variables:
-
-```yaml
-session_storage:
-  mode: cloud
-  cloud:
-    endpoint: https://your-account.documents.azure.com:443/
-    auth_method: service_principal
-    tenant_id: ${AZURE_TENANT_ID}
-    client_id: ${AZURE_CLIENT_ID}
-    client_secret: ${AZURE_CLIENT_SECRET}
-```
-
-#### Azure-Hosted with Managed Identity
-
-```yaml
-session_storage:
-  mode: cloud
-  cloud:
-    endpoint: https://your-account.documents.azure.com:443/
-    auth_method: managed_identity
-    # For user-assigned identity:
-    # client_id: your-managed-identity-client-id
-```
+| `AMPLIFIER_COSMOS_AUTH_METHOD` | `default_credential` or `key` | `default_credential` |
+| `AMPLIFIER_COSMOS_KEY` | Cosmos DB key (only if auth_method=key) | - |
 
 ### Authentication Methods
 
-| Method | Use Case | Secrets Required |
-|--------|----------|------------------|
-| `default_credential` | Developer workstation | None (uses `az login`) |
-| `managed_identity` | Azure App Service, Functions, AKS | None |
-| `service_principal` | CI/CD pipelines | Via `${ENV_VAR}` |
+#### Azure AD (Recommended)
 
-### Security Notes
+Uses `DefaultAzureCredential` which automatically tries:
+- Azure CLI credentials (`az login`)
+- Environment variables
+- Managed Identity
+- Visual Studio Code credentials
 
-**Safe to put in settings.yaml:**
-- Cosmos DB endpoint URLs
-- Database/container names
-- Auth method selection
-- Environment variable references (`${VAR}`)
+```python
+config = CosmosFileConfig(
+    endpoint="https://your-account.documents.azure.com:443/",
+    database_name="amplifier-db",
+    auth_method="default_credential",
+)
+```
 
-**Never put in settings.yaml:**
-- Cosmos DB keys
-- Client secrets
-- Any raw credentials
-
-### Required Azure Setup
-
-For Azure AD authentication, assign the Cosmos DB RBAC role:
+**Required RBAC role**: `Cosmos DB Built-in Data Contributor`
 
 ```bash
-# Get your user/service principal object ID
-az ad signed-in-user show --query id -o tsv
-
-# Assign Cosmos DB Built-in Data Contributor role
+# Assign role to your user
 az cosmosdb sql role assignment create \
     --account-name your-cosmos-account \
     --resource-group your-resource-group \
     --role-definition-name "Cosmos DB Built-in Data Contributor" \
-    --principal-id YOUR_OBJECT_ID \
+    --principal-id $(az ad signed-in-user show --query id -o tsv) \
     --scope "/"
 ```
 
-### Implementation Status
+#### Key-Based (Development)
 
-- [x] Core storage backends (Local, Cosmos, Hybrid)
-- [x] Azure AD authentication support
-- [x] Environment variable configuration
-- [ ] Settings.yaml loader integration
-- [ ] CLI commands for storage management
+```python
+config = CosmosFileConfig(
+    endpoint="https://your-account.documents.azure.com:443/",
+    database_name="amplifier-db",
+    auth_method="key",
+    key="your-cosmos-key",
+)
+```
+
+## Data Model
+
+### Container Structure
+
+The storage creates three containers with optimized partition keys:
+
+| Container | Partition Key | Contents |
+|-----------|---------------|----------|
+| `sessions` | `/user_id` | Session metadata (one doc per session) |
+| `transcripts` | `/partition_key` | Transcript messages (one doc per message) |
+| `events` | `/partition_key` | Events (one doc per event) |
+
+### Document Schema
+
+#### Session Metadata
+
+```json
+{
+    "id": "sess-abc",
+    "user_id": "user-123",
+    "host_id": "laptop-01",
+    "session_id": "sess-abc",
+    "project_slug": "my-project",
+    "bundle": "foundation",
+    "created": "2024-01-15T10:00:00Z",
+    "turn_count": 5,
+    "_type": "session",
+    "synced_at": "2024-01-15T12:00:00Z"
+}
+```
+
+#### Transcript Message
+
+```json
+{
+    "id": "sess-abc_msg_0",
+    "partition_key": "user-123|my-project|sess-abc",
+    "user_id": "user-123",
+    "host_id": "laptop-01",
+    "project_slug": "my-project",
+    "session_id": "sess-abc",
+    "sequence": 0,
+    "role": "user",
+    "content": "Hello",
+    "turn": 0,
+    "_type": "transcript_message",
+    "synced_at": "2024-01-15T12:00:00Z"
+}
+```
+
+#### Event
+
+```json
+{
+    "id": "sess-abc_evt_0",
+    "partition_key": "user-123|my-project|sess-abc",
+    "user_id": "user-123",
+    "host_id": "laptop-01",
+    "project_slug": "my-project",
+    "session_id": "sess-abc",
+    "sequence": 0,
+    "event": "session.start",
+    "ts": "2024-01-15T10:00:00Z",
+    "lvl": "info",
+    "data_truncated": false,
+    "data_size_bytes": 150,
+    "_type": "event",
+    "synced_at": "2024-01-15T12:00:00Z"
+}
+```
+
+### Large Event Handling
+
+Events larger than 400KB are stored with `data_truncated: true` and only summary fields preserved:
+- `event`, `ts`, `lvl`, `turn`
+- `data_size_bytes` (original size)
+
+This prevents Cosmos DB document size limit issues while preserving queryable metadata.
+
+## API Reference
+
+### CosmosFileStorage
+
+```python
+class CosmosFileStorage:
+    """Cosmos DB storage that mirrors CLI file format."""
+
+    async def initialize() -> None
+    async def close() -> None
+    async def verify_connection() -> bool
+
+    # Session metadata
+    async def upsert_session_metadata(user_id, host_id, metadata) -> None
+    async def get_session_metadata(user_id, session_id) -> dict | None
+    async def list_sessions(user_id, project_slug=None, limit=100) -> list[dict]
+    async def delete_session(user_id, project_slug, session_id) -> bool
+
+    # Transcript
+    async def sync_transcript_lines(user_id, host_id, project_slug, session_id, lines, start_sequence=0) -> int
+    async def get_transcript_lines(user_id, project_slug, session_id, after_sequence=-1) -> list[dict]
+    async def get_transcript_count(user_id, project_slug, session_id) -> int
+
+    # Events
+    async def sync_event_lines(user_id, host_id, project_slug, session_id, lines, start_sequence=0) -> int
+    async def get_event_lines(user_id, project_slug, session_id, after_sequence=-1) -> list[dict]
+    async def get_event_count(user_id, project_slug, session_id) -> int
+
+    # Utilities
+    @staticmethod
+    def make_partition_key(user_id, project_slug, session_id) -> str
+```
+
+### CosmosFileConfig
+
+```python
+@dataclass
+class CosmosFileConfig:
+    endpoint: str              # Cosmos DB endpoint URL
+    database_name: str         # Database name (default: "amplifier-db")
+    auth_method: str           # "default_credential" or "key"
+    key: str | None            # Cosmos key (only if auth_method="key")
+
+    @classmethod
+    def from_env(cls) -> CosmosFileConfig
+```
+
+## Incremental Sync Pattern
+
+The storage supports efficient incremental sync via sequence numbers:
+
+```python
+# Get current sync status
+transcript_count = await storage.get_transcript_count(user_id, project_slug, session_id)
+event_count = await storage.get_event_count(user_id, project_slug, session_id)
+
+# Sync only new lines (after existing ones)
+new_transcript_lines = local_transcript[transcript_count:]
+new_event_lines = local_events[event_count:]
+
+if new_transcript_lines:
+    await storage.sync_transcript_lines(
+        user_id, host_id, project_slug, session_id,
+        lines=new_transcript_lines,
+        start_sequence=transcript_count,
+    )
+
+if new_event_lines:
+    await storage.sync_event_lines(
+        user_id, host_id, project_slug, session_id,
+        lines=new_event_lines,
+        start_sequence=event_count,
+    )
+```
+
+## Identity Management
+
+The library includes identity utilities for consistent user/device tracking:
+
+```python
+from amplifier_session_storage import IdentityContext
+
+# Initialize identity context
+IdentityContext.initialize()
+
+# Get user and host IDs
+user_id = IdentityContext.get_user_id()
+host_id = IdentityContext.get_host_id()
+```
 
 ## Development
 
 ```bash
 # Install development dependencies
-pip install -e ".[dev]"
+uv sync --all-extras
 
 # Run tests
-pytest tests/ -v
+uv run pytest tests/ -v
 
-# Run linting
-ruff check .
-ruff format .
+# Run tests with Cosmos DB (requires environment setup)
+export AMPLIFIER_COSMOS_ENDPOINT="https://your-account.documents.azure.com:443/"
+uv run pytest tests/test_cosmos_file_storage.py -v
+
+# Linting and formatting
+uv run ruff check .
+uv run ruff format .
 
 # Type checking
-pyright
+uv run pyright
 ```
 
 ## License

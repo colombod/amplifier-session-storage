@@ -1,540 +1,333 @@
-# Session Storage Architecture
+# Architecture
 
-This document describes the architecture of the Amplifier Session Storage system, designed to support both local file storage and Azure Cosmos DB with offline-first synchronization.
+This document describes the architecture of the Amplifier Session Storage library.
 
 ## Overview
 
+The library provides a simple, focused solution for syncing Amplifier CLI session data to Azure Cosmos DB. It mirrors the CLI's local file format (metadata.json, transcript.jsonl, events.jsonl) to cloud storage with complete data parity.
+
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              APPLICATION LAYER                                   │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │
-│  │ AmplifierTUI│  │ AmplifierAPI│  │   Recipes   │  │    Session-Analyst      │ │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └───────────┬─────────────┘ │
-└─────────┼────────────────┼────────────────┼─────────────────────┼───────────────┘
-          │                │                │                     │
-          ▼                ▼                ▼                     ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           SESSION STORAGE PROTOCOL                               │
-│  ┌────────────────────────────────────────────────────────────────────────────┐ │
-│  │                        SessionStorage (ABC)                                │ │
-│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌─────────────────┐   │ │
-│  │  │ Session CRUD │ │   Events     │ │  Transcript  │ │    Queries      │   │ │
-│  │  │ create/read/ │ │ append_event │ │ append_msg   │ │ query_events    │   │ │
-│  │  │ update/list/ │ │ (append-only)│ │ compact      │ │ (projection!)   │   │ │
-│  │  │ delete       │ │              │ │ rewind       │ │ get_aggregates  │   │ │
-│  │  └──────────────┘ └──────────────┘ └──────────────┘ └─────────────────┘   │ │
-│  └────────────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────────────┘
-          │                                          │
-          ▼                                          ▼
-┌─────────────────────────────┐             ┌─────────────────────────────────────────┐
-│   LocalFileStorage          │             │        SyncedCosmosStorage              │
-│ ┌─────────────────────────┐ │             │  ┌────────────────────────────────────┐ │
-│ │ ~/.amplifier/           │ │             │  │           SyncEngine               │ │
-│ │   projects/             │ │◄───────────►│  │  ┌─────────┐    ┌──────────────┐  │ │
-│ │     {project}/          │ │  Sync       │  │  │ Change  │    │  Conflict    │  │ │
-│ │       sessions/         │ │  Protocol   │  │  │ Tracker │    │  Resolver    │  │ │
-│ │         {id}/           │ │             │  │  └─────────┘    └──────────────┘  │ │
-│ │           metadata      │ │             │  └────────────────────────────────────┘ │
-│ │           transcript    │ │             │         │                    │          │
-│ │           events        │ │             │         ▼                    ▼          │
-│ └─────────────────────────┘ │             │  ┌───────────────┐  ┌────────────────┐  │
-└─────────────────────────────┘             │  │LocalFileCache │  │ CosmosDBClient │  │
-                                            │  │ (offline ops) │  │ (cloud sync)   │  │
-                                            │  └───────────────┘  └────────────────┘  │
-                                            └─────────────────────────────────────────┘
-                                                                           │
-                                                                           ▼
-                                            ┌─────────────────────────────────────────┐
-                                            │            Azure Cosmos DB              │
-                                            │  ┌──────────┐ ┌──────────┐ ┌─────────┐ │
-                                            │  │ sessions │ │ messages │ │ events  │ │
-                                            │  │/user_id  │ │/user_id- │ │/user_id-│ │
-                                            │  │          │ │session_id│ │session  │ │
-                                            │  └──────────┘ └──────────┘ └─────────┘ │
-                                            │        ▲            │                   │
-                                            │        │     Large events (>400KB)      │
-                                            │        │            ▼                   │
-                                            │        │     ┌──────────────┐           │
-                                            │        └─────┤ event_chunks │           │
-                                            │              │ (overflow)   │           │
-                                            │              └──────────────┘           │
-                                            └─────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    Amplifier CLI (Local)                        │
+│                                                                 │
+│  ~/.amplifier/projects/{project}/sessions/{session}/            │
+│  ├── metadata.json      → Session metadata                      │
+│  ├── transcript.jsonl   → Conversation messages                 │
+│  └── events.jsonl       → Session events                        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ Session Sync Daemon
+                              │ (reads local files)
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    CosmosFileStorage                            │
+│                                                                 │
+│  - upsert_session_metadata()                                    │
+│  - sync_transcript_lines()                                      │
+│  - sync_event_lines()                                           │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ Azure SDK
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Azure Cosmos DB                              │
+│                                                                 │
+│  Database: amplifier-db                                         │
+│  ├── sessions      (partition: /user_id)                        │
+│  ├── transcripts   (partition: /partition_key)                  │
+│  └── events        (partition: /partition_key)                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## Core Design Principles
+## Design Principles
 
-### 1. User Isolation
+### 1. CLI Format Parity
 
-**All queries MUST include user_id.** This is enforced at the protocol level:
+The storage preserves the exact structure of local CLI files:
+- **metadata.json** → `sessions` container (one document per session)
+- **transcript.jsonl** → `transcripts` container (one document per line)
+- **events.jsonl** → `events` container (one document per line)
+
+No data transformation or loss occurs during sync.
+
+### 2. Multi-Device Origin Tracking
+
+Every document includes:
+- `user_id`: The user who owns the session
+- `host_id`: The machine where the session originated
+
+This enables:
+- Querying sessions by origin machine
+- Detecting conflicts from concurrent edits
+- Audit trail for session activity
+
+### 3. Incremental Sync
+
+Sequence numbers enable efficient delta sync:
+- Transcript lines have `sequence` (0, 1, 2, ...)
+- Event lines have `sequence` (0, 1, 2, ...)
+- Sync daemon queries current count, sends only new lines
+
+### 4. Query-Optimized Partitioning
+
+Container partition keys are chosen for efficient queries:
+
+| Container | Partition Key | Rationale |
+|-----------|---------------|-----------|
+| `sessions` | `/user_id` | List all sessions for a user efficiently |
+| `transcripts` | `/partition_key` | All messages for a session in one partition |
+| `events` | `/partition_key` | All events for a session in one partition |
+
+The composite partition key format is: `{user_id}|{project_slug}|{session_id}`
+
+## Components
+
+### CosmosFileStorage
+
+The main storage class providing:
 
 ```python
-# Every method requires user_id
-async def get_session(self, user_id: str, session_id: str) -> SessionMetadata | None
-async def append_message(self, user_id: str, session_id: str, message: TranscriptMessage)
+class CosmosFileStorage:
+    # Lifecycle
+    async def initialize() -> None
+    async def close() -> None
+    async def verify_connection() -> bool
+
+    # Session metadata (sessions container)
+    async def upsert_session_metadata(user_id, host_id, metadata) -> None
+    async def get_session_metadata(user_id, session_id) -> dict | None
+    async def list_sessions(user_id, project_slug?, limit?) -> list[dict]
+    async def delete_session(user_id, project_slug, session_id) -> bool
+
+    # Transcript messages (transcripts container)
+    async def sync_transcript_lines(user_id, host_id, project_slug, session_id, lines, start_sequence?) -> int
+    async def get_transcript_lines(user_id, project_slug, session_id, after_sequence?) -> list[dict]
+    async def get_transcript_count(user_id, project_slug, session_id) -> int
+
+    # Events (events container)
+    async def sync_event_lines(user_id, host_id, project_slug, session_id, lines, start_sequence?) -> int
+    async def get_event_lines(user_id, project_slug, session_id, after_sequence?) -> list[dict]
+    async def get_event_count(user_id, project_slug, session_id) -> int
 ```
 
-In Cosmos DB, user_id is part of the partition key, making cross-user queries **impossible by design**.
+### CosmosFileConfig
 
-### 2. Event Projection Enforcement
-
-Events can contain 100k+ tokens (full LLM responses). The protocol **prevents accidental retrieval**:
+Configuration for Cosmos DB connection:
 
 ```python
-# Safe: Returns EventSummary (small metadata only)
-async def query_events(self, query: EventQuery) -> list[EventSummary]
+@dataclass
+class CosmosFileConfig:
+    endpoint: str           # Cosmos DB account endpoint
+    database_name: str      # Database name (default: "amplifier-db")
+    auth_method: str        # "default_credential" or "key"
+    key: str | None         # Account key (only for key auth)
 
-# Explicit: Full data retrieval (separate method, use sparingly)
-async def get_event_data(self, user_id: str, session_id: str, event_id: str) -> dict | None
+    @classmethod
+    def from_env(cls) -> CosmosFileConfig
 ```
 
-The `EventProjection` TypedDict explicitly lists safe fields:
-- `event_id`, `event_type`, `ts`, `session_id`, `turn`
-- `model`, `usage`, `duration_ms`
-- `has_tool_calls`, `has_error`, `error_type`, `tool_name`
+### Identity Module
 
-**Never includes**: `data`, `content`, or other large payload fields.
+Utilities for consistent user/device identification:
 
-### 3. Offline-First Operation
+```python
+class IdentityContext:
+    @classmethod
+    def initialize() -> None
+    
+    @classmethod
+    def get_user_id() -> str
+    
+    @classmethod
+    def get_host_id() -> str
+```
 
-The `SyncedCosmosStorage` enables:
-1. Writes go to local storage immediately
-2. Changes tracked in sync queue
-3. Background sync uploads when connected
-4. Reads prefer local, fallback to cloud
+## Data Flow
 
-### 4. Atomic Rewind Operations
+### Sync Flow (Daemon → Cosmos)
 
-Transcript and events must stay in sync. Rewind operations:
-1. Create backup files (local) or snapshots (cloud)
-2. Truncate both transcript and events atomically
-3. Update session metadata (turn_count, message_count)
+```
+1. Daemon discovers local sessions
+   └── Scans ~/.amplifier/projects/*/sessions/*/
 
-## Data Model
+2. For each session, daemon calls server API:
+   └── POST /api/v1/sessions/{id}/sync-status
+       Returns: { event_count, transcript_count }
 
-### Cosmos DB Containers
+3. Daemon reads local files and calculates delta:
+   └── new_events = local_events[event_count:]
+   └── new_transcripts = local_transcripts[transcript_count:]
 
-| Container | Partition Key | Document Types |
-|-----------|---------------|----------------|
-| `sessions` | `/user_id` | SessionMetadata |
-| `transcript_messages` | `/user_id_session_id` | TranscriptMessage |
-| `events` | `/user_id_session_id` | EventRecord |
-| `event_chunks` | `/user_id_session_id` | EventChunk (for >400KB events) |
-| `sync_state` | `/user_id_device_id` | SyncState, PendingChange |
+4. Daemon sends incremental updates:
+   └── POST /api/v1/sessions/{id}/metadata
+   └── POST /api/v1/sessions/{id}/events
+   └── POST /api/v1/sessions/{id}/transcript
 
-### Session Metadata
+5. Server uses CosmosFileStorage to persist:
+   └── storage.upsert_session_metadata(...)
+   └── storage.sync_event_lines(...)
+   └── storage.sync_transcript_lines(...)
+```
+
+### Query Flow (Client → Cosmos)
+
+```
+1. Client requests session list:
+   └── GET /api/v1/sessions?user_id=X&project=Y
+
+2. Server queries Cosmos:
+   └── storage.list_sessions(user_id, project_slug)
+
+3. Cosmos executes efficient partition query:
+   └── Query scoped to user_id partition
+   └── Optional project_slug filter
+
+4. Results returned with full metadata
+```
+
+## Document Schemas
+
+### Session Document
 
 ```json
 {
-  "id": "{session_id}",
-  "user_id": "user_abc123",
-  "session_id": "c3843177-7ec7-4c7b-a9f0-24fab9291bf5",
-  "project_slug": "amplifier-core",
-  "parent_id": null,
-  "created": "2025-01-15T10:30:00Z",
-  "updated": "2025-01-15T11:45:00Z",
-  "name": "Implementing auth system",
-  "bundle": "foundation",
-  "model": "claude-sonnet-4-20250514",
-  "turn_count": 12,
-  "message_count": 47,
-  "event_count": 234
+    "id": "session-id",
+    "user_id": "user-123",
+    "host_id": "laptop-01",
+    "session_id": "session-id",
+    "project_slug": "my-project",
+    "bundle": "foundation",
+    "created": "2024-01-15T10:00:00Z",
+    "updated": "2024-01-15T12:00:00Z",
+    "turn_count": 5,
+    "parent_id": null,
+    "trace_id": "trace-xyz",
+    "config": { ... },
+    "_type": "session",
+    "synced_at": "2024-01-15T12:00:00Z"
 }
 ```
 
-### Transcript Message
+### Transcript Document
 
 ```json
 {
-  "id": "{session_id}_{sequence}",
-  "user_id_session_id": "user_abc123_c3843177-...",
-  "user_id": "user_abc123",
-  "session_id": "c3843177-...",
-  "sequence": 15,
-  "role": "assistant",
-  "content": "...",
-  "tool_calls": [...],
-  "timestamp": "2025-01-15T11:42:00Z",
-  "turn": 6
+    "id": "session-id_msg_0",
+    "partition_key": "user-123|my-project|session-id",
+    "user_id": "user-123",
+    "host_id": "laptop-01",
+    "project_slug": "my-project",
+    "session_id": "session-id",
+    "sequence": 0,
+    "role": "user",
+    "content": "Hello",
+    "timestamp": "2024-01-15T10:00:00Z",
+    "turn": 0,
+    "_type": "transcript_message",
+    "synced_at": "2024-01-15T12:00:00Z"
 }
 ```
 
-### Event Record
+### Event Document
 
 ```json
 {
-  "id": "{session_id}_{event_id}",
-  "user_id_session_id": "user_abc123_c3843177-...",
-  "user_id": "user_abc123",
-  "session_id": "c3843177-...",
-  "event_id": "evt_a1b2c3d4",
-  "event_type": "llm:response",
-  "ts": "2025-01-15T11:42:00.123Z",
-  "turn": 6,
-  
-  "summary": {
-    "model": "claude-sonnet-4-20250514",
-    "usage": {"input_tokens": 12500, "output_tokens": 850},
-    "duration_ms": 2340,
-    "has_tool_calls": true
-  },
-  
-  "data_size_bytes": 450000,
-  "is_chunked": true,
-  "chunk_count": 3
+    "id": "session-id_evt_0",
+    "partition_key": "user-123|my-project|session-id",
+    "user_id": "user-123",
+    "host_id": "laptop-01",
+    "project_slug": "my-project",
+    "session_id": "session-id",
+    "sequence": 0,
+    "event": "session.start",
+    "ts": "2024-01-15T10:00:00Z",
+    "lvl": "info",
+    "turn": 0,
+    "data": { ... },
+    "data_truncated": false,
+    "data_size_bytes": 150,
+    "_type": "event",
+    "synced_at": "2024-01-15T12:00:00Z"
 }
 ```
 
 ## Large Event Handling
 
-Events exceeding 400KB are chunked:
+Events larger than 400KB (Cosmos document size considerations) are handled specially:
 
-```
-Event Size        | Storage Strategy
-------------------+------------------------------------------
-< 400KB          | Single document with inline data
-400KB - 2MB      | EventRecord (summary) + EventChunks
-> 2MB            | Rejected (Cosmos DB limit)
-```
+1. **Detection**: `len(json.dumps(event).encode()) > 400KB`
+2. **Truncation**: Only summary fields stored:
+   - `event`, `ts`, `lvl`, `turn`
+   - `data_truncated: true`
+   - `data_size_bytes`: original size
+3. **Full data**: Remains in local `events.jsonl` file
 
-Reassembly:
-1. Query EventRecord to get chunk count
-2. Fetch all chunks in parallel
-3. Reassemble in order by chunk_index
+This approach:
+- Prevents Cosmos document size limit issues
+- Maintains queryable metadata for all events
+- Preserves full data locally for session-analyst access
 
-## Sync Protocol
+## Authentication
 
-### Change Tracking
+### DefaultAzureCredential (Recommended)
 
-```python
-@dataclass
-class ChangeRecord:
-    local_seq: int           # Monotonic sequence per device
-    device_id: str           # Unique device identifier
-    timestamp: datetime      # Wall-clock time
-    change_type: ChangeType  # CREATE, UPDATE, APPEND, DELETE
-    entity_type: EntityType  # SESSION, MESSAGE, EVENT
-    session_id: str
-    payload_ref: str         # Local file with actual data
-```
+Uses Azure Identity SDK's credential chain:
+1. Environment variables (AZURE_CLIENT_ID, etc.)
+2. Managed Identity (Azure-hosted services)
+3. Azure CLI (`az login`)
+4. Visual Studio Code
+5. Azure PowerShell
 
-### Sync States
+### Key-Based
 
-```
-                    ┌─────────────────┐
-                    │    SYNCED       │
-                    │  (no pending)   │
-                    └────────┬────────┘
-                             │
-                    Local write occurs
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │    PENDING      │
-                    │  (queued)       │
-                    └────────┬────────┘
-                             │
-                    Network available
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │   UPLOADING     │
-                    │  (in progress)  │
-                    └────────┬────────┘
-                             │
-            ┌────────────────┼────────────────┐
-            │                │                │
-         Success          Conflict         Error
-            │                │                │
-            ▼                ▼                ▼
-    ┌───────────┐    ┌───────────────┐    ┌─────────────┐
-    │  SYNCED   │    │  CONFLICTED   │    │   RETRY     │
-    └───────────┘    │  (needs       │    │  (backoff)  │
-                     │   resolution) │    └─────────────┘
-                     └───────────────┘
-```
+Direct Cosmos DB account key for development/testing.
 
-### Conflict Resolution
+**Security Note**: Never commit keys to source control.
 
-| Conflict Type | Resolution Strategy |
-|---------------|---------------------|
-| Metadata update | Last-writer-wins with version vector |
-| Concurrent appends | Merge by timestamp + device_id |
-| Delete vs modify | Delete wins (can restore from history) |
-| Rewind conflict | Requires user decision |
+## Error Handling
 
-### Version Vectors
+The library defines specific exceptions:
 
-```python
-@dataclass
-class VersionVector:
-    entries: dict[str, int]  # device_id -> sequence
-    timestamp: datetime      # Wall clock for tiebreaker
-    
-    def happens_before(self, other: "VersionVector") -> bool:
-        """Check if self causally precedes other."""
-        ...
-    
-    def concurrent_with(self, other: "VersionVector") -> bool:
-        """Check if two versions are concurrent (conflict)."""
-        return not self.happens_before(other) and not other.happens_before(self)
-```
+| Exception | Cause |
+|-----------|-------|
+| `AuthenticationError` | Cosmos auth failed |
+| `StorageConnectionError` | Network/connection issues |
+| `StorageIOError` | Read/write operations failed |
+| `SessionNotFoundError` | Session doesn't exist |
 
-## Security Model
+All exceptions inherit from `SessionStorageError` for unified handling.
 
-### Authentication Flow
-
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                    APPLICATION LAYER                                       │
-│  • Authenticate user (Entra ID / OAuth)                                   │
-│  • Inject user_id into all storage calls                                  │
-│  • NEVER trust user_id from client input                                  │
-└────────────────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                    STORAGE LAYER                                           │
-│  • user_id in partition key (Cosmos DB)                                   │
-│  • user_id in file path (Local)                                           │
-│  • ALL queries MUST include user_id                                       │
-│  • Cross-user queries IMPOSSIBLE by design                                │
-└────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Partition Key Strategy
-
-```python
-PARTITION_KEYS = {
-    "sessions": "/user_id",
-    "transcript_messages": "/user_id_session_id",  # Composite
-    "events": "/user_id_session_id",               # Composite
-    "sync_state": "/user_id_device_id",            # Composite
-}
-```
-
-Every query includes user_id, making cross-user access impossible at the database level.
-
-## Module Structure
-
-```
-amplifier_session_storage/
-├── __init__.py              # Main package exports
-├── protocol.py              # SessionStorage ABC and types
-├── exceptions.py            # Custom exceptions
-│
-├── local/
-│   ├── storage.py           # LocalFileStorage implementation
-│   └── file_ops.py          # Atomic file operations
-│
-├── cosmos/
-│   ├── storage.py           # CosmosDBStorage implementation
-│   ├── client.py            # Cosmos DB client wrapper
-│   └── chunking.py          # Large event chunking
-│
-├── sync/
-│   ├── engine.py            # SyncEngine orchestration
-│   ├── tracker.py           # Change tracking
-│   ├── conflict.py          # Conflict resolution
-│   └── version.py           # Version vectors
-│
-└── synced/
-    └── storage.py           # SyncedCosmosStorage (combines local + cosmos)
-```
-
-## Session Analyst Integration
-
-The session-analyst agent requires special consideration due to event size:
-
-### Safe Operations
-
-```python
-# ✅ List sessions (metadata only)
-sessions = await storage.list_sessions(query)
-
-# ✅ Get transcript (usually safe, <100KB)
-transcript = await storage.get_transcript(user_id, session_id)
-
-# ✅ Query events with projection (NEVER returns full data)
-events = await storage.query_events(EventQuery(
-    session_id=session_id,
-    user_id=user_id,
-    event_types=["llm:response", "tool:execute:post"],
-))
-
-# ✅ Get aggregates (computed server-side)
-stats = await storage.get_event_aggregates(user_id, session_id)
-
-# ✅ Rewind with backup
-result = await storage.rewind_to_turn(user_id, session_id, turn=5)
-```
-
-### Dangerous Operations (Use Sparingly)
-
-```python
-# ⚠️ Full event data - can be 100k+ tokens
-data = await storage.get_event_data(user_id, session_id, event_id)
-```
-
-## Migration Strategy
-
-### Phase 1: Local-Only (Current Amplifier)
-- Sessions stored locally at `~/.amplifier/projects/`
-- No sync capability
-
-### Phase 2: Hybrid (This Implementation)
-- New sessions created locally AND synced to cloud
-- Existing sessions migrated on-demand
-- Full local operation continues to work
-
-### Phase 3: Cloud-Primary (Future)
-- Cloud is source of truth
-- Local cache for offline operation
-- Existing local sessions fully migrated
-
-## Performance Considerations
-
-### Query Patterns
-
-| Operation | Expected Latency |
-|-----------|------------------|
-| Get session metadata | <100ms |
-| Append message (local) | <50ms |
-| Append message (synced) | <200ms |
-| Query events (projected) | <200ms |
-| Full event retrieval | 200ms - 2s (size dependent) |
-| Sync catchup | <30s after connectivity |
-
-### Cosmos DB RU Optimization
-
-- Partition by user for isolation
-- Composite keys for efficient range queries
-- Aggregations computed server-side
-- Chunked events reduce document size
-
-## Testing Strategy
+## Testing
 
 ### Unit Tests
-- Protocol compliance for each backend
-- Atomic write verification
-- Conflict resolution logic
 
-### Integration Tests
-- Multi-machine sync scenarios
-- Offline operation and recovery
-- Large event handling
-
-### End-to-End Tests
-- Session analyst workflows
-- Rewind and recovery
-- Cross-device session access
-- Session sharing and discovery
-
-## Session Sharing Architecture
-
-The storage system supports session sharing for team collaboration and cross-team learning.
-
-### Visibility Model
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Session Visibility                              │
-├─────────────────────────────────────────────────────────────────────────┤
-│  PRIVATE (default)     │ Only the session owner can access             │
-│  TEAM                  │ Members of specified teams can view           │
-│  ORGANIZATION          │ All organization members can view             │
-│  PUBLIC                │ Any authenticated user can view               │
-└─────────────────────────────────────────────────────────────────────────┘
+```bash
+uv run pytest tests/test_identity.py -v
 ```
 
-### Access Control Flow
+### Integration Tests (Requires Cosmos)
 
-```
-check_access(user_id, session, required_permission):
-    │
-    ├─► Is user the owner?
-    │       └─► YES → ALLOW (full access: read/write/delete)
-    │
-    ├─► Is visibility PRIVATE?
-    │       └─► YES → DENY
-    │
-    ├─► Check visibility level:
-    │       │
-    │       ├─► PUBLIC:
-    │       │   └─► Authenticated? → ALLOW read
-    │       │
-    │       ├─► ORGANIZATION:
-    │       │   └─► Same org_id? → ALLOW read
-    │       │
-    │       └─► TEAM:
-    │           └─► User in any session.team_ids? → ALLOW read
-    │
-    └─► DENY (insufficient permission)
+```bash
+export AMPLIFIER_COSMOS_ENDPOINT="https://..."
+uv run pytest tests/test_cosmos_file_storage.py -v
 ```
 
-### Additional Cosmos DB Containers
+Integration tests:
+- Create unique test data (UUID-based IDs)
+- Clean up after each test
+- Skip automatically if Cosmos not configured
 
-| Container | Partition Key | Purpose |
-|-----------|---------------|---------|
-| `shared_sessions` | `/org_id` | Index of shared sessions for discovery |
-| `organizations` | `/org_id` | Organization definitions |
-| `teams` | `/org_id` | Team definitions |
-| `user_memberships` | `/user_id` | User org/team memberships |
+## Future Considerations
 
-### Shared Session Index
+### Potential Enhancements
 
-When a session's visibility changes from PRIVATE, it's indexed in `shared_sessions`:
+1. **Batch Operations**: Use Cosmos transactional batch for atomic multi-document writes
+2. **Change Feed**: React to Cosmos changes for real-time sync
+3. **TTL Policies**: Auto-expire old session data
+4. **Compression**: Compress large event payloads before storage
 
-```json
-{
-  "id": "{session_id}",
-  "org_id": "org_123",
-  "session_id": "sess_abc",
-  "owner_user_id": "user_456",
-  "owner_name": "Alice",
-  "visibility": "team",
-  "team_ids": ["team_a", "team_b"],
-  "name": "Debug auth issue",
-  "project_slug": "my-project",
-  "tags": ["auth", "debugging"],
-  "turn_count": 15,
-  "created": "2025-01-30T10:00:00Z",
-  "updated": "2025-01-30T14:30:00Z",
-  "shared_at": "2025-01-30T12:00:00Z"
-}
-```
+### Not In Scope
 
-### Query Efficiency
-
-| Query | Cross-Partition? | RU Estimate |
-|-------|------------------|-------------|
-| My sessions | No (user_id partition) | ~5 RU |
-| All org shared sessions | No (org_id partition) | ~5-10 RU |
-| My team sessions | No (org_id + filter) | ~10 RU |
-| Recent team activity | No (org_id + time filter) | ~10 RU |
-
-### Module Structure (Sharing)
-
-```
-amplifier_session_storage/
-├── access/
-│   ├── __init__.py
-│   ├── controller.py      # AccessController
-│   └── permissions.py     # Permission enum, AccessDecision
-│
-├── membership/
-│   ├── __init__.py
-│   └── store.py           # MembershipStore
-│
-└── (existing modules updated with sharing methods)
-```
-
-### Key Design Decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| Separate `shared_sessions` container | Efficient org-scoped queries without cross-partition reads |
-| Owner always has full access | Security invariant, no exceptions |
-| Read-only shared access by default | Explicit write grants required for safety |
-| Denormalized owner_name in index | Avoids join to get display names |
-| Tags for categorization | Enables filtering by topic/type |
+- Local file storage (handled by Amplifier CLI)
+- Real-time WebSocket sync (separate service)
+- Session replay/analysis (session-analyst tool)

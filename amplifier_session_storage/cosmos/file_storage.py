@@ -372,6 +372,9 @@ class CosmosFileStorage:
     ) -> int:
         """Sync transcript lines to Cosmos.
 
+        Documents are idempotent: same session_id + sequence = same document ID.
+        Re-pushing the same transcript message will upsert (update) not duplicate.
+
         Args:
             user_id: User ID
             host_id: Host/machine ID where session originated
@@ -392,20 +395,29 @@ class CosmosFileStorage:
         synced = 0
         for i, line in enumerate(lines):
             sequence = start_sequence + i
+
+            # Document ID is deterministic: same session + sequence = same doc
+            # This ensures idempotent upserts - pushing same message twice won't duplicate
+            doc_id = f"{session_id}_msg_{sequence}"
+
+            # Get timestamp from the line data for tracking
+            ts = line.get("ts") or line.get("timestamp")
+
             doc = {
                 **line,
-                "id": f"{session_id}_msg_{sequence}",
+                "id": doc_id,
                 "partition_key": partition_key,
                 "user_id": user_id,
                 "host_id": host_id,
                 "project_slug": project_slug,
                 "session_id": session_id,
                 "sequence": sequence,
+                "ts": ts,  # Preserve/add ts for resume queries
                 "_type": "transcript_message",
                 "synced_at": datetime.now(UTC).isoformat(),
             }
 
-            # Don't pass partition_key - SDK extracts from doc["partition_key"]
+            # Upsert ensures idempotency - same ID = update, not create
             await container.upsert_item(body=doc)
             synced += 1
 
@@ -466,6 +478,58 @@ class CosmosFileStorage:
 
         return int(results[0]) if results else 0
 
+    async def get_last_transcript_ts(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> str | None:
+        """Get the timestamp of the last transcript message.
+
+        Returns:
+            ISO timestamp string of last message, or None if no messages exist.
+        """
+        container = self._get_container(TRANSCRIPTS_CONTAINER)
+        partition_key = self.make_partition_key(user_id, project_slug, session_id)
+
+        # Get the message with the highest sequence number
+        query = (
+            "SELECT TOP 1 c.ts, c.timestamp, c.synced_at FROM c "
+            "WHERE c.partition_key = @pk "
+            "ORDER BY c.sequence DESC"
+        )
+        params = [{"name": "@pk", "value": partition_key}]
+
+        async for item in container.query_items(query=query, parameters=params):
+            # Return ts (from original data) or timestamp or synced_at
+            return item.get("ts") or item.get("timestamp") or item.get("synced_at")
+
+        return None
+
+    async def get_last_transcript_sequence(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> int:
+        """Get the sequence number of the last transcript message.
+
+        Returns:
+            Last sequence number, or -1 if no messages exist.
+        """
+        container = self._get_container(TRANSCRIPTS_CONTAINER)
+        partition_key = self.make_partition_key(user_id, project_slug, session_id)
+
+        query = (
+            "SELECT TOP 1 c.sequence FROM c WHERE c.partition_key = @pk ORDER BY c.sequence DESC"
+        )
+        params = [{"name": "@pk", "value": partition_key}]
+
+        async for item in container.query_items(query=query, parameters=params):
+            return item.get("sequence", -1)
+
+        return -1
+
     # =========================================================================
     # Event Operations
     # =========================================================================
@@ -480,6 +544,9 @@ class CosmosFileStorage:
         start_sequence: int = 0,
     ) -> int:
         """Sync event lines to Cosmos.
+
+        Documents are idempotent: same session_id + sequence = same document ID.
+        Re-pushing the same event will upsert (update) not duplicate.
 
         For large events (>400KB), stores summary only with data_truncated flag.
 
@@ -504,6 +571,10 @@ class CosmosFileStorage:
         for i, line in enumerate(lines):
             sequence = start_sequence + i
 
+            # Document ID is deterministic: same session + sequence = same doc
+            # This ensures idempotent upserts - pushing same event twice won't duplicate
+            doc_id = f"{session_id}_evt_{sequence}"
+
             # Check event size - Cosmos has 2MB limit, we use 400KB threshold
             line_json = json.dumps(line)
             data_size = len(line_json.encode("utf-8"))
@@ -511,7 +582,7 @@ class CosmosFileStorage:
             if data_size > 400 * 1024:  # 400KB
                 # Store summary only for large events
                 doc = {
-                    "id": f"{session_id}_evt_{sequence}",
+                    "id": doc_id,
                     "partition_key": partition_key,
                     "user_id": user_id,
                     "host_id": host_id,
@@ -531,7 +602,7 @@ class CosmosFileStorage:
                 # Store full event
                 doc = {
                     **line,
-                    "id": f"{session_id}_evt_{sequence}",
+                    "id": doc_id,
                     "partition_key": partition_key,
                     "user_id": user_id,
                     "host_id": host_id,
@@ -544,7 +615,7 @@ class CosmosFileStorage:
                     "synced_at": datetime.now(UTC).isoformat(),
                 }
 
-            # Don't pass partition_key - SDK extracts from doc["partition_key"]
+            # Upsert ensures idempotency - same ID = update, not create
             await container.upsert_item(body=doc)
             synced += 1
 
@@ -603,6 +674,110 @@ class CosmosFileStorage:
             results.append(item)
 
         return int(results[0]) if results else 0
+
+    async def get_last_event_ts(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> str | None:
+        """Get the timestamp of the last event.
+
+        Returns:
+            ISO timestamp string of last event, or None if no events exist.
+        """
+        container = self._get_container(EVENTS_CONTAINER)
+        partition_key = self.make_partition_key(user_id, project_slug, session_id)
+
+        # Get the event with the highest sequence number
+        query = (
+            "SELECT TOP 1 c.ts, c.synced_at FROM c "
+            "WHERE c.partition_key = @pk "
+            "ORDER BY c.sequence DESC"
+        )
+        params = [{"name": "@pk", "value": partition_key}]
+
+        async for item in container.query_items(query=query, parameters=params):
+            # Return ts (original event timestamp) or synced_at as fallback
+            return item.get("ts") or item.get("synced_at")
+
+        return None
+
+    async def get_last_event_sequence(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> int:
+        """Get the sequence number of the last event.
+
+        Returns:
+            Last sequence number, or -1 if no events exist.
+        """
+        container = self._get_container(EVENTS_CONTAINER)
+        partition_key = self.make_partition_key(user_id, project_slug, session_id)
+
+        query = (
+            "SELECT TOP 1 c.sequence FROM c "
+            "WHERE c.partition_key = @pk "
+            "ORDER BY c.sequence DESC"
+        )
+        params = [{"name": "@pk", "value": partition_key}]
+
+        async for item in container.query_items(query=query, parameters=params):
+            return item.get("sequence", -1)
+
+        return -1
+
+    # =========================================================================
+    # Sync Status (for daemon resume)
+    # =========================================================================
+
+    async def get_sync_status(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """Get sync status for a session.
+
+        Returns all information needed for daemon to resume sync:
+        - Whether session exists
+        - Last event sequence and timestamp
+        - Last transcript sequence and timestamp
+
+        Returns:
+            Dict with sync status information
+        """
+        # Check if session exists
+        session = await self.get_session_metadata(user_id, session_id)
+        session_exists = session is not None
+
+        # Get last event info
+        last_event_sequence = await self.get_last_event_sequence(
+            user_id, project_slug, session_id
+        )
+        last_event_ts = await self.get_last_event_ts(user_id, project_slug, session_id)
+
+        # Get last transcript info
+        last_transcript_sequence = await self.get_last_transcript_sequence(
+            user_id, project_slug, session_id
+        )
+        last_transcript_ts = await self.get_last_transcript_ts(
+            user_id, project_slug, session_id
+        )
+
+        return {
+            "session_exists": session_exists,
+            "last_event_sequence": last_event_sequence,
+            "last_event_ts": last_event_ts,
+            "event_count": last_event_sequence + 1 if last_event_sequence >= 0 else 0,
+            "last_transcript_sequence": last_transcript_sequence,
+            "last_transcript_ts": last_transcript_ts,
+            "message_count": (
+                last_transcript_sequence + 1 if last_transcript_sequence >= 0 else 0
+            ),
+        }
 
     # =========================================================================
     # Connection Verification

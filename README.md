@@ -228,11 +228,18 @@ class CosmosFileStorage:
     async def sync_transcript_lines(user_id, host_id, project_slug, session_id, lines, start_sequence=0) -> int
     async def get_transcript_lines(user_id, project_slug, session_id, after_sequence=-1) -> list[dict]
     async def get_transcript_count(user_id, project_slug, session_id) -> int
+    async def get_last_transcript_sequence(user_id, project_slug, session_id) -> int
+    async def get_last_transcript_ts(user_id, project_slug, session_id) -> str | None
 
     # Events
     async def sync_event_lines(user_id, host_id, project_slug, session_id, lines, start_sequence=0) -> int
     async def get_event_lines(user_id, project_slug, session_id, after_sequence=-1) -> list[dict]
     async def get_event_count(user_id, project_slug, session_id) -> int
+    async def get_last_event_sequence(user_id, project_slug, session_id) -> int
+    async def get_last_event_ts(user_id, project_slug, session_id) -> str | None
+
+    # Sync Status (for daemon resume)
+    async def get_sync_status(user_id, project_slug, session_id) -> dict
 
     # Utilities
     @staticmethod
@@ -280,6 +287,52 @@ if new_event_lines:
         start_sequence=event_count,
     )
 ```
+
+## Resume Sync with Timestamps
+
+For daemons that need to resume sync after restart, use the comprehensive sync status:
+
+```python
+# Get full sync status including timestamps
+status = await storage.get_sync_status(user_id, project_slug, session_id)
+
+# Returns:
+# {
+#     "session_exists": True,
+#     "last_event_sequence": 149,
+#     "last_event_ts": "2024-01-15T10:30:00Z",
+#     "event_count": 150,
+#     "last_transcript_sequence": 42,
+#     "last_transcript_ts": "2024-01-15T10:29:55Z",
+#     "message_count": 43,
+# }
+
+# Use sequence numbers to resume from last position
+if status["session_exists"]:
+    # Only sync events after the last known sequence
+    local_events = read_local_events()
+    new_events = [e for i, e in enumerate(local_events) if i > status["last_event_sequence"]]
+    
+    if new_events:
+        await storage.sync_event_lines(
+            user_id, host_id, project_slug, session_id,
+            lines=new_events,
+            start_sequence=status["last_event_sequence"] + 1,
+        )
+```
+
+### Idempotent Uploads
+
+All sync operations are idempotent:
+
+- **Document IDs are deterministic**: `{session_id}_evt_{sequence}` for events, `{session_id}_msg_{sequence}` for transcripts
+- **Upsert semantics**: Re-uploading the same event/message updates rather than duplicates
+- **Safe to retry**: Network failures can be retried without risk of data corruption
+
+This means:
+1. Daemon can safely re-sync on restart
+2. No need for complex transaction handling
+3. Multiple daemons syncing the same session won't cause duplicates
 
 ## Identity Management
 

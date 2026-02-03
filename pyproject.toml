@@ -27,10 +27,11 @@ dependencies = [
 
 [project.optional-dependencies]
 # Cosmos DB support (azure-cosmos + azure-identity for AAD auth)
+# Note: azure-cosmos 4.9.0 is the last version with stable async partition_key support
 cosmos = [
-    "azure-cosmos>=4.5.0",
+    "azure-cosmos>=4.5.0,<4.10.0",
     "azure-identity>=1.15.0",
-    "aiohttp>=3.9.0",
+    "aiohttp>=3.9.0,<3.11",
 ]
 # Real-time sync support
 sync = [

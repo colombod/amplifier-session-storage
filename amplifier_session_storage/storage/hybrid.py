@@ -23,6 +23,7 @@ from typing import Any
 
 from ..blocks.types import SessionBlock
 from .base import (
+    AuthenticationError,
     BlockStorage,
     SessionNotFoundError,
     StorageConfig,
@@ -153,6 +154,11 @@ class HybridBlockStorage(BlockStorage):
         self._remote: CosmosBlockStorage | None = None
         self._remote_available = False
 
+        # Auth failure tracking - once auth fails, we stop trying permanently
+        # Users can restart the session to retry auth
+        self._auth_failed = False
+        self._auth_error_message: str | None = None
+
         # Sync state
         self._sync_queue: asyncio.Queue[SessionBlock] = asyncio.Queue()
         self._sync_task: asyncio.Task[None] | None = None
@@ -171,11 +177,20 @@ class HybridBlockStorage(BlockStorage):
         """Start the hybrid storage and background sync.
 
         Call this after initialization to enable cloud sync.
+
+        Auth errors are detected and logged once. If auth fails, sync is
+        permanently disabled for this session. Users can restart the session
+        to retry authentication.
         """
         if self._running:
             return
 
         self._running = True
+
+        # Don't try to connect if auth already failed
+        if self._auth_failed:
+            logger.debug("Skipping Cosmos DB connection - auth previously failed")
+            return
 
         # Try to connect to Cosmos DB
         if self.config.cosmos_endpoint:
@@ -185,12 +200,23 @@ class HybridBlockStorage(BlockStorage):
                 await self._remote.list_sessions(limit=1)
                 self._remote_available = True
                 logger.info("Connected to Cosmos DB for sync")
+            except AuthenticationError as e:
+                # Auth failed - log once and disable permanently
+                self._auth_failed = True
+                self._auth_error_message = str(e)
+                self._remote_available = False
+                logger.warning(
+                    f"Cosmos DB authentication failed - sync disabled for this session. "
+                    f"Restart session to retry. Error: {e}"
+                )
             except Exception as e:
+                # Other errors (network, etc.) - just log and continue offline
                 logger.warning(f"Cosmos DB not available, running in offline mode: {e}")
                 self._remote_available = False
 
-        # Start background sync task
-        self._sync_task = asyncio.create_task(self._sync_loop())
+        # Start background sync task only if remote is available
+        if self._remote_available:
+            self._sync_task = asyncio.create_task(self._sync_loop())
 
     async def stop(self) -> None:
         """Stop background sync and cleanup."""
@@ -205,26 +231,38 @@ class HybridBlockStorage(BlockStorage):
             self._sync_task = None
 
     async def write_block(self, block: SessionBlock) -> None:
-        """Write a block to local storage and queue for sync if eligible."""
-        # Always write to local first
+        """Write a block to local storage and queue for sync if eligible.
+
+        Local storage always succeeds. Cloud sync is best-effort and
+        will not block or fail the write operation.
+        """
+        # Always write to local first - this is the source of truth
         await self._local.write_block(block)
 
-        # Queue for sync if eligible
-        if self._remote_available and self._should_sync_session(block.session_id):
+        # Queue for sync if eligible (and auth hasn't failed)
+        if (
+            self._remote_available
+            and not self._auth_failed
+            and self._should_sync_session(block.session_id)
+        ):
             await self._sync_queue.put(block)
             self._pending_sessions.add(block.session_id)
             self._sync_states[block.session_id] = SyncState.PENDING
 
     async def write_blocks(self, blocks: list[SessionBlock]) -> None:
-        """Write multiple blocks to local and queue eligible ones for sync."""
+        """Write multiple blocks to local and queue eligible ones for sync.
+
+        Local storage always succeeds. Cloud sync is best-effort and
+        will not block or fail the write operation.
+        """
         if not blocks:
             return
 
-        # Write all to local
+        # Write all to local - this is the source of truth
         await self._local.write_blocks(blocks)
 
-        # Queue eligible blocks for sync
-        if self._remote_available:
+        # Queue eligible blocks for sync (if auth hasn't failed)
+        if self._remote_available and not self._auth_failed:
             for block in blocks:
                 if self._should_sync_session(block.session_id):
                     await self._sync_queue.put(block)
@@ -410,6 +448,50 @@ class HybridBlockStorage(BlockStorage):
         """
         return session_id in self._local_only_sessions
 
+    # Auth status methods
+
+    @property
+    def auth_failed(self) -> bool:
+        """Check if authentication has failed.
+
+        When True, sync is permanently disabled for this session.
+        Users should restart the session to retry authentication.
+
+        Returns:
+            True if auth failed and sync is disabled.
+        """
+        return self._auth_failed
+
+    @property
+    def auth_error_message(self) -> str | None:
+        """Get the authentication error message if auth failed.
+
+        Returns:
+            Error message string, or None if auth hasn't failed.
+        """
+        return self._auth_error_message
+
+    @property
+    def is_sync_enabled(self) -> bool:
+        """Check if cloud sync is currently enabled and working.
+
+        Returns False if:
+        - Auth failed
+        - No Cosmos endpoint configured
+        - Remote not available (network issues)
+        - Sync policy is SYNC_NONE
+
+        Returns:
+            True if sync is enabled and functional.
+        """
+        if self._auth_failed:
+            return False
+        if not self._remote_available:
+            return False
+        if self.sync_policy == SyncPolicy.SYNC_NONE:
+            return False
+        return True
+
     def _should_sync_session(self, session_id: str) -> bool:
         """Determine if a session should be synced to cloud.
 
@@ -458,8 +540,14 @@ class HybridBlockStorage(BlockStorage):
     # Private sync methods
 
     async def _sync_loop(self) -> None:
-        """Background sync loop."""
-        while self._running:
+        """Background sync loop.
+
+        Handles auth errors gracefully by:
+        1. Detecting auth failures and logging once
+        2. Clearing the sync queue to prevent memory buildup
+        3. Stopping the loop permanently (users can restart session to retry)
+        """
+        while self._running and not self._auth_failed:
             try:
                 # Process queued blocks
                 blocks_to_sync: list[SessionBlock] = []
@@ -483,6 +571,10 @@ class HybridBlockStorage(BlockStorage):
                             self._pending_sessions.discard(session_id)
                             if session_id not in self._conflict_sessions:
                                 self._sync_states[session_id] = SyncState.SYNCED
+                        except AuthenticationError as e:
+                            # Auth failed mid-session - disable sync permanently
+                            self._handle_auth_failure(e)
+                            return  # Exit sync loop
                         except Exception as e:
                             logger.error(f"Sync failed for {session_id}: {e}")
                             self._sync_states[session_id] = SyncState.ERROR
@@ -493,9 +585,51 @@ class HybridBlockStorage(BlockStorage):
 
             except asyncio.CancelledError:
                 break
+            except AuthenticationError as e:
+                # Auth error at loop level
+                self._handle_auth_failure(e)
+                break
             except Exception as e:
                 logger.error(f"Sync loop error: {e}")
                 await asyncio.sleep(self.sync_interval)
+
+    def _handle_auth_failure(self, error: Exception) -> None:
+        """Handle authentication failure by disabling sync permanently.
+
+        Args:
+            error: The authentication error that occurred
+        """
+        if self._auth_failed:
+            return  # Already handled
+
+        self._auth_failed = True
+        self._auth_error_message = str(error)
+        self._remote_available = False
+
+        # Clear the sync queue to prevent memory buildup
+        self._clear_sync_queue()
+
+        # Log once
+        logger.warning(
+            f"Cosmos DB authentication failed during sync - sync disabled for this session. "
+            f"Data is safely stored locally. Restart session to retry. Error: {error}"
+        )
+
+        # Notify via callback if registered
+        if self.on_sync_error:
+            self.on_sync_error(error)
+
+    def _clear_sync_queue(self) -> None:
+        """Clear all pending blocks from the sync queue."""
+        cleared = 0
+        while not self._sync_queue.empty():
+            try:
+                self._sync_queue.get_nowait()
+                cleared += 1
+            except asyncio.QueueEmpty:
+                break
+        if cleared > 0:
+            logger.debug(f"Cleared {cleared} blocks from sync queue after auth failure")
 
     async def _sync_session(self, session_id: str) -> None:
         """Sync a specific session."""

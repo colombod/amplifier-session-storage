@@ -66,6 +66,9 @@ from .blocks import (
     SessionUpdatedData,
 )
 
+# Cosmos file storage - CLI-compatible cloud storage
+from .cosmos import CosmosFileConfig, CosmosFileStorage
+
 # Facets module - server-side queryable aggregates
 from .facets import (
     BackfillProgress,
@@ -79,6 +82,9 @@ from .facets import (
     WorkflowPattern,
     rebuild_facets,
 )
+
+# Hybrid file storage - CLI-compatible with cloud sync
+from .hybrid import HybridFileStorage, HybridFileStorageConfig, SyncResult
 
 # Identity module - user/device/org management
 from .identity import (
@@ -188,6 +194,13 @@ __all__ = [
     "BackfillProgress",
     "BackfillResult",
     "rebuild_facets",
+    # Hybrid file storage (CLI-compatible)
+    "HybridFileStorage",
+    "HybridFileStorageConfig",
+    "SyncResult",
+    # Cosmos file storage (CLI-compatible)
+    "CosmosFileStorage",
+    "CosmosFileConfig",
 ]
 
 __version__ = "0.1.0"

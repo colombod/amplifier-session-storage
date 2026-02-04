@@ -207,18 +207,25 @@ class DuckDBBackend(StorageBackend):
             """Run sync initialization in thread."""
             self.conn = duckdb.connect(str(self.config.db_path))
 
-            # Enable experimental HNSW persistence for disk-based databases
-            if str(self.config.db_path) != ":memory:":
-                self.conn.execute("SET hnsw_enable_experimental_persistence = true")
-                logger.info("Enabled HNSW experimental persistence for disk storage")
-
             # Install and load VSS extension for vector search
+            # Must be done BEFORE setting hnsw_enable_experimental_persistence
+            vss_available = False
             try:
                 self.conn.execute("INSTALL vss")
                 self.conn.execute("LOAD vss")
+                vss_available = True
                 logger.info("VSS extension loaded for vector search")
             except Exception as e:
                 logger.warning(f"VSS extension not available: {e}")
+
+            # Enable experimental HNSW persistence for disk-based databases
+            # Only if VSS extension is loaded (the setting requires VSS)
+            if vss_available and str(self.config.db_path) != ":memory:":
+                try:
+                    self.conn.execute("SET hnsw_enable_experimental_persistence = true")
+                    logger.info("Enabled HNSW experimental persistence for disk storage")
+                except Exception as e:
+                    logger.warning(f"Could not enable HNSW persistence: {e}")
 
             # Create sessions table
             self.conn.execute("""

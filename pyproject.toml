@@ -32,11 +32,11 @@ dependencies = [
 cosmos = [
     "azure-cosmos>=4.5.0,<4.10.0",
     "azure-identity>=1.15.0",
-    "aiohttp>=3.9.0,<3.11",
+    "aiohttp>=3.11.0",  # Security fix: CVE vulnerabilities in <3.11
 ]
 # Real-time sync support
 sync = [
-    "aiohttp>=3.9.0",
+    "aiohttp>=3.11.0",  # Security fix: CVE vulnerabilities in <3.11
 ]
 # Azure OpenAI embeddings support
 azure-openai = [

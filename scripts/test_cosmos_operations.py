@@ -176,24 +176,26 @@ async def test_write_operations(
             # 2. Upsert transcript lines
             transcript = session["transcript"]
             if transcript:
-                await storage.sync_transcript(
+                written = await storage.sync_transcript_lines(
                     user_id=user_id,
+                    host_id=host_id,
                     project_slug=project_slug,
                     session_id=session_id,
                     lines=transcript,
                 )
-                print(f"    ✓ Transcript written: {len(transcript)} messages")
+                print(f"    ✓ Transcript written: {written} messages")
 
             # 3. Upsert events
             events = session["events"]
             if events:
-                await storage.sync_events(
+                written = await storage.sync_event_lines(
                     user_id=user_id,
+                    host_id=host_id,
                     project_slug=project_slug,
                     session_id=session_id,
-                    events=events,
+                    lines=events,
                 )
-                print(f"    ✓ Events written: {len(events)} events")
+                print(f"    ✓ Events written: {written} events")
 
         print(f"\n✓ Write operations successful: {len(sessions)} sessions")
         return True
@@ -232,8 +234,7 @@ async def test_read_operations(
         print(f"\n  Found {len(sessions)} sessions")
         for s in sessions[:3]:
             print(
-                f"    - {s.get('session_id', 'unknown')[:40]}... "
-                f"(turns: {s.get('turn_count', 0)})"
+                f"    - {s.get('session_id', 'unknown')[:40]}... (turns: {s.get('turn_count', 0)})"
             )
 
         # 3. Full-text search in transcripts
@@ -377,7 +378,7 @@ async def main():
     user_id = "test-user"
     host_id = "test-host"
 
-    # Find a project to load
+    # Find a project to load - prefer one with actual transcript data
     amplifier_dir = Path.home() / ".amplifier" / "projects"
     projects = list(amplifier_dir.iterdir()) if amplifier_dir.exists() else []
 
@@ -386,12 +387,18 @@ async def main():
         print("  Will run with synthetic test data")
         project_path = None
     else:
-        # Pick first project with sessions
+        # Pick a project that has sessions WITH transcript files
         project_path = None
-        for p in projects:
-            if (p / "sessions").exists():
-                project_path = p
-                break
+        for p in sorted(projects):
+            sessions_dir = p / "sessions"
+            if sessions_dir.exists():
+                # Check if any session has a transcript file
+                for session_dir in sessions_dir.iterdir():
+                    if session_dir.is_dir() and (session_dir / "transcript.jsonl").exists():
+                        project_path = p
+                        break
+                if project_path:
+                    break
 
         if project_path:
             print(f"\n📁 Using project: {project_path.name}")

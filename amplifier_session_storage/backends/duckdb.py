@@ -27,7 +27,9 @@ from .base import (
     SearchFilters,
     SearchResult,
     StorageBackend,
+    TranscriptMessage,
     TranscriptSearchOptions,
+    TurnContext,
 )
 
 logger = logging.getLogger(__name__)
@@ -873,6 +875,92 @@ class DuckDBBackend(StorageBackend):
                     if vec is not None:
                         return vec
             return None
+
+        return await asyncio.to_thread(_get)
+
+    async def get_turn_context(
+        self,
+        user_id: str,
+        session_id: str,
+        turn: int,
+        before: int = 2,
+        after: int = 2,
+        include_tool_outputs: bool = True,
+    ) -> TurnContext:
+        """Get context window around a specific turn."""
+
+        def _get() -> TurnContext:
+            if self.conn is None:
+                raise StorageConnectionError("Database not connected")
+
+            # Calculate turn range
+            min_turn = max(1, turn - before)
+            max_turn = turn + after
+
+            # Build role filter
+            role_filter = ""
+            if not include_tool_outputs:
+                role_filter = "AND role != 'tool'"
+
+            # Query messages in turn range
+            rows = self.conn.execute(
+                f"""
+                SELECT sequence, turn, role, content, ts, project_slug
+                FROM transcripts
+                WHERE user_id = ? AND session_id = ?
+                  AND turn >= ? AND turn <= ?
+                  {role_filter}
+                ORDER BY turn, sequence
+                """,
+                [user_id, session_id, min_turn, max_turn],
+            ).fetchall()
+
+            # Get session turn range
+            range_row = self.conn.execute(
+                """
+                SELECT MIN(turn), MAX(turn)
+                FROM transcripts
+                WHERE user_id = ? AND session_id = ?
+                """,
+                [user_id, session_id],
+            ).fetchone()
+
+            first_turn = range_row[0] if range_row and range_row[0] else 1
+            last_turn = range_row[1] if range_row and range_row[1] else turn
+
+            # Parse messages
+            messages = []
+            project_slug = "unknown"
+            for row in rows:
+                project_slug = row[5] or project_slug
+                messages.append(
+                    TranscriptMessage(
+                        sequence=row[0],
+                        turn=row[1],
+                        role=row[2] or "unknown",
+                        content=row[3] or "",
+                        ts=row[4],
+                        metadata={"session_id": session_id},
+                    )
+                )
+
+            # Partition into previous, current, following
+            previous = [m for m in messages if m.turn < turn]
+            current = [m for m in messages if m.turn == turn]
+            following = [m for m in messages if m.turn > turn]
+
+            return TurnContext(
+                session_id=session_id,
+                project_slug=project_slug,
+                target_turn=turn,
+                previous=previous,
+                current=current,
+                following=following,
+                has_more_before=min_turn > first_turn,
+                has_more_after=max_turn < last_turn,
+                first_turn=first_turn,
+                last_turn=last_turn,
+            )
 
         return await asyncio.to_thread(_get)
 

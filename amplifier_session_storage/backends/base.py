@@ -61,6 +61,56 @@ class SearchResult:
     source: str  # "full_text", "semantic", "hybrid"
 
 
+@dataclass
+class TranscriptMessage:
+    """A single message in a transcript."""
+
+    sequence: int
+    turn: int
+    role: str  # "user", "assistant", "system", "tool"
+    content: str
+    ts: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TurnContext:
+    """
+    Context window around a specific turn.
+
+    Useful for:
+    - Expanding search results with surrounding context
+    - Understanding conversation flow around a specific point
+    - Building prompts with relevant history
+    """
+
+    session_id: str
+    project_slug: str
+    target_turn: int
+
+    # The turns (each list contains all messages in those turns)
+    previous: list[TranscriptMessage]  # K turns before (oldest first)
+    current: list[TranscriptMessage]  # All messages in target turn
+    following: list[TranscriptMessage]  # K turns after (oldest first)
+
+    # Navigation metadata
+    has_more_before: bool  # Are there earlier turns?
+    has_more_after: bool  # Are there later turns?
+    first_turn: int  # First turn number in session
+    last_turn: int  # Last turn number in session
+
+    @property
+    def total_messages(self) -> int:
+        """Total messages in this context window."""
+        return len(self.previous) + len(self.current) + len(self.following)
+
+    @property
+    def turns_range(self) -> tuple[int, int]:
+        """Range of turns included (min, max)."""
+        all_turns = [m.turn for m in self.previous + self.current + self.following]
+        return (min(all_turns), max(all_turns)) if all_turns else (0, 0)
+
+
 class StorageBackend(ABC):
     """
     Abstract base for all storage backends.
@@ -207,11 +257,53 @@ class StorageBackend(ABC):
 
         Args:
             user_id: User identifier
-            options: Search configuration
+            options: Search configuration (includes mmr_lambda for diversity control)
             limit: Maximum results
 
         Returns:
             List of search results with relevance scores
+        """
+        pass
+
+    @abstractmethod
+    async def get_turn_context(
+        self,
+        user_id: str,
+        session_id: str,
+        turn: int,
+        before: int = 2,
+        after: int = 2,
+        include_tool_outputs: bool = True,
+    ) -> TurnContext:
+        """
+        Get context window around a specific turn.
+
+        Useful for:
+        - Expanding search results with surrounding context
+        - Understanding conversation flow around a specific point
+        - Building prompts with relevant history
+
+        Args:
+            user_id: User identifier
+            session_id: Session to query
+            turn: Target turn number (1-based)
+            before: Number of turns to include before target (default: 2)
+            after: Number of turns to include after target (default: 2)
+            include_tool_outputs: Include tool call outputs in results (default: True)
+
+        Returns:
+            TurnContext with previous turns, target turn, and following turns
+
+        Example:
+            # Vector search returns turn 15 as relevant
+            context = await storage.get_turn_context(
+                user_id="user1",
+                session_id="sess123",
+                turn=15,
+                before=3,  # Get turns 12, 13, 14
+                after=1,   # Get turn 16
+            )
+            # Now have full context: turns 12-16
         """
         pass
 

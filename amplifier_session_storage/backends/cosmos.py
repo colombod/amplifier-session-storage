@@ -28,7 +28,9 @@ from .base import (
     SearchFilters,
     SearchResult,
     StorageBackend,
+    TranscriptMessage,
     TranscriptSearchOptions,
+    TurnContext,
 )
 
 logger = logging.getLogger(__name__)
@@ -803,6 +805,107 @@ class CosmosBackend(StorageBackend):
 
         # Return re-ranked results
         return [combined[idx] for idx, _ in mmr_results]
+
+    async def get_turn_context(
+        self,
+        user_id: str,
+        session_id: str,
+        turn: int,
+        before: int = 2,
+        after: int = 2,
+        include_tool_outputs: bool = True,
+    ) -> TurnContext:
+        """
+        Get context window around a specific turn.
+
+        Queries Cosmos DB for messages in the turn range [turn-before, turn+after].
+        """
+        container = self._get_container(TRANSCRIPTS_CONTAINER)
+
+        # Calculate turn range
+        min_turn = max(1, turn - before)
+        max_turn = turn + after
+
+        # Query for messages in the turn range (no ORDER BY - Cosmos needs composite index)
+        # We'll sort in Python instead
+        query = """
+            SELECT c.sequence, c.turn, c.role, c.content, c.ts, c.project_slug
+            FROM c
+            WHERE c.user_id = @user_id 
+              AND c.session_id = @session_id
+              AND c.turn >= @min_turn
+              AND c.turn <= @max_turn
+        """
+        params = [
+            {"name": "@user_id", "value": user_id},
+            {"name": "@session_id", "value": session_id},
+            {"name": "@min_turn", "value": min_turn},
+            {"name": "@max_turn", "value": max_turn},
+        ]
+
+        # Fetch messages
+        messages: list[TranscriptMessage] = []
+        project_slug = "unknown"
+
+        async for item in container.query_items(query=query, parameters=params):
+            # Filter out tool outputs if requested
+            if not include_tool_outputs and item.get("role") == "tool":
+                continue
+
+            project_slug = item.get("project_slug", project_slug)
+            messages.append(
+                TranscriptMessage(
+                    sequence=item.get("sequence", 0),
+                    turn=item.get("turn", 0),
+                    role=item.get("role", "unknown"),
+                    content=item.get("content", ""),
+                    ts=item.get("ts"),
+                    metadata={"session_id": session_id},
+                )
+            )
+
+        # Sort by turn, then sequence (Cosmos doesn't support multi-column ORDER BY without composite index)
+        messages.sort(key=lambda m: (m.turn, m.sequence))
+
+        # Get session turn range for navigation metadata
+        # Cosmos DB doesn't support composite aggregates, so run separate queries
+        min_query = "SELECT VALUE MIN(c.turn) FROM c WHERE c.user_id = @user_id AND c.session_id = @session_id"
+        max_query = "SELECT VALUE MAX(c.turn) FROM c WHERE c.user_id = @user_id AND c.session_id = @session_id"
+        range_params = [
+            {"name": "@user_id", "value": user_id},
+            {"name": "@session_id", "value": session_id},
+        ]
+
+        first_turn = 1
+        last_turn = turn
+
+        async for item in container.query_items(query=min_query, parameters=range_params):
+            if item is not None:
+                first_turn = item
+            break
+
+        async for item in container.query_items(query=max_query, parameters=range_params):
+            if item is not None:
+                last_turn = item
+            break
+
+        # Partition messages into previous, current, following
+        previous = [m for m in messages if m.turn < turn]
+        current = [m for m in messages if m.turn == turn]
+        following = [m for m in messages if m.turn > turn]
+
+        return TurnContext(
+            session_id=session_id,
+            project_slug=project_slug,
+            target_turn=turn,
+            previous=previous,
+            current=current,
+            following=following,
+            has_more_before=min_turn > first_turn,
+            has_more_after=max_turn < last_turn,
+            first_turn=first_turn,
+            last_turn=last_turn,
+        )
 
     # =========================================================================
     # Event Operations

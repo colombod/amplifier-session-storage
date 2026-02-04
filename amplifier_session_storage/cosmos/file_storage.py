@@ -718,9 +718,7 @@ class CosmosFileStorage:
         partition_key = self.make_partition_key(user_id, project_slug, session_id)
 
         query = (
-            "SELECT TOP 1 c.sequence FROM c "
-            "WHERE c.partition_key = @pk "
-            "ORDER BY c.sequence DESC"
+            "SELECT TOP 1 c.sequence FROM c WHERE c.partition_key = @pk ORDER BY c.sequence DESC"
         )
         params = [{"name": "@pk", "value": partition_key}]
 
@@ -754,18 +752,14 @@ class CosmosFileStorage:
         session_exists = session is not None
 
         # Get last event info
-        last_event_sequence = await self.get_last_event_sequence(
-            user_id, project_slug, session_id
-        )
+        last_event_sequence = await self.get_last_event_sequence(user_id, project_slug, session_id)
         last_event_ts = await self.get_last_event_ts(user_id, project_slug, session_id)
 
         # Get last transcript info
         last_transcript_sequence = await self.get_last_transcript_sequence(
             user_id, project_slug, session_id
         )
-        last_transcript_ts = await self.get_last_transcript_ts(
-            user_id, project_slug, session_id
-        )
+        last_transcript_ts = await self.get_last_transcript_ts(user_id, project_slug, session_id)
 
         return {
             "session_exists": session_exists,
@@ -774,9 +768,7 @@ class CosmosFileStorage:
             "event_count": last_event_sequence + 1 if last_event_sequence >= 0 else 0,
             "last_transcript_sequence": last_transcript_sequence,
             "last_transcript_ts": last_transcript_ts,
-            "message_count": (
-                last_transcript_sequence + 1 if last_transcript_sequence >= 0 else 0
-            ),
+            "message_count": (last_transcript_sequence + 1 if last_transcript_sequence >= 0 else 0),
         }
 
     # =========================================================================

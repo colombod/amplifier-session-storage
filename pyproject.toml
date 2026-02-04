@@ -1,7 +1,7 @@
 [project]
 name = "amplifier-session-storage"
-version = "0.1.0"
-description = "Block-based session storage for Amplifier with local and Cosmos DB backends"
+version = "0.2.0"
+description = "Enhanced session storage for Amplifier with hybrid search and multiple backends"
 license = "MIT"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,6 +23,7 @@ dependencies = [
     "aiofiles>=23.0.0",
     "pydantic>=2.0.0",
     "pyyaml>=6.0.0",
+    "numpy>=1.24.0",
 ]
 
 [project.optional-dependencies]
@@ -37,9 +38,22 @@ cosmos = [
 sync = [
     "aiohttp>=3.9.0",
 ]
+# Azure OpenAI embeddings support
+azure-openai = [
+    "azure-ai-inference>=1.0.0b9",
+    "azure-core>=1.30.0",
+]
+# DuckDB backend support
+duckdb = [
+    "duckdb>=0.10.0",
+]
+# SQLite backend support
+sqlite = [
+    "aiosqlite>=0.19.0",
+]
 # Full installation (all optional features)
 all = [
-    "amplifier-session-storage[cosmos,sync]",
+    "amplifier-session-storage[cosmos,sync,azure-openai,duckdb,sqlite]",
 ]
 
 [project.urls]
@@ -63,7 +77,7 @@ allow-direct-references = true
 
 [dependency-groups]
 dev = [
-    "amplifier-session-storage[cosmos,sync]",
+    "amplifier-session-storage[all]",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.0.0",

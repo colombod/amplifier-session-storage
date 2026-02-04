@@ -1,33 +1,68 @@
 """
 Amplifier Session Storage
 
-A session storage library for syncing Amplifier CLI sessions to Azure Cosmos DB.
+Enhanced session storage library with hybrid search capabilities.
 
 Provides:
-- CosmosFileStorage: Cloud storage that mirrors CLI file format
-  - Sessions container (metadata.json equivalent)
-  - Transcripts container (transcript.jsonl lines)
-  - Events container (events.jsonl lines)
-- Identity management for user/device tracking
+- Multiple storage backends (Cosmos DB, DuckDB, SQLite)
+- Hybrid search (full-text + semantic + MMR re-ranking)
+- Pluggable embedding providers (Azure OpenAI)
+- LRU cache for hot query embeddings
 
 Usage:
 
-    >>> from amplifier_session_storage import CosmosFileStorage, CosmosFileConfig
-    >>> config = CosmosFileConfig.from_env()
-    >>> async with CosmosFileStorage(config) as storage:
-    ...     await storage.upsert_session_metadata(user_id, host_id, metadata)
+    >>> from amplifier_session_storage import CosmosBackend, AzureOpenAIEmbeddings
+    >>> embeddings = AzureOpenAIEmbeddings.from_env()
+    >>> async with CosmosBackend.create(embedding_provider=embeddings) as storage:
+    ...     # Sync with automatic embedding generation
     ...     await storage.sync_transcript_lines(user_id, host_id, project, session, lines)
-    ...     await storage.sync_event_lines(user_id, host_id, project, session, lines)
+    ...
+    ...     # Hybrid search with MMR re-ranking
+    ...     results = await storage.search_transcripts(
+    ...         user_id,
+    ...         TranscriptSearchOptions(
+    ...             query="vector search implementation",
+    ...             search_type="hybrid",
+    ...             mmr_lambda=0.7
+    ...         )
+    ...     )
 
-Identity Management:
+Backend Selection:
 
-    >>> from amplifier_session_storage import IdentityContext
-    >>> IdentityContext.initialize()
-    >>> user_id = IdentityContext.get_user_id()
+    # Cosmos DB for cloud multi-device sync
+    from amplifier_session_storage.backends import CosmosBackend, CosmosConfig
+
+    # DuckDB for local analytics and development
+    from amplifier_session_storage.backends import DuckDBBackend, DuckDBConfig
+
+    # SQLite for embedded applications
+    from amplifier_session_storage.backends import SQLiteBackend, SQLiteConfig
+
+Embeddings:
+
+    # Azure OpenAI
+    from amplifier_session_storage.embeddings import AzureOpenAIEmbeddings
+
+    # With caching
+    embeddings = AzureOpenAIEmbeddings(
+        endpoint=...,
+        api_key=...,
+        model="text-embedding-3-large",
+        cache_size=1000
+    )
 """
 
-# Cosmos file storage - CLI-compatible cloud storage
-from .cosmos import CosmosFileConfig, CosmosFileStorage
+# Backend abstraction
+from .backends import (
+    EventSearchOptions,
+    SearchFilters,
+    SearchResult,
+    StorageBackend,
+    TranscriptSearchOptions,
+)
+
+# Embedding providers
+from .embeddings import EmbeddingCache, EmbeddingProvider
 
 # Exceptions
 from .exceptions import (
@@ -48,7 +83,7 @@ from .exceptions import (
     ValidationError,
 )
 
-# Identity module - user/device/org management
+# Identity module
 from .identity import (
     ConfigFileIdentityProvider,
     IdentityContext,
@@ -56,10 +91,63 @@ from .identity import (
     UserIdentity,
 )
 
+# Search utilities
+from .search import compute_mmr, cosine_similarity
+
+# Conditional imports for optional backends
+try:
+    from .backends.cosmos import CosmosBackend, CosmosConfig  # noqa: F401
+
+    _has_cosmos = True
+except ImportError:
+    _has_cosmos = False
+
+try:
+    from .backends.duckdb import DuckDBBackend, DuckDBConfig  # noqa: F401
+
+    _has_duckdb = True
+except ImportError:
+    _has_duckdb = False
+
+try:
+    from .backends.sqlite import SQLiteBackend, SQLiteConfig  # noqa: F401
+
+    _has_sqlite = True
+except ImportError:
+    _has_sqlite = False
+
+# Conditional imports for embedding providers
+try:
+    from .embeddings.azure_openai import AzureOpenAIEmbeddings  # noqa: F401
+
+    _has_azure_openai = True
+except ImportError:
+    _has_azure_openai = False
+
+try:
+    from .embeddings.openai import OpenAIEmbeddings  # noqa: F401
+
+    _has_openai = True
+except ImportError:
+    _has_openai = False
+
+# Keep legacy exports for backward compatibility
+if _has_cosmos:
+    from .cosmos import CosmosFileConfig, CosmosFileStorage  # noqa: F401
+
 __all__ = [
-    # Cosmos file storage (CLI-compatible)
-    "CosmosFileStorage",
-    "CosmosFileConfig",
+    # Core abstractions
+    "StorageBackend",
+    "SearchFilters",
+    "SearchResult",
+    "TranscriptSearchOptions",
+    "EventSearchOptions",
+    # Embeddings
+    "EmbeddingProvider",
+    "EmbeddingCache",
+    # Search
+    "compute_mmr",
+    "cosine_similarity",
     # Identity
     "IdentityProvider",
     "UserIdentity",
@@ -83,4 +171,20 @@ __all__ = [
     "PermissionDeniedError",
 ]
 
-__version__ = "0.1.0"
+# Add optional exports
+if _has_cosmos:
+    __all__.extend(["CosmosBackend", "CosmosConfig", "CosmosFileStorage", "CosmosFileConfig"])
+
+if _has_duckdb:
+    __all__.extend(["DuckDBBackend", "DuckDBConfig"])
+
+if _has_sqlite:
+    __all__.extend(["SQLiteBackend", "SQLiteConfig"])
+
+if _has_azure_openai:
+    __all__.extend(["AzureOpenAIEmbeddings"])
+
+if _has_openai:
+    __all__.extend(["OpenAIEmbeddings"])
+
+__version__ = "0.2.0"  # Bumped for major enhancements

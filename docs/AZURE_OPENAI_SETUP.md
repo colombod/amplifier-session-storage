@@ -10,7 +10,7 @@ The Azure OpenAI embedding provider supports multiple authentication methods and
 
 ```bash
 # Base endpoint (no deployment path)
-export AZURE_OPENAI_ENDPOINT="https://amplifier-teamtracking-foundry.openai.azure.com"
+export AZURE_OPENAI_ENDPOINT="https://your-openai-resource.openai.azure.com"
 
 # Model and deployment
 export AZURE_OPENAI_EMBEDDING_MODEL="text-embedding-3-large"
@@ -66,7 +66,7 @@ from amplifier_session_storage.embeddings.azure_openai import AzureOpenAIEmbeddi
 
 # With RBAC (recommended)
 embeddings = AzureOpenAIEmbeddings(
-    endpoint="https://amplifier-teamtracking-foundry.openai.azure.com",
+    endpoint="https://your-openai-resource.openai.azure.com",
     model="text-embedding-3-large",
     deployment="text-embedding-3-large",
     use_default_credential=True,
@@ -101,7 +101,7 @@ Set environment variables and tests will use real Azure OpenAI:
 
 ```bash
 # Configure Azure OpenAI
-export AZURE_OPENAI_ENDPOINT="https://amplifier-teamtracking-foundry.openai.azure.com"
+export AZURE_OPENAI_ENDPOINT="https://your-openai-resource.openai.azure.com"
 export AZURE_OPENAI_EMBEDDING_MODEL="text-embedding-3-large"
 export AZURE_OPENAI_EMBEDDING_DEPLOYMENT="text-embedding-3-large"
 export AZURE_OPENAI_USE_RBAC="true"
@@ -129,18 +129,18 @@ Tests automatically detect configuration and use real embeddings when available,
 ```bash
 # 1. Verify resource exists
 az cognitiveservices account show \
-    --name amplifier-teamtracking-foundry \
-    --resource-group amplifier-teamtracking-rg
+    --name your-openai-resource \
+    --resource-group your-resource-group
 
 # 2. Verify deployment exists
 az cognitiveservices account deployment list \
-    --name amplifier-teamtracking-foundry \
-    --resource-group amplifier-teamtracking-rg
+    --name your-openai-resource \
+    --resource-group your-resource-group
 
 # 3. Verify RBAC access
 az role assignment list \
     --assignee $(az ad signed-in-user show --query id -o tsv) \
-    --scope /subscriptions/8a673afb-d858-4a97-a490-2625396d1484/resourceGroups/amplifier-teamtracking-rg/providers/Microsoft.CognitiveServices/accounts/amplifier-teamtracking-foundry
+    --scope /subscriptions/your-subscription-id/resourceGroups/your-resource-group/providers/Microsoft.CognitiveServices/accounts/your-openai-resource
 ```
 
 ### "Unauthorized" with RBAC
@@ -152,7 +152,7 @@ az role assignment list \
 az role assignment create \
     --role "Cognitive Services OpenAI User" \
     --assignee $(az ad signed-in-user show --query id -o tsv) \
-    --scope /subscriptions/8a673afb-d858-4a97-a490-2625396d1484/resourceGroups/amplifier-teamtracking-rg/providers/Microsoft.CognitiveServices/accounts/amplifier-teamtracking-foundry
+    --scope /subscriptions/your-subscription-id/resourceGroups/your-resource-group/providers/Microsoft.CognitiveServices/accounts/your-openai-resource
 ```
 
 ### Tests Pass but Real Embeddings Don't Work

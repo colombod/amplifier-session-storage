@@ -343,7 +343,7 @@ providers:
 session_storage:
   mode: hybrid
   cloud:
-    endpoint: https://dicolomb-amplifier-storage-test.documents.azure.com:443/
+    endpoint: https://your-cosmos-account.documents.azure.com:443/
     database: amplifier-db
     container: items
     # auth_method: default_credential (this is the default)

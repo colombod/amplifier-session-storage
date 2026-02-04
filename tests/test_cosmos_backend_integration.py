@@ -7,7 +7,7 @@ Run with: pytest -m integration
 Environment variables required:
     AMPLIFIER_COSMOS_ENDPOINT - Cosmos DB endpoint URL
     AMPLIFIER_COSMOS_AUTH_METHOD - "default_credential" (recommended) or "key"
-    AMPLIFIER_COSMOS_DATABASE - Database name (default: amplifier-test-db)
+    AMPLIFIER_COSMOS_DATABASE - Database name (default: your-database)
 
     For Azure OpenAI embeddings (optional):
     AZURE_OPENAI_ENDPOINT
@@ -59,7 +59,7 @@ async def cosmos_storage():
     try:
         config = CosmosConfig.from_env()
         # Override database name for testing
-        config.database_name = "amplifier-test-db"
+        config.database_name = "your-database"
 
         embeddings = MockEmbeddingProvider()
         storage = await CosmosBackend.create(config=config, embedding_provider=embeddings)

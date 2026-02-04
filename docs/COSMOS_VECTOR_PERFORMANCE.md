@@ -171,22 +171,22 @@ async def search_with_reranking(
 
 # Or via CLI (if supported in your region)
 az cosmosdb update \
-  --name amplifier-session-storage-test \
-  --resource-group amplifier-teamtracking-rg \
-  --subscription 8a673afb-d858-4a97-a490-2625396d1484 \
+  --name your-cosmos-account \
+  --resource-group your-resource-group \
+  --subscription your-subscription-id \
   --capabilities EnableServerless EnableNoSQLVectorSearch
 ```
 
-✅ **Already done** for `amplifier-session-storage-test`
+✅ **Already done** for `your-cosmos-account`
 
 ### 2. Create Database and Containers
 
 **Database**:
 ```bash
 az cosmosdb sql database create \
-  --account-name amplifier-session-storage-test \
-  --resource-group amplifier-teamtracking-rg \
-  --name amplifier-test-db \
+  --account-name your-cosmos-account \
+  --resource-group your-resource-group \
+  --name your-database \
   --throughput 400  # Minimum for serverless
 ```
 
@@ -194,15 +194,15 @@ az cosmosdb sql database create \
 ```bash
 # Sessions container (no vectors needed)
 az cosmosdb sql container create \
-  --account-name amplifier-session-storage-test \
-  --database-name amplifier-test-db \
+  --account-name your-cosmos-account \
+  --database-name your-database \
   --name sessions \
   --partition-key-path "/user_id"
 
 # Transcripts container (WITH vector indexes)
 az cosmosdb sql container create \
-  --account-name amplifier-session-storage-test \
-  --database-name amplifier-test-db \
+  --account-name your-cosmos-account \
+  --database-name your-database \
   --name transcripts \
   --partition-key-path "/partition_key" \
   --idx @vector-index-policy.json
@@ -254,8 +254,8 @@ az cosmosdb sql container create \
 
 ```bash
 az cosmosdb sql role assignment create \
-  --account-name amplifier-session-storage-test \
-  --resource-group amplifier-teamtracking-rg \
+  --account-name your-cosmos-account \
+  --resource-group your-resource-group \
   --scope "/" \
   --role-definition-id 00000000-0000-0000-0000-000000000002 \
   --principal-id $(az ad signed-in-user show --query id -o tsv)
@@ -325,7 +325,7 @@ mmr_indices = compute_mmr(vectors, query, lambda_param=0.7, top_k=10)
 
 ```python
 cosmos_config = {
-    "endpoint": "https://amplifier-session-storage-test.documents.azure.com:443/",
+    "endpoint": "https://your-cosmos-account.documents.azure.com:443/",
     "database": "amplifier-sessions",
     "auth_method": "default_credential",
     "enable_vector_search": True,
@@ -424,7 +424,7 @@ For high-performance Cosmos DB vector search, ensure:
 
 ```python
 # Environment configuration
-AMPLIFIER_COSMOS_ENDPOINT=https://amplifier-session-storage-test.documents.azure.com:443/
+AMPLIFIER_COSMOS_ENDPOINT=https://your-cosmos-account.documents.azure.com:443/
 AMPLIFIER_COSMOS_DATABASE=amplifier-sessions
 AMPLIFIER_COSMOS_AUTH_METHOD=default_credential
 AMPLIFIER_COSMOS_ENABLE_VECTOR=true

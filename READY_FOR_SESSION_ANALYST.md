@@ -108,7 +108,7 @@ OPENAI_EMBEDDING_MODEL="text-embedding-3-large"
 
 ### Azure OpenAI Foundry ✅  
 ```bash
-AZURE_OPENAI_ENDPOINT="https://amplifier-teamtracking-foundry.cognitiveservices.azure.com/openai/deployments/text-embedding-3-large"
+AZURE_OPENAI_ENDPOINT="https://your-openai-resource.openai.azure.com/openai/deployments/text-embedding-3-large"
 AZURE_OPENAI_API_KEY="<key>"
 ```
 **Tested**: 3072 dimensions, API key auth working

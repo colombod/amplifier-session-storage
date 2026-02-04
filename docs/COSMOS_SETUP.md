@@ -7,10 +7,10 @@ This document explains how to set up Azure Cosmos DB for testing the enhanced se
 A Cosmos DB account has been provisioned for testing:
 
 ```
-Account Name: amplifier-session-storage-test
-Resource Group: amplifier-teamtracking-rg
-Subscription: 8a673afb-d858-4a97-a490-2625396d1484
-Endpoint: https://amplifier-session-storage-test.documents.azure.com:443/
+Account Name: your-cosmos-account
+Resource Group: your-resource-group
+Subscription: your-subscription-id
+Endpoint: https://your-cosmos-account.documents.azure.com:443/
 Capabilities: EnableServerless, EnableNoSQLVectorSearch
 Region: eastus2
 ```
@@ -19,8 +19,8 @@ Region: eastus2
 
 ```bash
 # Set for integration tests
-export AMPLIFIER_COSMOS_ENDPOINT="https://amplifier-session-storage-test.documents.azure.com:443/"
-export AMPLIFIER_COSMOS_DATABASE="amplifier-test-db"
+export AMPLIFIER_COSMOS_ENDPOINT="https://your-cosmos-account.documents.azure.com:443/"
+export AMPLIFIER_COSMOS_DATABASE="your-database"
 export AMPLIFIER_COSMOS_AUTH_METHOD="default_credential"
 export AMPLIFIER_COSMOS_ENABLE_VECTOR="true"
 ```
@@ -60,9 +60,9 @@ If you need to grant access to another user:
 
 ```bash
 az cosmosdb sql role assignment create \
-    --account-name amplifier-session-storage-test \
-    --resource-group amplifier-teamtracking-rg \
-    --subscription 8a673afb-d858-4a97-a490-2625396d1484 \
+    --account-name your-cosmos-account \
+    --resource-group your-resource-group \
+    --subscription your-subscription-id \
     --role-definition-name "Cosmos DB Built-in Data Contributor" \
     --principal-id <USER_PRINCIPAL_ID> \
     --scope "/"
@@ -120,9 +120,9 @@ To delete the test account when done:
 
 ```bash
 az cosmosdb delete \
-    --name amplifier-session-storage-test \
-    --resource-group amplifier-teamtracking-rg \
-    --subscription 8a673afb-d858-4a97-a490-2625396d1484 \
+    --name your-cosmos-account \
+    --resource-group your-resource-group \
+    --subscription your-subscription-id \
     --yes
 ```
 
@@ -151,17 +151,17 @@ If vector search doesn't work:
 az account show
 
 # Verify subscription is correct
-az account set --subscription 8a673afb-d858-4a97-a490-2625396d1484
+az account set --subscription your-subscription-id
 
 # Test RBAC access
 az cosmosdb database list \
-    --name amplifier-session-storage-test \
-    --resource-group amplifier-teamtracking-rg
+    --name your-cosmos-account \
+    --resource-group your-resource-group
 ```
 
 ## Development vs Production
 
-**Test Account** (amplifier-session-storage-test):
+**Test Account** (your-cosmos-account):
 - Use for: Development, integration testing, experimentation
 - Serverless tier (cost-effective)
 - Can be deleted and recreated

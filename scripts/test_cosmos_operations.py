@@ -10,13 +10,13 @@ Tests:
 
 Usage:
     # Set environment (uses RBAC by default)
-    export AMPLIFIER_COSMOS_ENDPOINT="https://amplifier-session-storage-test.documents.azure.com:443/"
-    export AMPLIFIER_COSMOS_DATABASE="amplifier-test-db"
+    export AMPLIFIER_COSMOS_ENDPOINT="https://your-cosmos-account.documents.azure.com:443/"
+    export AMPLIFIER_COSMOS_DATABASE="your-database"
     export AMPLIFIER_COSMOS_AUTH_METHOD="default_credential"
     export AMPLIFIER_COSMOS_ENABLE_VECTOR="true"
 
     # Azure OpenAI for embeddings
-    export AZURE_OPENAI_ENDPOINT="https://amplifier-teamtracking-foundry.cognitiveservices.azure.com/openai/deployments/text-embedding-3-large"
+    export AZURE_OPENAI_ENDPOINT="https://your-openai-resource.openai.azure.com/openai/deployments/text-embedding-3-large"
     export AZURE_OPENAI_API_KEY="<your-key>"
 
     python scripts/test_cosmos_operations.py
@@ -413,9 +413,9 @@ async def main():
         config = CosmosConfig(
             endpoint=os.environ.get(
                 "AMPLIFIER_COSMOS_ENDPOINT",
-                "https://amplifier-session-storage-test.documents.azure.com:443/",
+                "https://your-cosmos-account.documents.azure.com:443/",
             ),
-            database_name=os.environ.get("AMPLIFIER_COSMOS_DATABASE", "amplifier-test-db"),
+            database_name=os.environ.get("AMPLIFIER_COSMOS_DATABASE", "your-database"),
             auth_method=os.environ.get("AMPLIFIER_COSMOS_AUTH_METHOD", "default_credential"),
             enable_vector_search=True,
         )

@@ -19,6 +19,7 @@ from azure.cosmos.aio import ContainerProxy, CosmosClient, DatabaseProxy
 from azure.cosmos.exceptions import CosmosHttpResponseError, CosmosResourceNotFoundError
 from azure.identity.aio import DefaultAzureCredential
 
+from ..content_extraction import count_embeddable_content_types, extract_all_embeddable_content
 from ..embeddings import EmbeddingProvider
 from ..exceptions import AuthenticationError, StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
@@ -204,17 +205,38 @@ class CosmosBackend(StorageBackend):
             "includedPaths": [{"path": "/*"}],
         }
 
-        # Add vector index for transcripts if enabled
+        # Add vector indexes for transcripts if enabled
         if vector_enabled and name == TRANSCRIPTS_CONTAINER:
-            # Vector index configuration for Cosmos DB
+            # Vector index configuration for Cosmos DB - one index per content type
             indexing_policy["vectorIndexes"] = [
                 {
-                    "path": "/embedding",
-                    "type": "quantizedFlat",  # Good for <100k docs, diskANN for larger
+                    "path": "/user_query_vector",
+                    "type": "quantizedFlat",
                     "quantizationByteSize": 128,
                     "vectorDataType": "float32",
-                    "dimensions": 3072,  # text-embedding-3-large
-                }
+                    "dimensions": 3072,
+                },
+                {
+                    "path": "/assistant_response_vector",
+                    "type": "quantizedFlat",
+                    "quantizationByteSize": 128,
+                    "vectorDataType": "float32",
+                    "dimensions": 3072,
+                },
+                {
+                    "path": "/assistant_thinking_vector",
+                    "type": "quantizedFlat",
+                    "quantizationByteSize": 128,
+                    "vectorDataType": "float32",
+                    "dimensions": 3072,
+                },
+                {
+                    "path": "/tool_output_vector",
+                    "type": "quantizedFlat",
+                    "quantizationByteSize": 128,
+                    "vectorDataType": "float32",
+                    "dimensions": 3072,
+                },
             ]
             logger.info(f"Creating {name} with vector search support (3072 dimensions)")
 
@@ -399,6 +421,63 @@ class CosmosBackend(StorageBackend):
             return False
 
     # =========================================================================
+    # Embedding Helper Methods
+    # =========================================================================
+
+    async def _embed_non_none(self, texts: list[str | None]) -> list[list[float] | None]:
+        """Generate embeddings only for non-None texts."""
+        if not self.embedding_provider:
+            return [None] * len(texts)
+
+        # Collect non-None texts with their indices
+        texts_to_embed: list[tuple[int, str]] = []
+        for i, text in enumerate(texts):
+            if text is not None:
+                texts_to_embed.append((i, text))
+
+        if not texts_to_embed:
+            return [None] * len(texts)
+
+        # Generate embeddings for non-None texts
+        non_none_texts = [text for _, text in texts_to_embed]
+        embeddings_batch = await self.embedding_provider.embed_batch(non_none_texts)
+
+        # Build result list with None for skipped texts
+        results: list[list[float] | None] = [None] * len(texts)
+        for (idx, _), embedding in zip(texts_to_embed, embeddings_batch, strict=True):
+            results[idx] = embedding
+
+        return results
+
+    async def _generate_multi_vector_embeddings(
+        self, lines: list[dict[str, Any]]
+    ) -> dict[str, list[list[float] | None]]:
+        """Generate embeddings for all content types in a batch."""
+        if not self.embedding_provider:
+            return {}
+
+        # Extract all embeddable content types
+        user_queries: list[str | None] = []
+        assistant_responses: list[str | None] = []
+        assistant_thinking: list[str | None] = []
+        tool_outputs: list[str | None] = []
+
+        for line in lines:
+            extracted = extract_all_embeddable_content(line)
+            user_queries.append(extracted["user_query"])
+            assistant_responses.append(extracted["assistant_response"])
+            assistant_thinking.append(extracted["assistant_thinking"])
+            tool_outputs.append(extracted["tool_output"])
+
+        # Generate embeddings for each content type (only for non-None values)
+        return {
+            "user_query": await self._embed_non_none(user_queries),
+            "assistant_response": await self._embed_non_none(assistant_responses),
+            "assistant_thinking": await self._embed_non_none(assistant_thinking),
+            "tool_output": await self._embed_non_none(tool_outputs),
+        }
+
+    # =========================================================================
     # Transcript Operations
     # =========================================================================
 
@@ -410,22 +489,28 @@ class CosmosBackend(StorageBackend):
         session_id: str,
         lines: list[dict[str, Any]],
         start_sequence: int = 0,
-        embeddings: list[list[float]] | None = None,
+        embeddings: dict[str, list[list[float] | None]] | None = None,
     ) -> int:
         """
-        Sync transcript lines with optional embeddings.
+        Sync transcript lines with optional multi-vector embeddings.
 
         Args:
-            embeddings: Pre-computed embeddings (same order as lines)
+            embeddings: Pre-computed embeddings dict with keys: user_query, assistant_response,
+                        assistant_thinking, tool_output
         """
         if not lines:
             return 0
 
-        # If embeddings not provided but we have a provider, generate them
+        # Generate embeddings if not provided and we have a provider
         if embeddings is None and self.embedding_provider:
-            texts = [line.get("content", "") for line in lines]
-            embeddings = await self.embedding_provider.embed_batch(texts)
-            logger.info(f"Generated {len(embeddings)} embeddings during ingestion")
+            embeddings = await self._generate_multi_vector_embeddings(lines)
+            counts = count_embeddable_content_types(lines)
+            logger.info(
+                f"Generated embeddings: {counts['user_query']} user, "
+                f"{counts['assistant_response']} responses, "
+                f"{counts['assistant_thinking']} thinking, "
+                f"{counts['tool_output']} tool"
+            )
 
         container = self._get_container(TRANSCRIPTS_CONTAINER)
         partition_key = self.make_partition_key(user_id, project_slug, session_id)
@@ -451,12 +536,36 @@ class CosmosBackend(StorageBackend):
                 "synced_at": datetime.now(UTC).isoformat(),
             }
 
-            # Add embedding if available
-            if embeddings and i < len(embeddings):
-                doc["embedding"] = embeddings[i]
-                doc["embedding_model"] = (
-                    self.embedding_provider.model_name if self.embedding_provider else "unknown"
-                )
+            # Add multi-vector embeddings if available
+            if embeddings:
+                user_query_vec = embeddings.get("user_query", [None] * len(lines))[i]
+                assistant_response_vec = embeddings.get("assistant_response", [None] * len(lines))[
+                    i
+                ]
+                assistant_thinking_vec = embeddings.get("assistant_thinking", [None] * len(lines))[
+                    i
+                ]
+                tool_output_vec = embeddings.get("tool_output", [None] * len(lines))[i]
+
+                if user_query_vec:
+                    doc["user_query_vector"] = user_query_vec
+                if assistant_response_vec:
+                    doc["assistant_response_vector"] = assistant_response_vec
+                if assistant_thinking_vec:
+                    doc["assistant_thinking_vector"] = assistant_thinking_vec
+                if tool_output_vec:
+                    doc["tool_output_vector"] = tool_output_vec
+
+                # Store metadata about which vectors exist
+                doc["vector_metadata"] = {
+                    "has_user_query": user_query_vec is not None,
+                    "has_assistant_response": assistant_response_vec is not None,
+                    "has_assistant_thinking": assistant_thinking_vec is not None,
+                    "has_tool_output": tool_output_vec is not None,
+                }
+
+                if self.embedding_provider:
+                    doc["embedding_model"] = self.embedding_provider.model_name
 
             await container.upsert_item(body=doc)
             synced += 1
@@ -874,27 +983,76 @@ class CosmosBackend(StorageBackend):
         query_vector: list[float],
         filters: SearchFilters | None = None,
         top_k: int = 100,
+        vector_columns: list[str] | None = None,
     ) -> list[SearchResult]:
         """
-        Perform vector similarity search in Cosmos DB.
+        Perform multi-vector similarity search in Cosmos DB.
 
-        Uses VectorDistance function for similarity scoring.
+        Uses VectorDistance function for each vector column and finds best match.
+
+        Args:
+            user_id: User identifier
+            query_vector: Query embedding vector
+            filters: Optional search filters
+            top_k: Number of results to return
+            vector_columns: Which vector columns to search. Default: all non-null vectors.
+                Options: ["user_query", "assistant_response",
+                          "assistant_thinking", "tool_output"]
         """
         container = self._get_container(TRANSCRIPTS_CONTAINER)
 
-        # Build query with VectorDistance
+        if vector_columns is None:
+            # Search all vector columns by default
+            vector_columns = [
+                "user_query",
+                "assistant_response",
+                "assistant_thinking",
+                "tool_output",
+            ]
+
+        # Build similarity expressions for each vector column
+        # In Cosmos DB, we can't use GREATEST, so we compute all and use ORDER BY
+        vector_distance_exprs = []
+        vector_field_names = {
+            "user_query": "user_query_vector",
+            "assistant_response": "assistant_response_vector",
+            "assistant_thinking": "assistant_thinking_vector",
+            "tool_output": "tool_output_vector",
+        }
+
+        for vec_type in vector_columns:
+            field = vector_field_names[vec_type]
+            # Use CASE to handle null vectors
+            vector_distance_exprs.append(
+                f"(IS_DEFINED(c.{field}) ? VectorDistance(c.{field}, @query_vector) : 1.0)"
+            )
+
+        # Create a minimum distance expression (best match across all vectors)
+        # Note: VectorDistance returns distance (lower is better), so use MIN
+        min_distance_expr = (
+            f"LEAST({', '.join(vector_distance_exprs)})"
+            if len(vector_distance_exprs) > 1
+            else vector_distance_exprs[0]
+        )
+
+        # Build query with multi-vector support
         query_parts = [
-            "SELECT c.id, c.session_id, c.project_slug, c.sequence, c.content, c.role, "
-            "c.turn, c.ts, c.embedding, "
-            "VectorDistance(c.embedding, @query_vector) AS similarity_score "
-            "FROM c "
-            "WHERE c.user_id = @user_id AND c.embedding != null"
+            f"SELECT c.id, c.session_id, c.project_slug, c.sequence, c.content, c.role, "
+            f"c.turn, c.ts, {min_distance_expr} AS best_distance "
+            f"FROM c "
+            f"WHERE c.user_id = @user_id"
         ]
 
         params: list[dict[str, object]] = [
             {"name": "@user_id", "value": user_id},
             {"name": "@query_vector", "value": query_vector},
         ]
+
+        # Require at least one vector to be defined
+        vector_exists_conditions = [
+            f"IS_DEFINED(c.{vector_field_names[v]})" for v in vector_columns
+        ]
+        query_parts.append(f"AND ({' OR '.join(vector_exists_conditions)})")
 
         # Apply filters
         if filters:
@@ -910,7 +1068,8 @@ class CosmosBackend(StorageBackend):
                 query_parts.append("AND c.ts <= @end_date")
                 params.append({"name": "@end_date", "value": filters.end_date})
 
-        query_parts.append("ORDER BY VectorDistance(c.embedding, @query_vector)")
+        # Order by best distance (lowest = most similar)
+        query_parts.append(f"ORDER BY {min_distance_expr}")
 
         query = " ".join(query_parts)
 
@@ -918,6 +1077,10 @@ class CosmosBackend(StorageBackend):
         async for item in container.query_items(
             query=query, parameters=params, max_item_count=top_k
         ):
+            # Convert distance to similarity score (1 - distance)
+            distance = item.get("best_distance", 1.0)
+            similarity = 1.0 - min(distance, 1.0)
+
             results.append(
                 SearchResult(
                     session_id=item["session_id"],
@@ -925,7 +1088,7 @@ class CosmosBackend(StorageBackend):
                     sequence=item["sequence"],
                     content=item.get("content", ""),
                     metadata=item,
-                    score=1.0 - item.get("similarity_score", 1.0),  # Convert distance to similarity
+                    score=similarity,
                     source="semantic",
                 )
             )

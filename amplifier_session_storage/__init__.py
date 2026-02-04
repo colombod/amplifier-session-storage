@@ -116,13 +116,20 @@ try:
 except ImportError:
     _has_sqlite = False
 
-# Conditional import for Azure OpenAI embeddings
+# Conditional imports for embedding providers
 try:
     from .embeddings.azure_openai import AzureOpenAIEmbeddings  # noqa: F401
 
     _has_azure_openai = True
 except ImportError:
     _has_azure_openai = False
+
+try:
+    from .embeddings.openai import OpenAIEmbeddings  # noqa: F401
+
+    _has_openai = True
+except ImportError:
+    _has_openai = False
 
 # Keep legacy exports for backward compatibility
 if _has_cosmos:
@@ -176,5 +183,8 @@ if _has_sqlite:
 
 if _has_azure_openai:
     __all__.extend(["AzureOpenAIEmbeddings"])
+
+if _has_openai:
+    __all__.extend(["OpenAIEmbeddings"])
 
 __version__ = "0.2.0"  # Bumped for major enhancements

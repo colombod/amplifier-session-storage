@@ -43,6 +43,10 @@ azure-openai = [
     "azure-ai-inference>=1.0.0b9",
     "azure-core>=1.30.0",
 ]
+# OpenAI direct embeddings support
+openai = [
+    "openai>=1.0.0",
+]
 # DuckDB backend support
 duckdb = [
     "duckdb>=0.10.0",
@@ -53,7 +57,7 @@ sqlite = [
 ]
 # Full installation (all optional features)
 all = [
-    "amplifier-session-storage[cosmos,sync,azure-openai,duckdb,sqlite]",
+    "amplifier-session-storage[cosmos,sync,azure-openai,openai,duckdb,sqlite]",
 ]
 
 [project.urls]

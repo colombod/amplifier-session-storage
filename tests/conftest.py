@@ -1,8 +1,13 @@
 """
 Shared test configuration and fixtures.
 
-Provides embedding provider factory that uses real Azure OpenAI when configured,
+Provides embedding provider factory that uses real embedding providers when configured,
 or falls back to mock provider for local testing.
+
+Provider priority:
+1. OpenAI direct (if OPENAI_API_KEY set)
+2. Azure OpenAI (if AZURE_OPENAI_ENDPOINT set)
+3. Mock (fallback)
 """
 
 import logging

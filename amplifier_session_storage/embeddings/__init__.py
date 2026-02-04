@@ -4,6 +4,7 @@ Embedding provider abstraction and implementations.
 Provides:
 - Abstract EmbeddingProvider interface
 - Azure OpenAI implementation
+- OpenAI direct implementation
 - LRU cache for hot query embeddings
 """
 

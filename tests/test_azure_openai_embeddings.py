@@ -270,15 +270,18 @@ class TestAzureOpenAIEmbeddings:
             with pytest.raises(ValueError, match="AZURE_OPENAI_ENDPOINT"):
                 AzureOpenAIEmbeddings.from_env()
 
-    def test_from_env_missing_api_key(self):
-        """from_env raises when AZURE_OPENAI_API_KEY missing."""
+    def test_from_env_uses_rbac_when_no_key(self):
+        """from_env uses RBAC when AZURE_OPENAI_API_KEY missing but RBAC enabled."""
         with patch.dict(
             "os.environ",
-            {"AZURE_OPENAI_ENDPOINT": "https://test.openai.azure.com"},
+            {
+                "AZURE_OPENAI_ENDPOINT": "https://test.openai.azure.com",
+                "AZURE_OPENAI_USE_RBAC": "true",
+            },
             clear=True,
         ):
-            with pytest.raises(ValueError, match="AZURE_OPENAI_API_KEY"):
-                AzureOpenAIEmbeddings.from_env()
+            provider = AzureOpenAIEmbeddings.from_env()
+            assert provider.use_default_credential is True
 
     def test_from_env_with_defaults(self):
         """from_env uses defaults when optional vars not set."""

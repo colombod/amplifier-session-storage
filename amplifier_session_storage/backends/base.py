@@ -165,7 +165,7 @@ class StorageBackend(ABC):
         session_id: str,
         lines: list[dict[str, Any]],
         start_sequence: int = 0,
-        embeddings: list[list[float]] | None = None,
+        embeddings: dict[str, list[list[float] | None]] | None = None,
     ) -> int:
         """
         Sync transcript lines with optional embeddings.

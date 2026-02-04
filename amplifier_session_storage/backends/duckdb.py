@@ -18,6 +18,7 @@ from typing import Any
 import duckdb
 import numpy as np
 
+from ..content_extraction import count_embeddable_content_types, extract_all_embeddable_content
 from ..embeddings import EmbeddingProvider
 from ..exceptions import StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
@@ -119,6 +120,82 @@ class DuckDBBackend(StorageBackend):
         dimension = len(vector)
         return f"{vec_str}::FLOAT[{dimension}]"
 
+    async def _embed_non_none(self, texts: list[str | None]) -> list[list[float] | None]:
+        """
+        Generate embeddings only for non-None texts.
+
+        Args:
+            texts: List of text strings (some may be None)
+
+        Returns:
+            List of embeddings with None preserved at same indices
+        """
+        if not self.embedding_provider:
+            return [None] * len(texts)
+
+        # Find non-None texts and their positions
+        texts_to_embed: list[tuple[int, str]] = [
+            (i, text) for i, text in enumerate(texts) if text is not None
+        ]
+
+        if not texts_to_embed:
+            return [None] * len(texts)
+
+        # Extract just the text strings
+        just_texts = [text for _, text in texts_to_embed]
+
+        # Generate embeddings
+        embeddings = await self.embedding_provider.embed_batch(just_texts)
+
+        # Place embeddings back at original indices
+        result: list[list[float] | None] = [None] * len(texts)
+        for (original_idx, _), embedding in zip(texts_to_embed, embeddings, strict=True):
+            result[original_idx] = embedding
+
+        return result
+
+    async def _generate_multi_vector_embeddings(
+        self, lines: list[dict[str, Any]]
+    ) -> dict[str, list[list[float] | None]]:
+        """
+        Generate embeddings for all content types in a batch.
+
+        Extracts all embeddable content from messages and generates
+        embeddings for each content type separately.
+
+        Args:
+            lines: Transcript lines from Amplifier
+
+        Returns:
+            Dict with keys: user_query, assistant_response, assistant_thinking, tool_output
+            Each value is a list of embeddings (or None) matching the input lines
+        """
+        if not self.embedding_provider:
+            none_list: list[list[float] | None] = [None] * len(lines)
+            return {
+                "user_query": none_list,
+                "assistant_response": none_list,
+                "assistant_thinking": none_list,
+                "tool_output": none_list,
+            }
+
+        # Extract all content types
+        all_content = [extract_all_embeddable_content(line) for line in lines]
+
+        # Separate by content type
+        user_queries = [c["user_query"] for c in all_content]
+        assistant_responses = [c["assistant_response"] for c in all_content]
+        assistant_thinkings = [c["assistant_thinking"] for c in all_content]
+        tool_outputs = [c["tool_output"] for c in all_content]
+
+        # Generate embeddings for each type
+        return {
+            "user_query": await self._embed_non_none(user_queries),
+            "assistant_response": await self._embed_non_none(assistant_responses),
+            "assistant_thinking": await self._embed_non_none(assistant_thinkings),
+            "tool_output": await self._embed_non_none(tool_outputs),
+        }
+
     async def initialize(self) -> None:
         """Initialize DuckDB connection and schema."""
         if self._initialized:
@@ -152,7 +229,7 @@ class DuckDBBackend(StorageBackend):
                 )
             """)
 
-            # Create transcripts table with vector support
+            # Create transcripts table with multi-vector support
             self.conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS transcripts (
                     id VARCHAR NOT NULL PRIMARY KEY,
@@ -162,11 +239,15 @@ class DuckDBBackend(StorageBackend):
                     session_id VARCHAR NOT NULL,
                     sequence INTEGER NOT NULL,
                     role VARCHAR,
-                    content TEXT,
+                    content JSON,
                     turn INTEGER,
                     ts TIMESTAMP,
-                    embedding FLOAT[{self.config.vector_dimensions}],
+                    user_query_vector FLOAT[{self.config.vector_dimensions}],
+                    assistant_response_vector FLOAT[{self.config.vector_dimensions}],
+                    assistant_thinking_vector FLOAT[{self.config.vector_dimensions}],
+                    tool_output_vector FLOAT[{self.config.vector_dimensions}],
                     embedding_model VARCHAR,
+                    vector_metadata JSON,
                     synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -207,16 +288,31 @@ class DuckDBBackend(StorageBackend):
                 "CREATE INDEX IF NOT EXISTS idx_events_type ON events(user_id, event, ts)"
             )
 
-            # Create HNSW vector index for fast similarity search
+            # Create HNSW vector indexes for each content type
             try:
                 self.conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_transcript_embedding
-                    ON transcripts USING HNSW (embedding)
+                    CREATE INDEX IF NOT EXISTS idx_user_query_vector
+                    ON transcripts USING HNSW (user_query_vector)
                     WITH (metric = 'cosine')
                 """)
-                logger.info("HNSW vector index created on transcripts.embedding")
+                self.conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_assistant_response_vector
+                    ON transcripts USING HNSW (assistant_response_vector)
+                    WITH (metric = 'cosine')
+                """)
+                self.conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_assistant_thinking_vector
+                    ON transcripts USING HNSW (assistant_thinking_vector)
+                    WITH (metric = 'cosine')
+                """)
+                self.conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_tool_output_vector
+                    ON transcripts USING HNSW (tool_output_vector)
+                    WITH (metric = 'cosine')
+                """)
+                logger.info("HNSW vector indexes created for all content types")
             except Exception as e:
-                logger.warning(f"Failed to create HNSW index: {e}")
+                logger.warning(f"Failed to create HNSW indexes: {e}")
 
         try:
             await asyncio.to_thread(_init)
@@ -433,17 +529,22 @@ class DuckDBBackend(StorageBackend):
         session_id: str,
         lines: list[dict[str, Any]],
         start_sequence: int = 0,
-        embeddings: list[list[float]] | None = None,
+        embeddings: dict[str, list[list[float] | None]] | None = None,
     ) -> int:
-        """Sync transcript lines with optional embeddings."""
+        """Sync transcript lines with optional multi-vector embeddings."""
         if not lines:
             return 0
 
         # Generate embeddings if not provided and we have a provider
         if embeddings is None and self.embedding_provider:
-            texts = [line.get("content", "") for line in lines]
-            embeddings = await self.embedding_provider.embed_batch(texts)
-            logger.info(f"Generated {len(embeddings)} embeddings during ingestion")
+            embeddings = await self._generate_multi_vector_embeddings(lines)
+            counts = count_embeddable_content_types(lines)
+            logger.info(
+                f"Generated embeddings: {counts['user_query']} user, "
+                f"{counts['assistant_response']} responses, "
+                f"{counts['assistant_thinking']} thinking, "
+                f"{counts['tool_output']} tool"
+            )
 
         def _sync() -> int:
             if self.conn is None:
@@ -454,19 +555,51 @@ class DuckDBBackend(StorageBackend):
                 sequence = start_sequence + i
                 doc_id = f"{session_id}_msg_{sequence}"
 
-                # Prepare embedding if available
-                embedding_vector = embeddings[i] if embeddings and i < len(embeddings) else None
+                # Extract vectors for each content type
+                user_query_vec = None
+                assistant_response_vec = None
+                assistant_thinking_vec = None
+                tool_output_vec = None
+
+                if embeddings:
+                    user_query_vec = embeddings.get("user_query", [None] * len(lines))[i]
+                    assistant_response_vec = embeddings.get(
+                        "assistant_response", [None] * len(lines)
+                    )[i]
+                    assistant_thinking_vec = embeddings.get(
+                        "assistant_thinking", [None] * len(lines)
+                    )[i]
+                    tool_output_vec = embeddings.get("tool_output", [None] * len(lines))[i]
+
+                # Build vector metadata
+                vector_metadata = {
+                    "has_user_query": user_query_vec is not None,
+                    "has_assistant_response": assistant_response_vec is not None,
+                    "has_assistant_thinking": assistant_thinking_vec is not None,
+                    "has_tool_output": tool_output_vec is not None,
+                }
+
+                # Store content as JSON (handles both string and array formats)
+                content = line.get("content")
+                content_json = json.dumps(content) if content is not None else None
 
                 self.conn.execute(
                     """
                     INSERT INTO transcripts (
                         id, user_id, host_id, project_slug, session_id, sequence,
-                        role, content, turn, ts, embedding, embedding_model, synced_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        role, content, turn, ts,
+                        user_query_vector, assistant_response_vector,
+                        assistant_thinking_vector, tool_output_vector,
+                        embedding_model, vector_metadata, synced_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (id) DO UPDATE SET
                         content = EXCLUDED.content,
-                        embedding = EXCLUDED.embedding,
+                        user_query_vector = EXCLUDED.user_query_vector,
+                        assistant_response_vector = EXCLUDED.assistant_response_vector,
+                        assistant_thinking_vector = EXCLUDED.assistant_thinking_vector,
+                        tool_output_vector = EXCLUDED.tool_output_vector,
                         embedding_model = EXCLUDED.embedding_model,
+                        vector_metadata = EXCLUDED.vector_metadata,
                         synced_at = EXCLUDED.synced_at
                     """,
                     [
@@ -477,11 +610,15 @@ class DuckDBBackend(StorageBackend):
                         session_id,
                         sequence,
                         line.get("role"),
-                        line.get("content"),
+                        content_json,
                         line.get("turn"),
                         line.get("ts") or line.get("timestamp"),
-                        embedding_vector,
+                        user_query_vec,
+                        assistant_response_vec,
+                        assistant_thinking_vec,
+                        tool_output_vec,
                         self.embedding_provider.model_name if self.embedding_provider else None,
+                        json.dumps(vector_metadata),
                         datetime.now(UTC).isoformat(),
                     ],
                 )
@@ -520,7 +657,7 @@ class DuckDBBackend(StorageBackend):
                     "id": row[0],
                     "sequence": row[1],
                     "role": row[2],
-                    "content": row[3],
+                    "content": json.loads(row[3]) if row[3] else None,
                     "turn": row[4],
                     "ts": row[5],
                 }
@@ -704,7 +841,12 @@ class DuckDBBackend(StorageBackend):
     async def _get_embedding(
         self, user_id: str, session_id: str, sequence: int
     ) -> list[float] | None:
-        """Fetch embedding for a specific transcript message."""
+        """
+        Fetch first available embedding for a transcript message.
+
+        Returns the first non-null vector from any of the 4 vector columns.
+        Used primarily for testing.
+        """
 
         def _get() -> list[float] | None:
             if self.conn is None:
@@ -712,15 +854,19 @@ class DuckDBBackend(StorageBackend):
 
             result = self.conn.execute(
                 """
-                SELECT embedding
+                SELECT user_query_vector, assistant_response_vector,
+                       assistant_thinking_vector, tool_output_vector
                 FROM transcripts
                 WHERE user_id = ? AND session_id = ? AND sequence = ?
                 """,
                 [user_id, session_id, sequence],
             ).fetchone()
 
-            if result and result[0]:
-                return result[0]
+            if result:
+                # Return first non-null vector
+                for vec in result:
+                    if vec is not None:
+                        return vec
             return None
 
         return await asyncio.to_thread(_get)
@@ -979,15 +1125,37 @@ class DuckDBBackend(StorageBackend):
         query_vector: list[float],
         filters: SearchFilters | None = None,
         top_k: int = 100,
+        vector_columns: list[str] | None = None,
     ) -> list[SearchResult]:
-        """Perform vector similarity search using DuckDB VSS."""
+        """
+        Perform multi-vector similarity search using DuckDB VSS.
+
+        Searches across specified vector columns and returns best matches.
+
+        Args:
+            user_id: User identifier
+            query_vector: Query embedding vector
+            filters: Optional search filters
+            top_k: Number of results to return
+            vector_columns: Which vector columns to search. Default: all non-null vectors.
+                Options: ["user_query_vector", "assistant_response_vector",
+                          "assistant_thinking_vector", "tool_output_vector"]
+        """
+        if vector_columns is None:
+            # Search all vector columns by default
+            vector_columns = [
+                "user_query_vector",
+                "assistant_response_vector",
+                "assistant_thinking_vector",
+                "tool_output_vector",
+            ]
 
         def _search() -> list[SearchResult]:
             if self.conn is None:
                 raise StorageIOError("vector_search", cause=RuntimeError("Not initialized"))
 
-            # Build WHERE clause
-            where_parts = ["user_id = ?", "embedding IS NOT NULL"]
+            # Build base WHERE clause
+            where_parts = ["user_id = ?"]
             params: list[Any] = [user_id]
 
             if filters:
@@ -1003,24 +1171,36 @@ class DuckDBBackend(StorageBackend):
                     where_parts.append("ts <= ?")
                     params.append(filters.end_date)
 
-            where_clause = " AND ".join(where_parts)
-
-            # DuckDB vector search using array_cosine_similarity
-            # CRITICAL: DuckDB-VSS requires constant array expressions for HNSW index usage
-            # Parameter binding (?::FLOAT[N]) doesn't work - must use string interpolation
+            # DuckDB vector search - use GREATEST to find best match across all vector columns
             vec_literal = self._format_vector_literal(query_vector)
+
+            # Build similarity expressions for each vector column
+            similarity_exprs = []
+            for vec_col in vector_columns:
+                similarity_exprs.append(
+                    f"CASE WHEN {vec_col} IS NOT NULL "
+                    f"THEN array_cosine_similarity({vec_col}, {vec_literal}) "
+                    f"ELSE 0.0 END"
+                )
+
+            # Use GREATEST to find the maximum similarity across all vectors
+            max_similarity = f"GREATEST({', '.join(similarity_exprs)})"
+
+            # Ensure at least one vector is not null
+            any_vector_not_null = " OR ".join([f"{v} IS NOT NULL" for v in vector_columns])
+            where_parts.append(f"({any_vector_not_null})")
+
+            where_clause = " AND ".join(where_parts)
 
             query = f"""
                 SELECT id, session_id, project_slug, sequence, content, role, turn, ts,
-                       embedding,
-                       array_cosine_similarity(embedding, {vec_literal}) AS similarity
+                       {max_similarity} AS similarity
                 FROM transcripts
                 WHERE {where_clause}
                 ORDER BY similarity DESC
                 LIMIT ?
             """
 
-            # Note: query_vector now embedded in SQL, only other params passed
             params.append(top_k)
 
             results_raw = self.conn.execute(query, params).fetchall()
@@ -1030,15 +1210,14 @@ class DuckDBBackend(StorageBackend):
                     session_id=row[1],
                     project_slug=row[2],
                     sequence=row[3],
-                    content=row[4] or "",
+                    content=json.loads(row[4]) if row[4] else "",
                     metadata={
                         "id": row[0],
                         "role": row[5],
                         "turn": row[6],
                         "ts": row[7],
-                        "embedding": row[8],
                     },
-                    score=float(row[9]) if row[9] is not None else 0.0,
+                    score=float(row[8]) if row[8] is not None else 0.0,
                     source="semantic",
                 )
                 for row in results_raw

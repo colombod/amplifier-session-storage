@@ -59,24 +59,38 @@ class MockEmbeddingProvider(EmbeddingProvider):
 
 def try_create_real_embedding_provider() -> EmbeddingProvider | None:
     """
-    Try to create real Azure OpenAI embedding provider from environment.
+    Try to create real embedding provider from environment.
+    
+    Priority:
+    1. OpenAI direct (if OPENAI_API_KEY set)
+    2. Azure OpenAI (if AZURE_OPENAI_ENDPOINT set)
+    3. None (use mock)
 
     Returns None if not configured (tests should use mock instead).
     """
-    endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    # Try OpenAI direct first
+    if os.environ.get("OPENAI_API_KEY"):
+        try:
+            from amplifier_session_storage.embeddings.openai import OpenAIEmbeddings
+            
+            provider = OpenAIEmbeddings.from_env()
+            logger.info("Using real OpenAI embeddings for tests")
+            return provider
+        except Exception as e:
+            logger.warning(f"Could not create OpenAI provider: {e}")
+    
+    # Try Azure OpenAI second
+    if os.environ.get("AZURE_OPENAI_ENDPOINT"):
+        try:
+            from amplifier_session_storage.embeddings.azure_openai import AzureOpenAIEmbeddings
 
-    if not endpoint:
-        return None
-
-    try:
-        from amplifier_session_storage.embeddings.azure_openai import AzureOpenAIEmbeddings
-
-        provider = AzureOpenAIEmbeddings.from_env()
-        logger.info("Using real Azure OpenAI embeddings for tests")
-        return provider
-    except Exception as e:
-        logger.warning(f"Could not create Azure OpenAI provider: {e}")
-        return None
+            provider = AzureOpenAIEmbeddings.from_env()
+            logger.info("Using real Azure OpenAI embeddings for tests")
+            return provider
+        except Exception as e:
+            logger.warning(f"Could not create Azure OpenAI provider: {e}")
+    
+    return None
 
 
 @pytest.fixture

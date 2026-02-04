@@ -17,6 +17,7 @@ from typing import Any
 import aiosqlite
 import numpy as np
 
+from ..content_extraction import count_embeddable_content_types, extract_all_embeddable_content
 from ..embeddings import EmbeddingProvider
 from ..exceptions import StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
@@ -141,11 +142,15 @@ class SQLiteBackend(StorageBackend):
                     session_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
                     role TEXT,
-                    content TEXT,
+                    content_json TEXT,
                     turn INTEGER,
                     ts TEXT,
-                    embedding_json TEXT,
+                    user_query_vector_json TEXT,
+                    assistant_response_vector_json TEXT,
+                    assistant_thinking_vector_json TEXT,
+                    tool_output_vector_json TEXT,
                     embedding_model TEXT,
+                    vector_metadata TEXT,
                     synced_at TEXT DEFAULT (datetime('now'))
                 )
             """)
@@ -376,6 +381,63 @@ class SQLiteBackend(StorageBackend):
             raise
 
     # =========================================================================
+    # Embedding Helper Methods
+    # =========================================================================
+
+    async def _embed_non_none(self, texts: list[str | None]) -> list[list[float] | None]:
+        """Generate embeddings only for non-None texts."""
+        if not self.embedding_provider:
+            return [None] * len(texts)
+
+        # Collect non-None texts with their indices
+        texts_to_embed: list[tuple[int, str]] = []
+        for i, text in enumerate(texts):
+            if text is not None:
+                texts_to_embed.append((i, text))
+
+        if not texts_to_embed:
+            return [None] * len(texts)
+
+        # Generate embeddings for non-None texts
+        non_none_texts = [text for _, text in texts_to_embed]
+        embeddings_batch = await self.embedding_provider.embed_batch(non_none_texts)
+
+        # Build result list with None for skipped texts
+        results: list[list[float] | None] = [None] * len(texts)
+        for (idx, _), embedding in zip(texts_to_embed, embeddings_batch, strict=True):
+            results[idx] = embedding
+
+        return results
+
+    async def _generate_multi_vector_embeddings(
+        self, lines: list[dict[str, Any]]
+    ) -> dict[str, list[list[float] | None]]:
+        """Generate embeddings for all content types in a batch."""
+        if not self.embedding_provider:
+            return {}
+
+        # Extract all embeddable content types
+        user_queries: list[str | None] = []
+        assistant_responses: list[str | None] = []
+        assistant_thinking: list[str | None] = []
+        tool_outputs: list[str | None] = []
+
+        for line in lines:
+            extracted = extract_all_embeddable_content(line)
+            user_queries.append(extracted["user_query"])
+            assistant_responses.append(extracted["assistant_response"])
+            assistant_thinking.append(extracted["assistant_thinking"])
+            tool_outputs.append(extracted["tool_output"])
+
+        # Generate embeddings for each content type (only for non-None values)
+        return {
+            "user_query": await self._embed_non_none(user_queries),
+            "assistant_response": await self._embed_non_none(assistant_responses),
+            "assistant_thinking": await self._embed_non_none(assistant_thinking),
+            "tool_output": await self._embed_non_none(tool_outputs),
+        }
+
+    # =========================================================================
     # Transcript Operations
     # =========================================================================
 
@@ -387,41 +449,86 @@ class SQLiteBackend(StorageBackend):
         session_id: str,
         lines: list[dict[str, Any]],
         start_sequence: int = 0,
-        embeddings: list[list[float]] | None = None,
+        embeddings: dict[str, list[list[float] | None]] | None = None,
     ) -> int:
-        """Sync transcript lines with optional embeddings."""
+        """Sync transcript lines with optional multi-vector embeddings."""
         if not lines:
             return 0
 
         if self.conn is None:
             raise StorageIOError("sync_transcript", cause=RuntimeError("Not initialized"))
 
-        # Generate embeddings if needed
+        # Generate embeddings if not provided and we have a provider
         if embeddings is None and self.embedding_provider:
-            texts = [line.get("content", "") for line in lines]
-            embeddings = await self.embedding_provider.embed_batch(texts)
-            logger.info(f"Generated {len(embeddings)} embeddings during ingestion")
+            embeddings = await self._generate_multi_vector_embeddings(lines)
+            counts = count_embeddable_content_types(lines)
+            logger.info(
+                f"Generated embeddings: {counts['user_query']} user, "
+                f"{counts['assistant_response']} responses, "
+                f"{counts['assistant_thinking']} thinking, "
+                f"{counts['tool_output']} tool"
+            )
 
         synced = 0
         for i, line in enumerate(lines):
             sequence = start_sequence + i
             doc_id = f"{session_id}_msg_{sequence}"
 
-            # Serialize embedding to JSON for SQLite storage
-            embedding_json = (
-                json.dumps(embeddings[i]) if embeddings and i < len(embeddings) else None
+            # Extract vectors for each content type
+            user_query_vec = None
+            assistant_response_vec = None
+            assistant_thinking_vec = None
+            tool_output_vec = None
+
+            if embeddings:
+                user_query_vec = embeddings.get("user_query", [None] * len(lines))[i]
+                assistant_response_vec = embeddings.get("assistant_response", [None] * len(lines))[
+                    i
+                ]
+                assistant_thinking_vec = embeddings.get("assistant_thinking", [None] * len(lines))[
+                    i
+                ]
+                tool_output_vec = embeddings.get("tool_output", [None] * len(lines))[i]
+
+            # Serialize vectors to JSON TEXT for SQLite
+            user_query_json = json.dumps(user_query_vec) if user_query_vec else None
+            assistant_response_json = (
+                json.dumps(assistant_response_vec) if assistant_response_vec else None
             )
+            assistant_thinking_json = (
+                json.dumps(assistant_thinking_vec) if assistant_thinking_vec else None
+            )
+            tool_output_json = json.dumps(tool_output_vec) if tool_output_vec else None
+
+            # Build vector metadata
+            vector_metadata = {
+                "has_user_query": user_query_vec is not None,
+                "has_assistant_response": assistant_response_vec is not None,
+                "has_assistant_thinking": assistant_thinking_vec is not None,
+                "has_tool_output": tool_output_vec is not None,
+            }
+
+            # Store content as JSON (handles both string and array formats)
+            content = line.get("content")
+            content_json = json.dumps(content) if content is not None else None
 
             await self.conn.execute(
                 """
                 INSERT INTO transcripts (
                     id, user_id, host_id, project_slug, session_id, sequence,
-                    role, content, turn, ts, embedding_json, embedding_model, synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    role, content_json, turn, ts,
+                    user_query_vector_json, assistant_response_vector_json,
+                    assistant_thinking_vector_json, tool_output_vector_json,
+                    embedding_model, vector_metadata, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (id) DO UPDATE SET
-                    content = excluded.content,
-                    embedding_json = excluded.embedding_json,
+                    content_json = excluded.content_json,
+                    user_query_vector_json = excluded.user_query_vector_json,
+                    assistant_response_vector_json = excluded.assistant_response_vector_json,
+                    assistant_thinking_vector_json = excluded.assistant_thinking_vector_json,
+                    tool_output_vector_json = excluded.tool_output_vector_json,
                     embedding_model = excluded.embedding_model,
+                    vector_metadata = excluded.vector_metadata,
                     synced_at = excluded.synced_at
                 """,
                 (
@@ -432,28 +539,18 @@ class SQLiteBackend(StorageBackend):
                     session_id,
                     sequence,
                     line.get("role"),
-                    line.get("content"),
+                    content_json,
                     line.get("turn"),
                     line.get("ts") or line.get("timestamp"),
-                    embedding_json,
+                    user_query_json,
+                    assistant_response_json,
+                    assistant_thinking_json,
+                    tool_output_json,
                     self.embedding_provider.model_name if self.embedding_provider else None,
+                    json.dumps(vector_metadata),
                     datetime.now(UTC).isoformat(),
                 ),
             )
-
-            # If VSS is available and we have an embedding, also insert into virtual table
-            if self._vss_available and embedding_json:
-                try:
-                    await self.conn.execute(
-                        """
-                        INSERT INTO transcript_embeddings (rowid, embedding)
-                        VALUES (?, ?)
-                        ON CONFLICT (rowid) DO UPDATE SET embedding = excluded.embedding
-                        """,
-                        (sequence, embedding_json),
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to insert into VSS table: {e}")
 
             synced += 1
 
@@ -473,7 +570,7 @@ class SQLiteBackend(StorageBackend):
 
         async with self.conn.execute(
             """
-            SELECT id, sequence, role, content, turn, ts
+            SELECT id, sequence, role, content_json, turn, ts
             FROM transcripts
             WHERE user_id = ? AND project_slug = ? AND session_id = ?
             AND sequence > ?
@@ -487,7 +584,7 @@ class SQLiteBackend(StorageBackend):
                     "id": row[0],
                     "sequence": row[1],
                     "role": row[2],
-                    "content": row[3],
+                    "content": json.loads(row[3]) if row[3] else "",
                     "turn": row[4],
                     "ts": row[5],
                 }
@@ -539,8 +636,8 @@ class SQLiteBackend(StorageBackend):
         if role_conditions:
             where_parts.append(f"({' OR '.join(role_conditions)})")
 
-        # Content search
-        where_parts.append("content LIKE ?")
+        # Content search (search in JSON content)
+        where_parts.append("content_json LIKE ?")
         params.append(f"%{options.query}%")
 
         # Apply filters
@@ -560,7 +657,7 @@ class SQLiteBackend(StorageBackend):
         where_clause = " AND ".join(where_parts)
 
         query = f"""
-            SELECT id, session_id, project_slug, sequence, content, role, turn, ts
+            SELECT id, session_id, project_slug, sequence, content_json, role, turn, ts
             FROM transcripts
             WHERE {where_clause}
             ORDER BY ts DESC
@@ -575,7 +672,7 @@ class SQLiteBackend(StorageBackend):
                     session_id=row[1],
                     project_slug=row[2],
                     sequence=row[3],
-                    content=row[4] or "",
+                    content=json.loads(row[4]) if row[4] else "",
                     metadata={
                         "id": row[0],
                         "role": row[5],
@@ -657,21 +754,25 @@ class SQLiteBackend(StorageBackend):
     async def _get_embedding(
         self, user_id: str, session_id: str, sequence: int
     ) -> list[float] | None:
-        """Fetch embedding for a specific transcript."""
+        """Fetch embedding for a specific transcript (returns first non-null vector)."""
         if self.conn is None:
             return None
 
         async with self.conn.execute(
             """
-            SELECT embedding_json
+            SELECT user_query_vector_json, assistant_response_vector_json,
+                   assistant_thinking_vector_json, tool_output_vector_json
             FROM transcripts
             WHERE user_id = ? AND session_id = ? AND sequence = ?
             """,
             (user_id, session_id, sequence),
         ) as cursor:
             row = await cursor.fetchone()
-            if row and row[0]:
-                return json.loads(row[0])
+            if row:
+                # Return first non-null vector (for backward compatibility with tests)
+                for vec_json in row:
+                    if vec_json:
+                        return json.loads(vec_json)
             return None
 
     # =========================================================================
@@ -863,19 +964,27 @@ class SQLiteBackend(StorageBackend):
         session_id: str,
         embeddings: list[dict[str, Any]],
     ) -> int:
-        """Upsert embeddings for existing transcripts."""
+        """Upsert embeddings for existing transcripts (legacy method - deprecated)."""
         if self.conn is None:
             raise StorageIOError("upsert_embeddings", cause=RuntimeError("Not initialized"))
+
+        # This method is deprecated in multi-vector design
+        # For backward compatibility, we store single vectors in user_query_vector
+        logger.warning(
+            "upsert_embeddings is deprecated in multi-vector schema. "
+            "Use sync_transcript_lines with multi-vector embeddings instead."
+        )
 
         updated = 0
         for emb in embeddings:
             doc_id = f"{session_id}_msg_{emb['sequence']}"
             embedding_json = json.dumps(emb["vector"])
 
+            # Store in user_query_vector for backward compatibility
             await self.conn.execute(
                 """
                 UPDATE transcripts
-                SET embedding_json = ?,
+                SET user_query_vector_json = ?,
                     embedding_model = ?,
                     synced_at = ?
                 WHERE id = ? AND user_id = ?
@@ -889,20 +998,6 @@ class SQLiteBackend(StorageBackend):
                 ),
             )
 
-            # Update VSS table if available
-            if self._vss_available:
-                try:
-                    await self.conn.execute(
-                        """
-                        INSERT INTO transcript_embeddings (rowid, embedding)
-                        VALUES (?, ?)
-                        ON CONFLICT (rowid) DO UPDATE SET embedding = excluded.embedding
-                        """,
-                        (emb["sequence"], embedding_json),
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to update VSS table: {e}")
-
             updated += 1
 
         await self.conn.commit()
@@ -914,19 +1009,42 @@ class SQLiteBackend(StorageBackend):
         query_vector: list[float],
         filters: SearchFilters | None = None,
         top_k: int = 100,
+        vector_columns: list[str] | None = None,
     ) -> list[SearchResult]:
         """
-        Perform vector similarity search.
+        Perform multi-vector similarity search.
 
-        Uses sqlite-vss if available, otherwise falls back to brute-force numpy.
+        Searches across specified vector columns and returns best matches.
+
+        Args:
+            user_id: User identifier
+            query_vector: Query embedding vector
+            filters: Optional search filters
+            top_k: Number of results to return
+            vector_columns: Which vector columns to search. Default: all non-null vectors.
+                Options: ["user_query", "assistant_response",
+                          "assistant_thinking", "tool_output"]
         """
         if self.conn is None:
             raise StorageIOError("vector_search", cause=RuntimeError("Not initialized"))
 
+        if vector_columns is None:
+            # Search all vector columns by default
+            vector_columns = [
+                "user_query",
+                "assistant_response",
+                "assistant_thinking",
+                "tool_output",
+            ]
+
         if self._vss_available:
-            return await self._vss_vector_search(user_id, query_vector, filters, top_k)
+            return await self._vss_vector_search(
+                user_id, query_vector, filters, top_k, vector_columns
+            )
         else:
-            return await self._numpy_vector_search(user_id, query_vector, filters, top_k)
+            return await self._numpy_vector_search(
+                user_id, query_vector, filters, top_k, vector_columns
+            )
 
     async def _vss_vector_search(
         self,
@@ -934,12 +1052,15 @@ class SQLiteBackend(StorageBackend):
         query_vector: list[float],
         filters: SearchFilters | None,
         top_k: int,
+        vector_columns: list[str],
     ) -> list[SearchResult]:
         """Vector search using sqlite-vss extension."""
         # Note: Implementation depends on sqlite-vss API
         # This is a placeholder for when sqlite-vss is properly integrated
         logger.warning("sqlite-vss integration not yet implemented, using numpy fallback")
-        return await self._numpy_vector_search(user_id, query_vector, filters, top_k)
+        return await self._numpy_vector_search(
+            user_id, query_vector, filters, top_k, vector_columns
+        )
 
     async def _numpy_vector_search(
         self,
@@ -947,13 +1068,24 @@ class SQLiteBackend(StorageBackend):
         query_vector: list[float],
         filters: SearchFilters | None,
         top_k: int,
+        vector_columns: list[str],
     ) -> list[SearchResult]:
-        """Brute-force vector search using numpy cosine similarity."""
+        """Brute-force multi-vector search using numpy cosine similarity."""
         if self.conn is None:
             raise StorageIOError("vector_search", cause=RuntimeError("Not initialized"))
 
-        # Build WHERE clause
-        where_parts = ["user_id = ?", "embedding_json IS NOT NULL"]
+        # Map content type names to JSON column names
+        column_map = {
+            "user_query": "user_query_vector_json",
+            "assistant_response": "assistant_response_vector_json",
+            "assistant_thinking": "assistant_thinking_vector_json",
+            "tool_output": "tool_output_vector_json",
+        }
+
+        # Build WHERE clause - require at least one vector column to be non-null
+        where_parts = ["user_id = ?"]
+        vector_checks = [f"{column_map[col]} IS NOT NULL" for col in vector_columns]
+        where_parts.append(f"({' OR '.join(vector_checks)})")
         params: list[Any] = [user_id]
 
         if filters:
@@ -971,8 +1103,24 @@ class SQLiteBackend(StorageBackend):
 
         where_clause = " AND ".join(where_parts)
 
+        # Select all vector columns
+        select_columns = [
+            "id",
+            "session_id",
+            "project_slug",
+            "sequence",
+            "content_json",
+            "role",
+            "turn",
+            "ts",
+            "user_query_vector_json",
+            "assistant_response_vector_json",
+            "assistant_thinking_vector_json",
+            "tool_output_vector_json",
+        ]
+
         query = f"""
-            SELECT id, session_id, project_slug, sequence, content, role, turn, ts, embedding_json
+            SELECT {", ".join(select_columns)}
             FROM transcripts
             WHERE {where_clause}
         """
@@ -981,22 +1129,34 @@ class SQLiteBackend(StorageBackend):
         async with self.conn.execute(query, params) as cursor:
             rows = await cursor.fetchall()
 
-        # Compute similarities with numpy
+        # Compute similarities with numpy (GREATEST strategy across all vectors)
         query_np = np.array(query_vector)
         candidates: list[tuple[float, Any]] = []
 
         for row in rows:
-            if row[8]:  # embedding_json
-                embedding = json.loads(row[8])
-                embedding_np = np.array(embedding)
+            # Load all 4 vector types (indices 8-11)
+            vectors_to_check = []
 
-                # Cosine similarity
-                similarity = float(
-                    np.dot(query_np, embedding_np)
-                    / (np.linalg.norm(query_np) * np.linalg.norm(embedding_np))
-                )
+            for idx, vec_type in enumerate(
+                ["user_query", "assistant_response", "assistant_thinking", "tool_output"]
+            ):
+                if vec_type in vector_columns:
+                    vec_json = row[8 + idx]  # Columns 8-11 are the vector JSONs
+                    if vec_json:
+                        vec = json.loads(vec_json)
+                        vec_np = np.array(vec)
 
-                candidates.append((similarity, row))
+                        # Cosine similarity
+                        sim = float(
+                            np.dot(query_np, vec_np)
+                            / (np.linalg.norm(query_np) * np.linalg.norm(vec_np))
+                        )
+                        vectors_to_check.append(sim)
+
+            # Use maximum similarity across all vector types (GREATEST strategy)
+            if vectors_to_check:
+                max_similarity = max(vectors_to_check)
+                candidates.append((max_similarity, row))
 
         # Sort by similarity (descending) and take top_k
         candidates.sort(reverse=True, key=lambda x: x[0])
@@ -1007,13 +1167,12 @@ class SQLiteBackend(StorageBackend):
                 session_id=row[1],
                 project_slug=row[2],
                 sequence=row[3],
-                content=row[4] or "",
+                content=json.loads(row[4]) if row[4] else "",
                 metadata={
                     "id": row[0],
                     "role": row[5],
                     "turn": row[6],
                     "ts": row[7],
-                    "embedding": json.loads(row[8]),
                 },
                 score=similarity,
                 source="semantic",

@@ -205,6 +205,9 @@ class CosmosBackend(StorageBackend):
             "includedPaths": [{"path": "/*"}],
         }
 
+        # Vector embedding policy for Cosmos DB (required for vector search)
+        vector_embedding_policy: dict[str, Any] | None = None
+
         # Add vector indexes for transcripts if enabled
         if vector_enabled and name == TRANSCRIPTS_CONTAINER:
             # Vector index configuration for Cosmos DB - one index per content type
@@ -212,39 +215,69 @@ class CosmosBackend(StorageBackend):
                 {
                     "path": "/user_query_vector",
                     "type": "quantizedFlat",
-                    "quantizationByteSize": 128,
-                    "vectorDataType": "float32",
-                    "dimensions": 3072,
                 },
                 {
                     "path": "/assistant_response_vector",
                     "type": "quantizedFlat",
-                    "quantizationByteSize": 128,
-                    "vectorDataType": "float32",
-                    "dimensions": 3072,
                 },
                 {
                     "path": "/assistant_thinking_vector",
                     "type": "quantizedFlat",
-                    "quantizationByteSize": 128,
-                    "vectorDataType": "float32",
-                    "dimensions": 3072,
                 },
                 {
                     "path": "/tool_output_vector",
                     "type": "quantizedFlat",
-                    "quantizationByteSize": 128,
-                    "vectorDataType": "float32",
-                    "dimensions": 3072,
                 },
             ]
-            logger.info(f"Creating {name} with vector search support (3072 dimensions)")
 
-        container = await self._database.create_container_if_not_exists(
-            id=name,
-            partition_key=PartitionKey(path=partition_key_path),
-            indexing_policy=indexing_policy,
-        )
+            # Vector embedding policy defines the embedding paths and their properties
+            # This is REQUIRED for vector search to work in Cosmos DB
+            vector_embedding_policy = {
+                "vectorEmbeddings": [
+                    {
+                        "path": "/user_query_vector",
+                        "dataType": "float32",
+                        "dimensions": 3072,
+                        "distanceFunction": "cosine",
+                    },
+                    {
+                        "path": "/assistant_response_vector",
+                        "dataType": "float32",
+                        "dimensions": 3072,
+                        "distanceFunction": "cosine",
+                    },
+                    {
+                        "path": "/assistant_thinking_vector",
+                        "dataType": "float32",
+                        "dimensions": 3072,
+                        "distanceFunction": "cosine",
+                    },
+                    {
+                        "path": "/tool_output_vector",
+                        "dataType": "float32",
+                        "dimensions": 3072,
+                        "distanceFunction": "cosine",
+                    },
+                ]
+            }
+            logger.info(
+                f"Creating {name} with vector search support (3072 dimensions, cosine distance)"
+            )
+
+        # Create container with optional vector embedding policy
+        if vector_embedding_policy:
+            container = await self._database.create_container_if_not_exists(
+                id=name,
+                partition_key=PartitionKey(path=partition_key_path),
+                indexing_policy=indexing_policy,
+                vector_embedding_policy=vector_embedding_policy,
+            )
+        else:
+            container = await self._database.create_container_if_not_exists(
+                id=name,
+                partition_key=PartitionKey(path=partition_key_path),
+                indexing_policy=indexing_policy,
+            )
         self._containers[name] = container
 
     async def close(self) -> None:
@@ -988,7 +1021,9 @@ class CosmosBackend(StorageBackend):
         """
         Perform multi-vector similarity search in Cosmos DB.
 
-        Uses VectorDistance function for each vector column and finds best match.
+        Since Cosmos DB doesn't support LEAST/GREATEST functions, we run separate
+        queries for each vector column and merge results, keeping the best score
+        for each document.
 
         Args:
             user_id: User identifier
@@ -1010,9 +1045,6 @@ class CosmosBackend(StorageBackend):
                 "tool_output",
             ]
 
-        # Build similarity expressions for each vector column
-        # In Cosmos DB, we can't use GREATEST, so we compute all and use ORDER BY
-        vector_distance_exprs = []
         vector_field_names = {
             "user_query": "user_query_vector",
             "assistant_response": "assistant_response_vector",
@@ -1020,22 +1052,133 @@ class CosmosBackend(StorageBackend):
             "tool_output": "tool_output_vector",
         }
 
+        # Build base filter conditions
+        filter_parts = ["c.user_id = @user_id"]
+        base_params: list[dict[str, object]] = [
+            {"name": "@user_id", "value": user_id},
+            {"name": "@query_vector", "value": query_vector},
+        ]
+
+        if filters:
+            if filters.project_slug:
+                filter_parts.append("c.project_slug = @project")
+                base_params.append({"name": "@project", "value": filters.project_slug})
+
+            if filters.start_date:
+                filter_parts.append("c.ts >= @start_date")
+                base_params.append({"name": "@start_date", "value": filters.start_date})
+
+            if filters.end_date:
+                filter_parts.append("c.ts <= @end_date")
+                base_params.append({"name": "@end_date", "value": filters.end_date})
+
+        where_clause = " AND ".join(filter_parts)
+
+        # Run separate query for each vector column and merge results
+        # This is necessary because Cosmos DB doesn't support LEAST() function
+        all_results: dict[str, SearchResult] = {}  # keyed by doc id
+
         for vec_type in vector_columns:
             field = vector_field_names[vec_type]
-            # Use CASE to handle null vectors
+
+            # Query for this vector column only - TOP is REQUIRED for vector search in Cosmos DB
+            query = f"""
+                SELECT TOP {top_k} c.id, c.session_id, c.project_slug, c.sequence, c.content, 
+                       c.role, c.turn, c.ts,
+                       VectorDistance(c.{field}, @query_vector) AS distance
+                FROM c
+                WHERE {where_clause} AND IS_DEFINED(c.{field})
+                ORDER BY VectorDistance(c.{field}, @query_vector)
+            """
+
+            try:
+                async for item in container.query_items(
+                    query=query, parameters=base_params, max_item_count=top_k
+                ):
+                    doc_id = item["id"]
+                    distance = item.get("distance", 1.0)
+                    similarity = 1.0 - min(distance, 1.0)
+
+                    # Keep the best score for each document
+                    if doc_id not in all_results or similarity > all_results[doc_id].score:
+                        all_results[doc_id] = SearchResult(
+                            session_id=item["session_id"],
+                            project_slug=item["project_slug"],
+                            sequence=item["sequence"],
+                            content=item.get("content", ""),
+                            metadata=item,
+                            score=similarity,
+                            source=f"semantic_{vec_type}",
+                        )
+            except CosmosHttpResponseError as e:
+                # Log but continue with other vector columns
+                logger.warning(f"Vector search failed for {vec_type}: {e}")
+                continue
+
+        # Sort by score and return top_k
+        results = sorted(all_results.values(), key=lambda r: r.score, reverse=True)[:top_k]
+        return results
+
+    async def _vector_search_single_column(
+        self,
+        user_id: str,
+        query_vector: list[float],
+        vector_column: str,
+        filters: SearchFilters | None = None,
+        top_k: int = 100,
+    ) -> list[SearchResult]:
+        """Helper for single-column vector search."""
+        return await self.vector_search(
+            user_id=user_id,
+            query_vector=query_vector,
+            filters=filters,
+            top_k=top_k,
+            vector_columns=[vector_column],
+        )
+
+    async def _old_vector_search(
+        self,
+        user_id: str,
+        query_vector: list[float],
+        filters: SearchFilters | None = None,
+        top_k: int = 100,
+        vector_columns: list[str] | None = None,
+    ) -> list[SearchResult]:
+        """
+        DEPRECATED: Old implementation that used LEAST() - not supported by Cosmos DB.
+        Kept for reference only.
+        """
+        container = self._get_container(TRANSCRIPTS_CONTAINER)
+
+        if vector_columns is None:
+            vector_columns = [
+                "user_query",
+                "assistant_response",
+                "assistant_thinking",
+                "tool_output",
+            ]
+
+        vector_field_names = {
+            "user_query": "user_query_vector",
+            "assistant_response": "assistant_response_vector",
+            "assistant_thinking": "assistant_thinking_vector",
+            "tool_output": "tool_output_vector",
+        }
+
+        vector_distance_exprs = []
+        for vec_type in vector_columns:
+            field = vector_field_names[vec_type]
             vector_distance_exprs.append(
                 f"(IS_DEFINED(c.{field}) ? VectorDistance(c.{field}, @query_vector) : 1.0)"
             )
 
-        # Create a minimum distance expression (best match across all vectors)
-        # Note: VectorDistance returns distance (lower is better), so use MIN
+        # NOTE: LEAST() is NOT supported in Cosmos DB SQL
         min_distance_expr = (
             f"LEAST({', '.join(vector_distance_exprs)})"
             if len(vector_distance_exprs) > 1
             else vector_distance_exprs[0]
         )
 
-        # Build query with multi-vector support
         query_parts = [
             f"SELECT c.id, c.session_id, c.project_slug, c.sequence, c.content, c.role, "
             f"c.turn, c.ts, {min_distance_expr} AS best_distance "
@@ -1128,34 +1271,24 @@ class CosmosBackend(StorageBackend):
 
         where_clause = " AND ".join(where_parts)
 
-        # Count total sessions
-        count_query = f"SELECT VALUE COUNT(1) FROM c WHERE {where_clause}"
-        total_sessions = 0
-        async for count_val in sessions.query_items(query=count_query, parameters=params):  # type: ignore
-            total_sessions = int(count_val) if isinstance(count_val, (int, str)) else 0
-            break
+        # Cosmos DB cross-partition queries don't support GROUP BY with aggregates
+        # So we fetch minimal data and aggregate in Python
+        fetch_query = f"SELECT c.project_slug, c.bundle FROM c WHERE {where_clause}"
 
-        # Aggregate by project
-        project_query = f"""
-            SELECT c.project_slug, COUNT(1) as count
-            FROM c
-            WHERE {where_clause}
-            GROUP BY c.project_slug
-        """
         projects: dict[str, int] = {}
-        async for item in sessions.query_items(query=project_query, parameters=params):  # type: ignore
-            projects[item["project_slug"]] = item["count"]
-
-        # Aggregate by bundle
-        bundle_query = f"""
-            SELECT c.bundle, COUNT(1) as count
-            FROM c
-            WHERE {where_clause}
-            GROUP BY c.bundle
-        """
         bundles: dict[str, int] = {}
-        async for item in sessions.query_items(query=bundle_query, parameters=params):  # type: ignore
-            bundles[item["bundle"]] = item["count"]
+        total_sessions = 0
+
+        async for item in sessions.query_items(query=fetch_query, parameters=params):  # type: ignore
+            total_sessions += 1
+
+            # Count by project
+            proj = item.get("project_slug", "unknown")
+            projects[proj] = projects.get(proj, 0) + 1
+
+            # Count by bundle
+            bundle = item.get("bundle", "unknown")
+            bundles[bundle] = bundles.get(bundle, 0) + 1
 
         return {
             "total_sessions": total_sessions,

@@ -265,11 +265,37 @@ class CosmosBackend(StorageBackend):
             },
         )
 
-        # Base indexing policy
+        # Optimized indexing policy per COSMOS_DB_BEST_PRACTICES.md
+        # - Include only queried scalar properties (reduces write RU cost)
+        # - Exclude large text content and vectors from standard indexes
+        # - Default exclude everything else to prevent indexing new unknown fields
         indexing_policy: dict[str, Any] = {
             "indexingMode": "consistent",
             "automatic": True,
-            "includedPaths": [{"path": "/*"}],
+            "includedPaths": [
+                {"path": "/user_id/?"},
+                {"path": "/session_id/?"},
+                {"path": "/type/?"},  # Type discriminator for single-container
+                {"path": "/partition_key/?"},
+                {"path": "/project_slug/?"},
+                {"path": "/ts/?"},
+                {"path": "/sequence/?"},
+                {"path": "/role/?"},
+                {"path": "/turn/?"},
+                {"path": "/created/?"},
+                {"path": "/updated/?"},
+                {"path": "/bundle/?"},
+                {"path": "/event/?"},
+                {"path": "/lvl/?"},
+            ],
+            "excludedPaths": [
+                {"path": "/content/*"},  # Don't index full content text
+                {"path": "/user_query_vector/*"},  # Handled by vector index
+                {"path": "/assistant_response_vector/*"},
+                {"path": "/assistant_thinking_vector/*"},
+                {"path": "/tool_output_vector/*"},
+                {"path": "/*"},  # Exclude everything else by default
+            ],
         }
 
         # Vector embedding policy for Cosmos DB (required for vector search)

@@ -1,6 +1,10 @@
 # Vector Schema Design - Multi-Embedding Strategy
 
-**Purpose**: Design document for how embeddings are stored and what content they represent.
+> **Version**: 1.0.0  
+> **Last Updated**: 2025-02-05  
+> **Status**: Implemented across all 3 backends (DuckDB, SQLite, Cosmos DB)
+
+**Purpose**: Technical reference for how embeddings are stored and what content they represent.
 
 **Key Insight**: Different content types need different embeddings for effective search.
 
@@ -8,7 +12,7 @@
 
 ## The Problem with Single Embedding Column
 
-**Current naive approach**:
+**The naive approach (NOT used)**:
 ```sql
 CREATE TABLE transcripts (
     ...
@@ -25,7 +29,7 @@ CREATE TABLE transcripts (
 
 ---
 
-## Recommended Design: Multi-Vector Schema
+## Implemented Design: Multi-Vector Schema
 
 ### Transcripts Table Schema
 
@@ -240,7 +244,7 @@ error_message = event["data"].get("error", {}).get("message", "")
 
 ## Embedding Metadata Strategy
 
-### Option A: Separate Columns (Recommended)
+### Option A: Separate Columns (Implemented)
 
 **Schema**:
 ```sql
@@ -738,13 +742,18 @@ results = await storage.search_transcripts(
 
 ---
 
-## Next Steps
+## Implementation Status
 
-1. **Update schema** in all three backends (DuckDB, SQLite, Cosmos)
-2. **Implement extraction functions** (user, assistant, tool)
-3. **Update embedding generation** to produce multiple vectors
-4. **Update search queries** to use appropriate vector columns
-5. **Add tests** with real assistant message structure
-6. **Update documentation** with new schema
+All items completed:
 
-**This is a significant change but necessary for correct semantic search over real Amplifier sessions!**
+- ✅ Schema updated in all three backends (DuckDB, SQLite, Cosmos)
+- ✅ Extraction functions implemented (`content_extraction.py`)
+- ✅ Embedding generation produces multiple vectors per message
+- ✅ Search queries use appropriate vector columns
+- ✅ Tests added with real assistant message structure (18+ tests)
+- ✅ Documentation updated
+
+**See also**:
+- `EMBEDDING_STRATEGY.md` - What content gets embedded
+- `MULTI_VECTOR_IMPLEMENTATION.md` - Complete implementation details
+- `HYBRID_SEARCH_GUIDE.md` - User guide for search features

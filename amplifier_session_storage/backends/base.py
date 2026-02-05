@@ -33,6 +33,7 @@ class TranscriptSearchOptions:
     search_in_user: bool = True  # Search in user messages
     search_in_assistant: bool = True  # Search in assistant messages
     search_in_thinking: bool = True  # Search in thinking blocks
+    search_in_tool: bool = False  # Search in tool output blocks (default off - usually noisy)
     search_type: str = "hybrid"  # "full_text", "semantic", "hybrid"
     mmr_lambda: float = 0.7  # MMR relevance vs diversity (1.0=relevance, 0.0=diversity)
     filters: SearchFilters | None = None
@@ -401,20 +402,37 @@ class StorageBackend(ABC):
     @abstractmethod
     async def search_events(
         self,
-        user_id: str,
-        options: EventSearchOptions,
-        limit: int = 100,
+        user_id: str = "",
+        session_id: str = "",
+        project_slug: str = "",
+        event_type: str = "",
+        event_category: str = "",
+        tool_name: str = "",
+        model: str = "",
+        provider: str = "",
+        level: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        limit: int = 50,
     ) -> list[SearchResult]:
-        """
-        Search events by type, tool, date range.
+        """Search events with structured filters.
 
         Args:
-            user_id: User identifier
-            options: Search configuration
-            limit: Maximum results
+            user_id: Filter by user.
+            session_id: Filter by session.
+            project_slug: Filter by project.
+            event_type: Exact event type match (e.g. ``"tool:pre"``, ``"llm:response"``).
+            event_category: Semantic group (e.g. ``"tool"``, ``"llm"``, ``"lifecycle"``).
+            tool_name: Filter tool events by ``data.tool_name``.
+            model: Filter LLM events by ``data.model``.
+            provider: Filter LLM events by ``data.provider``.
+            level: Filter by log level (``lvl`` field).
+            start_date: Inclusive lower bound on ``ts`` (ISO-8601).
+            end_date: Inclusive upper bound on ``ts`` (ISO-8601).
+            limit: Maximum results to return.
 
         Returns:
-            List of matching events with metadata
+            List of matching events with metadata, ordered by timestamp descending.
         """
         pass
 

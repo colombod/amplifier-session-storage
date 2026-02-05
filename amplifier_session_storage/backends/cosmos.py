@@ -24,7 +24,6 @@ from ..embeddings import EmbeddingProvider
 from ..exceptions import AuthenticationError, StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
 from .base import (
-    EventSearchOptions,
     MessageContext,
     SearchFilters,
     SearchResult,
@@ -96,6 +95,102 @@ def _strip_vectors(item: dict[str, Any]) -> dict[str, Any]:
     reduces RU cost significantly.
     """
     return {k: v for k, v in item.items() if k not in VECTOR_FIELDS}
+
+
+def _extract_display_content(raw_content: Any) -> str:
+    """Extract readable text from raw transcript content for display.
+
+    Handles:
+    - Simple strings (user messages) -> returned as-is
+    - List of content blocks (assistant messages) -> extracts text/thinking
+    - None -> empty string
+    """
+    if raw_content is None:
+        return ""
+    if isinstance(raw_content, str):
+        return raw_content
+    if isinstance(raw_content, list):
+        parts = []
+        for block in raw_content:
+            if isinstance(block, dict):
+                block_type = block.get("type", "")
+                if block_type == "text":
+                    text = block.get("text", "")
+                    if text:
+                        parts.append(text)
+                elif block_type == "thinking":
+                    thinking = block.get("thinking", "")
+                    if thinking:  # Skip empty thinking with only signature
+                        parts.append(f"[thinking] {thinking}")
+                elif block_type == "tool_use":
+                    name = block.get("name", "unknown")
+                    parts.append(f"[tool_use: {name}]")
+                elif block_type == "tool_result":
+                    content = block.get("content", "")
+                    if isinstance(content, str) and content:
+                        parts.append(f"[tool_result] {content[:200]}")
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts) if parts else str(raw_content)[:500]
+    return str(raw_content)[:500]
+
+
+def _extract_event_content(item: dict[str, Any]) -> str:
+    """Build useful display content from an event document."""
+    event_type = item.get("event", "")
+    data = item.get("data", {})
+
+    if not isinstance(data, dict):
+        return event_type
+
+    parts: list[str] = [event_type]
+
+    # Tool events
+    if event_type in ("tool:pre", "tool:post"):
+        tool = data.get("tool_name", "")
+        if tool:
+            parts.append(f"tool={tool}")
+
+    # LLM events
+    elif event_type in ("llm:request", "llm:response"):
+        model = data.get("model", "")
+        provider = data.get("provider", "")
+        if model:
+            parts.append(f"model={model}")
+        if provider:
+            parts.append(f"provider={provider}")
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            inp = usage.get("input", 0)
+            out = usage.get("output", 0)
+            parts.append(f"tokens={inp}in/{out}out")
+
+    # Content blocks
+    elif event_type.startswith("content_block:"):
+        block_type = data.get("block_type", "")
+        if block_type:
+            parts.append(f"type={block_type}")
+        idx = data.get("block_index")
+        total = data.get("total_blocks")
+        if idx is not None and total:
+            parts.append(f"block={idx}/{total}")
+
+    # Orchestrator
+    elif event_type == "orchestrator:complete":
+        orch = data.get("orchestrator", "")
+        turns = data.get("turn_count", "")
+        if orch:
+            parts.append(f"orchestrator={orch}")
+        if turns:
+            parts.append(f"turns={turns}")
+
+    # Delegate
+    elif event_type == "delegate:agent_completed":
+        agent = data.get("agent", data.get("agent_name", ""))
+        if agent:
+            parts.append(f"agent={agent}")
+
+    return " | ".join(parts)
 
 
 @dataclass
@@ -543,13 +638,14 @@ class CosmosBackend(StorageBackend):
 
         # Build query with explicit projection for RU optimization
         # Filter by type discriminator for single-container architecture
-        query_parts = [
-            f"SELECT {SESSION_PROJECTION} FROM c WHERE c.type = @type AND c.user_id = @user_id"
-        ]
+        query_parts = [f"SELECT {SESSION_PROJECTION} FROM c WHERE c.type = @type"]
         params: list[dict[str, object]] = [
             {"name": "@type", "value": DOC_TYPE_SESSION},
-            {"name": "@user_id", "value": user_id},
         ]
+
+        if user_id:
+            query_parts.append("AND c.user_id = @user_id")
+            params.append({"name": "@user_id", "value": user_id})
 
         if filters.project_slug:
             query_parts.append("AND c.project_slug = @project")
@@ -900,7 +996,7 @@ class CosmosBackend(StorageBackend):
                     session_id=item["session_id"],
                     project_slug=item["project_slug"],
                     sequence=item["sequence"],
-                    content=item.get("content", ""),
+                    content=_extract_display_content(item.get("content")),
                     metadata=_strip_vectors(item),
                     score=1.0,  # Full-text doesn't have scores
                     source="full_text",
@@ -924,12 +1020,26 @@ class CosmosBackend(StorageBackend):
         # Generate query embedding
         query_vector = await self.embedding_provider.embed_text(options.query)
 
+        # Translate search_in_* flags to vector_columns
+        vector_columns: list[str] | None = []
+        if options.search_in_user:
+            vector_columns.append("user_query")
+        if options.search_in_assistant:
+            vector_columns.append("assistant_response")
+        if options.search_in_thinking:
+            vector_columns.append("assistant_thinking")
+        if options.search_in_tool:
+            vector_columns.append("tool_output")
+        if not vector_columns:
+            vector_columns = None  # None = search all
+
         # Perform vector search
         return await self.vector_search(
             user_id=user_id,
             query_vector=query_vector,
             filters=options.filters,
             top_k=limit,
+            vector_columns=vector_columns,
         )
 
     async def _hybrid_search_transcripts(
@@ -1181,7 +1291,7 @@ class CosmosBackend(StorageBackend):
         # Filter by type discriminator for single-container architecture
         query = (
             "SELECT c.id, c.sequence, c.ts, c.lvl, c.event, c.turn, "
-            "c.data_truncated, c.data_size_bytes "
+            "c.data, c.data_truncated, c.data_size_bytes "
             "FROM c WHERE c.type = @type AND c.partition_key = @pk "
             "AND c.sequence > @after_seq ORDER BY c.sequence"
         )
@@ -1199,49 +1309,97 @@ class CosmosBackend(StorageBackend):
 
     async def search_events(
         self,
-        user_id: str,
-        options: EventSearchOptions,
-        limit: int = 100,
+        user_id: str = "",
+        session_id: str = "",
+        project_slug: str = "",
+        event_type: str = "",
+        event_category: str = "",
+        tool_name: str = "",
+        model: str = "",
+        provider: str = "",
+        level: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        limit: int = 50,
     ) -> list[SearchResult]:
-        """Search events by type, tool, and filters."""
+        """Search events with structured filters.
+
+        Args:
+            user_id: Filter by user.
+            session_id: Filter by session.
+            project_slug: Filter by project.
+            event_type: Exact event type match (e.g. "tool:pre", "llm:response").
+            event_category: Prefix-based group filter (e.g. "tool", "llm", "session").
+                Uses STARTSWITH on the event type prefix for fully dynamic discovery.
+            tool_name: Filter tool events by ``data.tool_name``.
+            model: Filter LLM events by ``data.model``.
+            provider: Filter LLM events by ``data.provider``.
+            level: Filter by log level (``lvl`` field).
+            start_date: Inclusive lower bound on ``ts`` (ISO-8601).
+            end_date: Inclusive upper bound on ``ts`` (ISO-8601).
+            limit: Maximum results to return.
+
+        Returns:
+            List of :class:`SearchResult` ordered by timestamp descending.
+        """
         container = self._get_container(CONTAINER_NAME)
 
-        # Build query with explicit projection for RU optimization
-        # Filter by type discriminator for single-container architecture
-        query_parts = [
-            f"SELECT {EVENT_PROJECTION} FROM c WHERE c.type = @doc_type AND c.user_id = @user_id"
-        ]
+        # Always filter on the type discriminator
+        query_parts = [f"SELECT {EVENT_PROJECTION} FROM c WHERE c.type = @doc_type"]
         params: list[dict[str, object]] = [
             {"name": "@doc_type", "value": DOC_TYPE_EVENT},
-            {"name": "@user_id", "value": user_id},
         ]
 
-        if options.event_type:
+        if user_id:
+            query_parts.append("AND c.user_id = @user_id")
+            params.append({"name": "@user_id", "value": user_id})
+
+        if session_id:
+            query_parts.append("AND c.session_id = @session_id")
+            params.append({"name": "@session_id", "value": session_id})
+
+        if project_slug:
+            query_parts.append("AND c.project_slug = @project")
+            params.append({"name": "@project", "value": project_slug})
+
+        # event_type takes precedence over event_category
+        if event_type:
             query_parts.append("AND c.event = @event_type")
-            params.append({"name": "@event_type", "value": options.event_type})
+            params.append({"name": "@event_type", "value": event_type})
+        elif event_category:
+            # Category is the prefix before first colon (e.g. "tool" matches "tool:pre", "tool:post", "tool:error")
+            # Use STARTSWITH for fully dynamic discovery - no hardcoded mapping needed
+            cat_prefix = event_category.rstrip(":") + ":"
+            # Allow shorthand: "content" matches "content_block:*"
+            if cat_prefix == "content:" and not event_category.startswith("content_block"):
+                cat_prefix = "content_block:"
+            query_parts.append("AND STARTSWITH(c.event, @cat_prefix)")
+            params.append({"name": "@cat_prefix", "value": cat_prefix})
 
-        if options.tool_name:
-            # Search in data field for tool name (this requires full event data)
-            query_parts.append("AND CONTAINS(c.data, @tool_name)")
-            params.append({"name": "@tool_name", "value": options.tool_name})
+        # Data-level filters (correct path into the nested dict)
+        if tool_name:
+            query_parts.append("AND c.data.tool_name = @tool_name")
+            params.append({"name": "@tool_name", "value": tool_name})
 
-        if options.level:
+        if model:
+            query_parts.append("AND c.data.model = @model")
+            params.append({"name": "@model", "value": model})
+
+        if provider:
+            query_parts.append("AND c.data.provider = @provider")
+            params.append({"name": "@provider", "value": provider})
+
+        if level:
             query_parts.append("AND c.lvl = @level")
-            params.append({"name": "@level", "value": options.level})
+            params.append({"name": "@level", "value": level})
 
-        # Apply filters
-        if options.filters:
-            if options.filters.project_slug:
-                query_parts.append("AND c.project_slug = @project")
-                params.append({"name": "@project", "value": options.filters.project_slug})
+        if start_date:
+            query_parts.append("AND c.ts >= @start_date")
+            params.append({"name": "@start_date", "value": start_date})
 
-            if options.filters.start_date:
-                query_parts.append("AND c.ts >= @start_date")
-                params.append({"name": "@start_date", "value": options.filters.start_date})
-
-            if options.filters.end_date:
-                query_parts.append("AND c.ts <= @end_date")
-                params.append({"name": "@end_date", "value": options.filters.end_date})
+        if end_date:
+            query_parts.append("AND c.ts <= @end_date")
+            params.append({"name": "@end_date", "value": end_date})
 
         query_parts.append("ORDER BY c.ts DESC")
         query = " ".join(query_parts)
@@ -1252,10 +1410,10 @@ class CosmosBackend(StorageBackend):
         ):
             results.append(
                 SearchResult(
-                    session_id=item["session_id"],
-                    project_slug=item["project_slug"],
-                    sequence=item["sequence"],
-                    content=str(item.get("event", "")),
+                    session_id=item.get("session_id", ""),
+                    project_slug=item.get("project_slug", ""),
+                    sequence=item.get("sequence", 0),
+                    content=_extract_event_content(item),
                     metadata=_strip_vectors(item),
                     score=1.0,
                     source="event_search",
@@ -1265,6 +1423,42 @@ class CosmosBackend(StorageBackend):
                 break
 
         return results
+
+    async def list_event_types(self, user_id: str = "", session_id: str = "") -> dict:
+        """Return distinct event types with counts and runtime-discovered categories.
+
+        Categories are derived from event type prefixes (e.g. tool:pre -> tool).
+        No hardcoded mapping needed - new event types are auto-categorized.
+        """
+        container = self._get_container(CONTAINER_NAME)
+        query = "SELECT c.event FROM c WHERE c.type = @t"
+        params: list[dict[str, str]] = [{"name": "@t", "value": DOC_TYPE_EVENT}]
+        if user_id:
+            query += " AND c.user_id = @uid"
+            params.append({"name": "@uid", "value": user_id})
+        if session_id:
+            query += " AND c.session_id = @sid"
+            params.append({"name": "@sid", "value": session_id})
+
+        from collections import Counter
+
+        type_counter: Counter[str] = Counter()
+        async for item in container.query_items(query=query, parameters=params):
+            type_counter[item.get("event", "?")] += 1
+
+        # Derive categories from event type prefixes
+        category_map: dict[str, list[str]] = {}
+        for event_type in sorted(type_counter.keys()):
+            # Category = everything before first colon
+            prefix = event_type.split(":")[0] if ":" in event_type else event_type
+            # Normalize: content_block -> content_block (keep underscore as part of prefix)
+            category_map.setdefault(prefix, []).append(event_type)
+
+        return {
+            "event_types": [{"event_type": k, "count": v} for k, v in type_counter.most_common()],
+            "categories": category_map,
+            "total_events": sum(type_counter.values()),
+        }
 
     # =========================================================================
     # Vector/Embedding Operations
@@ -1399,8 +1593,8 @@ class CosmosBackend(StorageBackend):
 
             # Query for this vector column only - TOP is REQUIRED for vector search in Cosmos DB
             query = f"""
-                SELECT TOP {top_k} c.id, c.session_id, c.project_slug, c.sequence, c.content,
-                       c.role, c.turn, c.ts,
+                SELECT TOP {top_k} c.id, c.session_id, c.project_slug, c.user_id, c.host_id,
+                       c.sequence, c.content, c.role, c.turn, c.ts,
                        VectorDistance(c.{field}, @query_vector) AS distance
                 FROM c
                 {where_prefix} IS_DEFINED(c.{field})
@@ -1421,7 +1615,7 @@ class CosmosBackend(StorageBackend):
                             session_id=item["session_id"],
                             project_slug=item["project_slug"],
                             sequence=item["sequence"],
-                            content=item.get("content", ""),
+                            content=_extract_display_content(item.get("content")),
                             metadata=_strip_vectors(item),
                             score=similarity,
                             source=f"semantic_{vec_type}",

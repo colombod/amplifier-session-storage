@@ -60,6 +60,9 @@ all = [
     "amplifier-session-storage[cosmos,sync,azure-openai,openai,duckdb,sqlite]",
 ]
 
+[project.scripts]
+amplifier-session-login = "amplifier_session_storage.identity.login:main"
+
 [project.urls]
 Homepage = "https://github.com/colombod/amplifier-session-storage"
 Documentation = "https://github.com/colombod/amplifier-session-storage#readme"

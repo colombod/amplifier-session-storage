@@ -23,7 +23,6 @@ from ..embeddings import EmbeddingProvider
 from ..exceptions import StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
 from .base import (
-    EventSearchOptions,
     MessageContext,
     SearchFilters,
     SearchResult,
@@ -881,7 +880,23 @@ class DuckDBBackend(StorageBackend):
             raise ValueError("Embedding provider required for semantic search")
 
         query_vector = await self.embedding_provider.embed_text(options.query)
-        return await self.vector_search(user_id, query_vector, options.filters, limit)
+
+        # Translate search_in_* flags to vector_columns
+        vector_columns: list[str] | None = []
+        if options.search_in_user:
+            vector_columns.append("user_query_vector")
+        if options.search_in_assistant:
+            vector_columns.append("assistant_response_vector")
+        if options.search_in_thinking:
+            vector_columns.append("assistant_thinking_vector")
+        if options.search_in_tool:
+            vector_columns.append("tool_output_vector")
+        if not vector_columns:
+            vector_columns = None  # None = search all
+
+        return await self.vector_search(
+            user_id, query_vector, options.filters, limit, vector_columns=vector_columns
+        )
 
     async def _hybrid_search_transcripts(
         self,
@@ -1172,48 +1187,70 @@ class DuckDBBackend(StorageBackend):
 
     async def search_events(
         self,
-        user_id: str,
-        options: EventSearchOptions,
-        limit: int = 100,
+        user_id: str = "",
+        session_id: str = "",
+        project_slug: str = "",
+        event_type: str = "",
+        event_category: str = "",
+        tool_name: str = "",
+        model: str = "",
+        provider: str = "",
+        level: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        limit: int = 50,
     ) -> list[SearchResult]:
-        """Search events by type, tool, and filters."""
+        """Search events with structured filters."""
 
         def _search() -> list[SearchResult]:
             if self.conn is None:
                 raise StorageIOError("search_events", cause=RuntimeError("Not initialized"))
 
             # Build WHERE clause
-            where_parts = ["user_id = ?"]
-            params: list[Any] = [user_id]
+            where_parts: list[str] = []
+            params: list[Any] = []
 
-            if options.event_type:
+            if user_id:
+                where_parts.append("user_id = ?")
+                params.append(user_id)
+
+            if session_id:
+                where_parts.append("session_id = ?")
+                params.append(session_id)
+
+            if project_slug:
+                where_parts.append("project_slug = ?")
+                params.append(project_slug)
+
+            if event_type:
                 where_parts.append("event = ?")
-                params.append(options.event_type)
+                params.append(event_type)
 
-            if options.tool_name:
-                # Search in JSON data field
-                where_parts.append("json_extract(data, '$.tool') = ?")
-                params.append(options.tool_name)
+            if tool_name:
+                where_parts.append("json_extract(data, '$.tool_name') = ?")
+                params.append(tool_name)
 
-            if options.level:
+            if model:
+                where_parts.append("json_extract(data, '$.model') = ?")
+                params.append(model)
+
+            if provider:
+                where_parts.append("json_extract(data, '$.provider') = ?")
+                params.append(provider)
+
+            if level:
                 where_parts.append("lvl = ?")
-                params.append(options.level)
+                params.append(level)
 
-            # Apply filters
-            if options.filters:
-                if options.filters.project_slug:
-                    where_parts.append("project_slug = ?")
-                    params.append(options.filters.project_slug)
+            if start_date:
+                where_parts.append("ts >= ?")
+                params.append(start_date)
 
-                if options.filters.start_date:
-                    where_parts.append("ts >= ?")
-                    params.append(options.filters.start_date)
+            if end_date:
+                where_parts.append("ts <= ?")
+                params.append(end_date)
 
-                if options.filters.end_date:
-                    where_parts.append("ts <= ?")
-                    params.append(options.filters.end_date)
-
-            where_clause = " AND ".join(where_parts)
+            where_clause = " AND ".join(where_parts) if where_parts else "1=1"
 
             query = f"""
                 SELECT id, session_id, project_slug, sequence, event, ts, data

@@ -36,6 +36,90 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Column Definitions - Centralized for consistency and maintainability
+# =============================================================================
+
+# Vector column names - excluded from standard queries to avoid bloating LLM context
+VECTOR_COLUMNS = frozenset(
+    {
+        "user_query_vector",
+        "assistant_response_vector",
+        "assistant_thinking_vector",
+        "tool_output_vector",
+    }
+)
+
+# Transcript columns for standard read operations (excludes vectors)
+TRANSCRIPT_READ_COLUMNS = (
+    "id",
+    "user_id",
+    "host_id",
+    "project_slug",
+    "session_id",
+    "sequence",
+    "role",
+    "content",
+    "turn",
+    "ts",
+    "embedding_model",
+    "vector_metadata",
+)
+
+# Event columns for standard read operations
+EVENT_READ_COLUMNS = (
+    "id",
+    "user_id",
+    "host_id",
+    "project_slug",
+    "session_id",
+    "sequence",
+    "ts",
+    "lvl",
+    "event",
+    "turn",
+    "data",
+    "data_truncated",
+    "data_size_bytes",
+)
+
+# Session columns for standard read operations
+SESSION_READ_COLUMNS = (
+    "user_id",
+    "session_id",
+    "host_id",
+    "project_slug",
+    "bundle",
+    "created",
+    "updated",
+    "turn_count",
+    "metadata",
+)
+
+# SQL for creating views that exclude vector columns
+# DuckDB supports SELECT * EXCLUDE syntax, making this especially clean
+_CREATE_VIEWS_SQL = """
+-- View for transcript reads without vectors (most common access pattern)
+-- Uses DuckDB's EXCLUDE syntax for automatic vector exclusion
+CREATE OR REPLACE VIEW transcript_messages AS
+SELECT * EXCLUDE (
+    user_query_vector,
+    assistant_response_vector,
+    assistant_thinking_vector,
+    tool_output_vector
+)
+FROM transcripts;
+
+-- View for vector-only access (used by vector search operations)
+CREATE OR REPLACE VIEW transcript_vectors AS
+SELECT
+    id, user_id, session_id, sequence,
+    user_query_vector, assistant_response_vector,
+    assistant_thinking_vector, tool_output_vector
+FROM transcripts;
+"""
+
+
 @dataclass
 class DuckDBConfig:
     """Configuration for DuckDB storage."""
@@ -328,6 +412,11 @@ class DuckDBBackend(StorageBackend):
                 logger.info("HNSW vector indexes created for all content types")
             except Exception as e:
                 logger.warning(f"Failed to create HNSW indexes: {e}")
+
+            # Create views for vector-free access (best practice per DUCKDB_BEST_PRACTICES.md)
+            # DuckDB's EXCLUDE syntax makes this especially clean
+            self.conn.execute(_CREATE_VIEWS_SQL)
+            logger.debug("Created transcript_messages and transcript_vectors views")
 
         try:
             await asyncio.to_thread(_init)

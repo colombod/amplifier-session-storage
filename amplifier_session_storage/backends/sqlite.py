@@ -35,6 +35,86 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Column Definitions - Centralized for consistency and maintainability
+# =============================================================================
+
+# Vector column names - excluded from standard queries to avoid bloating LLM context
+VECTOR_COLUMNS = frozenset(
+    {
+        "user_query_vector_json",
+        "assistant_response_vector_json",
+        "assistant_thinking_vector_json",
+        "tool_output_vector_json",
+    }
+)
+
+# Transcript columns for standard read operations (excludes vectors)
+TRANSCRIPT_READ_COLUMNS = (
+    "id",
+    "user_id",
+    "host_id",
+    "project_slug",
+    "session_id",
+    "sequence",
+    "role",
+    "content_json",
+    "turn",
+    "ts",
+    "embedding_model",
+    "vector_metadata",
+)
+
+# Event columns for standard read operations
+EVENT_READ_COLUMNS = (
+    "id",
+    "user_id",
+    "host_id",
+    "project_slug",
+    "session_id",
+    "sequence",
+    "ts",
+    "lvl",
+    "event",
+    "turn",
+    "data",
+    "data_truncated",
+    "data_size_bytes",
+)
+
+# Session columns for standard read operations
+SESSION_READ_COLUMNS = (
+    "user_id",
+    "session_id",
+    "host_id",
+    "project_slug",
+    "bundle",
+    "created",
+    "updated",
+    "turn_count",
+    "metadata",
+)
+
+# SQL for creating views that exclude vector columns
+# These views provide a stable API even if schema changes
+_CREATE_VIEWS_SQL = """
+-- View for transcript reads without vectors (most common access pattern)
+CREATE VIEW IF NOT EXISTS transcript_messages AS
+SELECT
+    id, user_id, host_id, project_slug, session_id, sequence,
+    role, content_json, turn, ts, embedding_model, vector_metadata, synced_at
+FROM transcripts;
+
+-- View for vector-only access (used by vector search operations)
+CREATE VIEW IF NOT EXISTS transcript_vectors AS
+SELECT
+    id, user_id, session_id, sequence,
+    user_query_vector_json, assistant_response_vector_json,
+    assistant_thinking_vector_json, tool_output_vector_json
+FROM transcripts;
+"""
+
+
 @dataclass
 class SQLiteConfig:
     """Configuration for SQLite storage."""
@@ -206,6 +286,11 @@ class SQLiteBackend(StorageBackend):
                 except Exception as e:
                     logger.warning(f"Failed to create VSS table: {e}")
                     self._vss_available = False
+
+            # Create views for vector-free access (best practice per SQLITE_BEST_PRACTICES.md)
+            # These views provide a stable API even if schema changes
+            await self.conn.executescript(_CREATE_VIEWS_SQL)
+            logger.debug("Created transcript_messages and transcript_vectors views")
 
             await self.conn.commit()
             self._initialized = True

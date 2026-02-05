@@ -53,9 +53,38 @@ VECTOR_FIELDS = {
     "tool_output_vector",
 }
 
+# =============================================================================
+# Column Projections for RU Optimization (per COSMOS_DB_BEST_PRACTICES.md)
+# Using explicit projections reduces RU cost by not reading large vector fields
+# =============================================================================
+
+# Session fields (sessions container has no vectors, but explicit is still better)
+SESSION_PROJECTION = """
+    c.id, c.user_id, c.session_id, c.host_id, c.project_slug,
+    c.bundle, c.created, c.updated, c.turn_count, c.metadata, c.synced_at
+"""
+
+# Transcript fields WITHOUT vectors (most common read pattern)
+# This dramatically reduces RU cost vs SELECT * when vectors are ~48KB each
+TRANSCRIPT_PROJECTION = """
+    c.id, c.user_id, c.host_id, c.project_slug, c.session_id, c.sequence,
+    c.role, c.content, c.turn, c.ts, c.embedding_model, c.vector_metadata, c.synced_at
+"""
+
+# Event fields (events container has no vectors)
+EVENT_PROJECTION = """
+    c.id, c.user_id, c.host_id, c.project_slug, c.session_id, c.sequence,
+    c.ts, c.lvl, c.event, c.turn, c.data, c.data_truncated, c.data_size_bytes, c.synced_at
+"""
+
 
 def _strip_vectors(item: dict[str, Any]) -> dict[str, Any]:
-    """Remove vector fields from item to avoid bloating LLM context."""
+    """Remove vector fields from item to avoid bloating LLM context.
+
+    Note: This is a safety fallback. Prefer using explicit projections in queries
+    (TRANSCRIPT_PROJECTION) to avoid reading vectors in the first place, which
+    reduces RU cost significantly.
+    """
     return {k: v for k, v in item.items() if k not in VECTOR_FIELDS}
 
 
@@ -448,7 +477,8 @@ class CosmosBackend(StorageBackend):
         container = self._get_container(SESSIONS_CONTAINER)
 
         try:
-            query = "SELECT * FROM c WHERE c.user_id = @user_id AND c.id = @session_id"
+            # Use explicit projection for RU optimization (per COSMOS_DB_BEST_PRACTICES.md)
+            query = f"SELECT {SESSION_PROJECTION} FROM c WHERE c.user_id = @user_id AND c.id = @session_id"
             params: list[dict[str, object]] = [
                 {"name": "@user_id", "value": user_id},
                 {"name": "@session_id", "value": session_id},
@@ -468,8 +498,8 @@ class CosmosBackend(StorageBackend):
         """Search sessions with advanced filters."""
         container = self._get_container(SESSIONS_CONTAINER)
 
-        # Build query
-        query_parts = ["SELECT * FROM c WHERE c.user_id = @user_id"]
+        # Build query with explicit projection for RU optimization
+        query_parts = [f"SELECT {SESSION_PROJECTION} FROM c WHERE c.user_id = @user_id"]
         params: list[dict[str, object]] = [{"name": "@user_id", "value": user_id}]
 
         if filters.project_slug:
@@ -721,8 +751,11 @@ class CosmosBackend(StorageBackend):
         container = self._get_container(TRANSCRIPTS_CONTAINER)
         partition_key = self.make_partition_key(user_id, project_slug, session_id)
 
+        # Use explicit projection to exclude vectors at query time (reduces RU cost)
+        # This is more efficient than SELECT * + _strip_vectors() because Cosmos
+        # doesn't have to read the large vector fields at all
         query = (
-            "SELECT * FROM c WHERE c.partition_key = @pk "
+            f"SELECT {TRANSCRIPT_PROJECTION} FROM c WHERE c.partition_key = @pk "
             "AND c.sequence > @after_seq ORDER BY c.sequence"
         )
         params = [
@@ -732,8 +765,7 @@ class CosmosBackend(StorageBackend):
 
         results: list[dict[str, Any]] = []
         async for item in container.query_items(query=query, parameters=params):
-            # Strip vectors to avoid bloating LLM context
-            results.append(_strip_vectors(item))
+            results.append(item)
 
         return results
 
@@ -776,13 +808,14 @@ class CosmosBackend(StorageBackend):
         """Full-text search using CONTAINS."""
         container = self._get_container(TRANSCRIPTS_CONTAINER)
 
-        # Build query - allow empty user_id for team-wide search
+        # Build query with explicit projection (excludes vectors, reduces RU cost)
+        # Allow empty user_id for team-wide search
         if user_id:
-            query_parts = ["SELECT * FROM c WHERE c.user_id = @user_id"]
+            query_parts = [f"SELECT {TRANSCRIPT_PROJECTION} FROM c WHERE c.user_id = @user_id"]
             params: list[dict[str, object]] = [{"name": "@user_id", "value": user_id}]
         else:
             # Team-wide search (all users)
-            query_parts = ["SELECT * FROM c WHERE 1=1"]
+            query_parts = [f"SELECT {TRANSCRIPT_PROJECTION} FROM c WHERE 1=1"]
             params: list[dict[str, object]] = []
 
         # Role filters
@@ -1124,8 +1157,8 @@ class CosmosBackend(StorageBackend):
         """Search events by type, tool, and filters."""
         container = self._get_container(EVENTS_CONTAINER)
 
-        # Build query
-        query_parts = ["SELECT * FROM c WHERE c.user_id = @user_id"]
+        # Build query with explicit projection for RU optimization
+        query_parts = [f"SELECT {EVENT_PROJECTION} FROM c WHERE c.user_id = @user_id"]
         params: list[dict[str, object]] = [{"name": "@user_id", "value": user_id}]
 
         if options.event_type:

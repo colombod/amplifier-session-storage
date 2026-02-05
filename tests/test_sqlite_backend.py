@@ -9,7 +9,6 @@ from datetime import UTC, datetime
 import pytest
 
 from amplifier_session_storage.backends import (
-    EventSearchOptions,
     SearchFilters,
     TranscriptSearchOptions,
 )
@@ -484,7 +483,7 @@ class TestSQLiteEventOperations:
         # Search for llm.request events
         results = await sqlite_storage.search_events(
             user_id="user-1",
-            options=EventSearchOptions(event_type="llm.request"),
+            event_type="llm.request",
             limit=10,
         )
 
@@ -511,7 +510,7 @@ class TestSQLiteEventOperations:
         # Search for error level events
         results = await sqlite_storage.search_events(
             user_id="user-1",
-            options=EventSearchOptions(level="error"),
+            level="error",
             limit=10,
         )
 

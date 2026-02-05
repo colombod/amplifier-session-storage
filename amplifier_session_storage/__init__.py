@@ -83,14 +83,6 @@ from .exceptions import (
     ValidationError,
 )
 
-# Identity module
-from .identity import (
-    ConfigFileIdentityProvider,
-    IdentityContext,
-    IdentityProvider,
-    UserIdentity,
-)
-
 # Search utilities
 from .search import compute_mmr, cosine_similarity
 
@@ -145,11 +137,6 @@ __all__ = [
     # Search
     "compute_mmr",
     "cosine_similarity",
-    # Identity
-    "IdentityProvider",
-    "UserIdentity",
-    "ConfigFileIdentityProvider",
-    "IdentityContext",
     # Exceptions
     "SessionStorageError",
     "SessionNotFoundError",

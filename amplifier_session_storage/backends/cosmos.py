@@ -8,7 +8,6 @@ Supports both traditional queries and vector similarity search.
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -22,6 +21,7 @@ from azure.identity.aio import DefaultAzureCredential
 from ..content_extraction import count_embeddable_content_types, extract_all_embeddable_content
 from ..embeddings import EmbeddingProvider
 from ..exceptions import AuthenticationError, StorageConnectionError, StorageIOError
+from ..logging_utils import get_storage_logger
 from ..search.mmr import compute_mmr
 from .base import (
     EventSearchOptions,
@@ -33,7 +33,7 @@ from .base import (
     TurnContext,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_storage_logger("cosmos")
 
 # Container names
 SESSIONS_CONTAINER = "sessions"
@@ -205,6 +205,9 @@ class CosmosBackend(StorageBackend):
         """
         Ensure container exists with optional vector indexing.
 
+        If vector_enabled is True and the container already exists without vector support,
+        this will attempt to migrate by replacing the container (after logging a warning).
+
         Args:
             name: Container name
             partition_key_path: Partition key path
@@ -212,6 +215,15 @@ class CosmosBackend(StorageBackend):
         """
         if self._database is None:
             raise StorageIOError("ensure_container", cause=RuntimeError("Database not initialized"))
+
+        logger.info(
+            "Ensuring container exists",
+            extra={
+                "container": name,
+                "partition_key": partition_key_path,
+                "vector_enabled": vector_enabled,
+            },
+        )
 
         # Base indexing policy
         indexing_policy: dict[str, Any] = {
@@ -276,16 +288,92 @@ class CosmosBackend(StorageBackend):
                 ]
             }
             logger.info(
-                f"Creating {name} with vector search support (3072 dimensions, cosine distance)"
+                "Configuring vector search support",
+                extra={
+                    "container": name,
+                    "dimensions": 3072,
+                    "distance_function": "cosine",
+                    "vector_paths": [
+                        "/user_query_vector",
+                        "/assistant_response_vector",
+                        "/assistant_thinking_vector",
+                        "/tool_output_vector",
+                    ],
+                },
             )
 
-        # Create container with optional vector embedding policy
-        if vector_embedding_policy:
+        # Check if container exists and needs migration
+        needs_migration = False
+        try:
+            existing_container = self._database.get_container_client(name)
+            # Try to read container properties to verify it exists
+            props = await existing_container.read()
+
+            # Check if vector upgrade is needed
+            if vector_enabled and name == TRANSCRIPTS_CONTAINER:
+                existing_vector_policy = props.get("vectorEmbeddingPolicy")
+                if not existing_vector_policy or not existing_vector_policy.get("vectorEmbeddings"):
+                    logger.warning(
+                        "Container exists without vector support - migration required",
+                        extra={
+                            "container": name,
+                            "action": "will_recreate",
+                            "warning": "Existing data will be preserved but vector indexes need rebuild",
+                        },
+                    )
+                    needs_migration = True
+                else:
+                    logger.info(
+                        "Container already has vector support",
+                        extra={"container": name, "status": "no_migration_needed"},
+                    )
+        except CosmosResourceNotFoundError:
+            # Container doesn't exist, will be created
+            logger.info(
+                "Container does not exist, will create",
+                extra={"container": name, "vector_enabled": vector_enabled},
+            )
+
+        # Create or replace container
+        if needs_migration:
+            # For migration, we need to replace the container
+            # Note: This preserves data but requires reindexing
+            logger.warning(
+                "Replacing container to add vector support",
+                extra={
+                    "container": name,
+                    "action": "replace_container",
+                    "note": "Data preserved, indexes will rebuild",
+                },
+            )
+            try:
+                container = await self._database.replace_container(
+                    container=name,
+                    partition_key=PartitionKey(path=partition_key_path),
+                    indexing_policy=indexing_policy,
+                    vector_embedding_policy=vector_embedding_policy,
+                )
+                logger.info(
+                    "Container replaced with vector support",
+                    extra={"container": name, "status": "migration_complete"},
+                )
+            except CosmosHttpResponseError as e:
+                logger.error(
+                    "Failed to replace container for vector migration",
+                    extra={"container": name, "error": str(e), "status_code": e.status_code},
+                )
+                # Fall back to using existing container without vector
+                container = self._database.get_container_client(name)
+        elif vector_embedding_policy:
             container = await self._database.create_container_if_not_exists(
                 id=name,
                 partition_key=PartitionKey(path=partition_key_path),
                 indexing_policy=indexing_policy,
                 vector_embedding_policy=vector_embedding_policy,
+            )
+            logger.info(
+                "Container created/verified with vector support",
+                extra={"container": name, "status": "ready"},
             )
         else:
             container = await self._database.create_container_if_not_exists(
@@ -293,6 +381,7 @@ class CosmosBackend(StorageBackend):
                 partition_key=PartitionKey(path=partition_key_path),
                 indexing_policy=indexing_policy,
             )
+            logger.info("Container created/verified", extra={"container": name, "status": "ready"})
         self._containers[name] = container
 
     async def close(self) -> None:
@@ -845,7 +934,7 @@ class CosmosBackend(StorageBackend):
         query = """
             SELECT c.sequence, c.turn, c.role, c.content, c.ts, c.project_slug
             FROM c
-            WHERE c.user_id = @user_id 
+            WHERE c.user_id = @user_id
               AND c.session_id = @session_id
               AND c.turn >= @min_turn
               AND c.turn <= @max_turn
@@ -1200,7 +1289,7 @@ class CosmosBackend(StorageBackend):
 
             # Query for this vector column only - TOP is REQUIRED for vector search in Cosmos DB
             query = f"""
-                SELECT TOP {top_k} c.id, c.session_id, c.project_slug, c.sequence, c.content, 
+                SELECT TOP {top_k} c.id, c.session_id, c.project_slug, c.sequence, c.content,
                        c.role, c.turn, c.ts,
                        VectorDistance(c.{field}, @query_vector) AS distance
                 FROM c

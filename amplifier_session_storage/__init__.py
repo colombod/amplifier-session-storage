@@ -185,3 +185,18 @@ if _has_openai:
     __all__.extend(["OpenAIEmbeddings"])
 
 __version__ = "0.2.0"  # Bumped for major enhancements
+
+# Logging utilities for cloud environments
+from .logging_utils import (
+    StructuredJsonFormatter,
+    configure_structured_logging,
+    get_storage_logger,
+    StorageLoggerAdapter,
+)
+
+__all__.extend([
+    "StructuredJsonFormatter",
+    "configure_structured_logging", 
+    "get_storage_logger",
+    "StorageLoggerAdapter",
+])

@@ -642,7 +642,8 @@ class CosmosBackend(StorageBackend):
 
         results: list[dict[str, Any]] = []
         async for item in container.query_items(query=query, parameters=params):
-            results.append(item)
+            # Strip vectors to avoid bloating LLM context
+            results.append(_strip_vectors(item))
 
         return results
 

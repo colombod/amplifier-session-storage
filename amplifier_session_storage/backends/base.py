@@ -66,7 +66,7 @@ class TranscriptMessage:
     """A single message in a transcript."""
 
     sequence: int
-    turn: int
+    turn: int | None  # Can be None in some transcripts
     role: str  # "user", "assistant", "system", "tool"
     content: str
     ts: str | None = None
@@ -107,8 +107,54 @@ class TurnContext:
     @property
     def turns_range(self) -> tuple[int, int]:
         """Range of turns included (min, max)."""
-        all_turns = [m.turn for m in self.previous + self.current + self.following]
+        all_turns = [
+            m.turn for m in self.previous + self.current + self.following if m.turn is not None
+        ]
         return (min(all_turns), max(all_turns)) if all_turns else (0, 0)
+
+
+@dataclass
+class MessageContext:
+    """
+    Context window around a specific message by sequence.
+
+    Used when:
+    - Turn is null in the transcript
+    - You need precise sequence-based navigation
+    - You want to expand search results by sequence
+
+    Unlike TurnContext which groups by turn number, this navigates
+    by raw sequence numbers which are always present.
+    """
+
+    session_id: str
+    project_slug: str
+    target_sequence: int
+
+    # Messages around the target
+    previous: list[TranscriptMessage]  # Messages before (oldest first)
+    current: TranscriptMessage | None  # The target message
+    following: list[TranscriptMessage]  # Messages after (oldest first)
+
+    # Navigation metadata
+    has_more_before: bool
+    has_more_after: bool
+    first_sequence: int
+    last_sequence: int
+
+    @property
+    def total_messages(self) -> int:
+        """Total messages in this context window."""
+        count = len(self.previous) + len(self.following)
+        return count + 1 if self.current else count
+
+    @property
+    def sequence_range(self) -> tuple[int, int]:
+        """Range of sequences included (min, max)."""
+        all_seqs = [m.sequence for m in self.previous + self.following]
+        if self.current:
+            all_seqs.append(self.current.sequence)
+        return (min(all_seqs), max(all_seqs)) if all_seqs else (0, 0)
 
 
 class StorageBackend(ABC):
@@ -121,6 +167,10 @@ class StorageBackend(ABC):
     - Event line storage and search
     - Vector embeddings for semantic search
     - Graceful degradation when embeddings unavailable
+
+    Note on user_id parameter:
+    - Empty string ("") means search across ALL users (team-wide)
+    - Non-empty string filters to that specific user
     """
 
     @abstractmethod
@@ -446,5 +496,119 @@ class StorageBackend(ABC):
             - sessions_by_bundle: dict[str, int]
             - events_by_type: dict[str, int]
             - tools_used: dict[str, int]
+        """
+        pass
+
+    # =========================================================================
+    # Discovery APIs
+    # =========================================================================
+
+    @abstractmethod
+    async def list_users(
+        self,
+        filters: SearchFilters | None = None,
+    ) -> list[str]:
+        """
+        List all unique user IDs in the storage.
+
+        Args:
+            filters: Optional filters (project_slug, date range, bundle)
+
+        Returns:
+            List of unique user IDs, sorted alphabetically
+        """
+        pass
+
+    @abstractmethod
+    async def list_projects(
+        self,
+        user_id: str = "",
+        filters: SearchFilters | None = None,
+    ) -> list[str]:
+        """
+        List all unique project slugs.
+
+        Args:
+            user_id: Filter by user (empty = all users)
+            filters: Optional filters (date range, bundle)
+
+        Returns:
+            List of unique project slugs, sorted alphabetically
+        """
+        pass
+
+    @abstractmethod
+    async def list_sessions(
+        self,
+        user_id: str = "",
+        project_slug: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """
+        List sessions with pagination.
+
+        Simpler than search_sessions - just lists recent sessions
+        ordered by creation date (newest first).
+
+        Args:
+            user_id: Filter by user (empty = all users)
+            project_slug: Filter by project
+            limit: Max results (default 100)
+            offset: Pagination offset (default 0)
+
+        Returns:
+            List of session metadata dicts with:
+                - session_id
+                - user_id
+                - project_slug
+                - bundle
+                - created
+                - turn_count
+        """
+        pass
+
+    # =========================================================================
+    # Sequence-Based Navigation
+    # =========================================================================
+
+    @abstractmethod
+    async def get_message_context(
+        self,
+        session_id: str,
+        sequence: int,
+        user_id: str = "",
+        before: int = 5,
+        after: int = 5,
+        include_tool_outputs: bool = True,
+    ) -> MessageContext:
+        """
+        Get context window around a specific message by sequence.
+
+        Use this when:
+        - Turn is null in the transcript
+        - You need precise sequence-based navigation
+        - You want to expand search results by sequence
+
+        Args:
+            session_id: Session identifier
+            sequence: Target sequence number
+            user_id: User ID (empty = search all users for session)
+            before: Messages to include before target (default 5)
+            after: Messages to include after target (default 5)
+            include_tool_outputs: Include tool outputs (default True)
+
+        Returns:
+            MessageContext with surrounding messages
+
+        Example:
+            # Search returns sequence 42 as relevant
+            context = await storage.get_message_context(
+                session_id="sess123",
+                sequence=42,
+                before=3,  # Get sequences 39, 40, 41
+                after=2,   # Get sequences 43, 44
+            )
+            # Now have full context: sequences 39-44
         """
         pass

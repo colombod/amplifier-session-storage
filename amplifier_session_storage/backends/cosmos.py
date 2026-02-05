@@ -25,6 +25,7 @@ from ..exceptions import AuthenticationError, StorageConnectionError, StorageIOE
 from ..search.mmr import compute_mmr
 from .base import (
     EventSearchOptions,
+    MessageContext,
     SearchFilters,
     SearchResult,
     StorageBackend,
@@ -469,7 +470,7 @@ class CosmosBackend(StorageBackend):
 
         # Build query
         query_parts = ["SELECT * FROM c WHERE c.user_id = @user_id"]
-        params = [{"name": "@user_id", "value": user_id}]
+        params: list[dict[str, object]] = [{"name": "@user_id", "value": user_id}]
 
         if filters.project_slug:
             query_parts.append("AND c.project_slug = @project")
@@ -775,9 +776,14 @@ class CosmosBackend(StorageBackend):
         """Full-text search using CONTAINS."""
         container = self._get_container(TRANSCRIPTS_CONTAINER)
 
-        # Build query with role filters
-        query_parts = ["SELECT * FROM c WHERE c.user_id = @user_id"]
-        params: list[dict[str, object]] = [{"name": "@user_id", "value": user_id}]
+        # Build query - allow empty user_id for team-wide search
+        if user_id:
+            query_parts = ["SELECT * FROM c WHERE c.user_id = @user_id"]
+            params: list[dict[str, object]] = [{"name": "@user_id", "value": user_id}]
+        else:
+            # Team-wide search (all users)
+            query_parts = ["SELECT * FROM c WHERE 1=1"]
+            params: list[dict[str, object]] = []
 
         # Role filters
         role_conditions = []
@@ -993,9 +999,10 @@ class CosmosBackend(StorageBackend):
             break
 
         # Partition messages into previous, current, following
-        previous = [m for m in messages if m.turn < turn]
+        # Handle case where turn might be None
+        previous = [m for m in messages if m.turn is not None and m.turn < turn]
         current = [m for m in messages if m.turn == turn]
-        following = [m for m in messages if m.turn > turn]
+        following = [m for m in messages if m.turn is not None and m.turn > turn]
 
         return TurnContext(
             session_id=session_id,
@@ -1258,12 +1265,19 @@ class CosmosBackend(StorageBackend):
             "tool_output": "tool_output_vector",
         }
 
-        # Build base filter conditions
-        filter_parts = ["c.user_id = @user_id"]
-        base_params: list[dict[str, object]] = [
-            {"name": "@user_id", "value": user_id},
-            {"name": "@query_vector", "value": query_vector},
-        ]
+        # Build base filter conditions - allow empty user_id for team-wide search
+        if user_id:
+            filter_parts = ["c.user_id = @user_id"]
+            base_params: list[dict[str, object]] = [
+                {"name": "@user_id", "value": user_id},
+                {"name": "@query_vector", "value": query_vector},
+            ]
+        else:
+            # Team-wide search (all users)
+            filter_parts: list[str] = []
+            base_params: list[dict[str, object]] = [
+                {"name": "@query_vector", "value": query_vector},
+            ]
 
         if filters:
             if filters.project_slug:
@@ -1278,7 +1292,12 @@ class CosmosBackend(StorageBackend):
                 filter_parts.append("c.ts <= @end_date")
                 base_params.append({"name": "@end_date", "value": filters.end_date})
 
-        where_clause = " AND ".join(filter_parts)
+        # Build where clause - handle empty filter_parts for team-wide search
+        if filter_parts:
+            where_clause = " AND ".join(filter_parts)
+            where_prefix = f"WHERE {where_clause} AND"
+        else:
+            where_prefix = "WHERE"
 
         # Run separate query for each vector column and merge results
         # This is necessary because Cosmos DB doesn't support LEAST() function
@@ -1293,7 +1312,7 @@ class CosmosBackend(StorageBackend):
                        c.role, c.turn, c.ts,
                        VectorDistance(c.{field}, @query_vector) AS distance
                 FROM c
-                WHERE {where_clause} AND IS_DEFINED(c.{field})
+                {where_prefix} IS_DEFINED(c.{field})
                 ORDER BY VectorDistance(c.{field}, @query_vector)
             """
 
@@ -1502,3 +1521,238 @@ class CosmosBackend(StorageBackend):
             "sessions_by_bundle": bundles,
             "filters_applied": filters is not None,
         }
+
+    # =========================================================================
+    # Discovery APIs
+    # =========================================================================
+
+    async def list_users(
+        self,
+        filters: SearchFilters | None = None,
+    ) -> list[str]:
+        """List all unique user IDs in the storage."""
+        container = self._get_container(SESSIONS_CONTAINER)
+
+        # Build query with optional filters
+        where_parts: list[str] = []
+        params: list[dict[str, object]] = []
+
+        if filters:
+            if filters.project_slug:
+                where_parts.append("c.project_slug = @project")
+                params.append({"name": "@project", "value": filters.project_slug})
+
+            if filters.start_date:
+                where_parts.append("c.created >= @start_date")
+                params.append({"name": "@start_date", "value": filters.start_date})
+
+            if filters.end_date:
+                where_parts.append("c.created <= @end_date")
+                params.append({"name": "@end_date", "value": filters.end_date})
+
+            if filters.bundle:
+                where_parts.append("c.bundle = @bundle")
+                params.append({"name": "@bundle", "value": filters.bundle})
+
+        where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+        query = f"SELECT DISTINCT VALUE c.user_id FROM c WHERE {where_clause}"
+
+        users: list[str] = []
+        async for user_id in container.query_items(query=query, parameters=params):
+            if user_id:
+                users.append(user_id)
+
+        return sorted(users)
+
+    async def list_projects(
+        self,
+        user_id: str = "",
+        filters: SearchFilters | None = None,
+    ) -> list[str]:
+        """List all unique project slugs."""
+        container = self._get_container(SESSIONS_CONTAINER)
+
+        # Build query with optional filters
+        where_parts: list[str] = []
+        params: list[dict[str, object]] = []
+
+        if user_id:
+            where_parts.append("c.user_id = @user_id")
+            params.append({"name": "@user_id", "value": user_id})
+
+        if filters:
+            if filters.start_date:
+                where_parts.append("c.created >= @start_date")
+                params.append({"name": "@start_date", "value": filters.start_date})
+
+            if filters.end_date:
+                where_parts.append("c.created <= @end_date")
+                params.append({"name": "@end_date", "value": filters.end_date})
+
+            if filters.bundle:
+                where_parts.append("c.bundle = @bundle")
+                params.append({"name": "@bundle", "value": filters.bundle})
+
+        where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+        query = f"SELECT DISTINCT VALUE c.project_slug FROM c WHERE {where_clause}"
+
+        projects: list[str] = []
+        async for project in container.query_items(query=query, parameters=params):
+            if project:
+                projects.append(project)
+
+        return sorted(projects)
+
+    async def list_sessions(
+        self,
+        user_id: str = "",
+        project_slug: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List sessions with pagination."""
+        container = self._get_container(SESSIONS_CONTAINER)
+
+        # Build query with optional filters
+        where_parts: list[str] = []
+        params: list[dict[str, object]] = []
+
+        if user_id:
+            where_parts.append("c.user_id = @user_id")
+            params.append({"name": "@user_id", "value": user_id})
+
+        if project_slug:
+            where_parts.append("c.project_slug = @project")
+            params.append({"name": "@project", "value": project_slug})
+
+        where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+
+        # Cosmos DB doesn't support OFFSET directly, use continuation token pattern
+        # For simplicity, we'll fetch all and slice in Python (fine for moderate datasets)
+        query = f"""
+            SELECT c.session_id, c.user_id, c.project_slug, c.bundle, c.created, c.turn_count
+            FROM c WHERE {where_clause}
+            ORDER BY c.created DESC
+        """
+
+        sessions: list[dict[str, Any]] = []
+        async for item in container.query_items(query=query, parameters=params):
+            sessions.append(item)
+
+        # Apply offset and limit
+        return sessions[offset : offset + limit]
+
+    # =========================================================================
+    # Sequence-Based Navigation
+    # =========================================================================
+
+    async def get_message_context(
+        self,
+        session_id: str,
+        sequence: int,
+        user_id: str = "",
+        before: int = 5,
+        after: int = 5,
+        include_tool_outputs: bool = True,
+    ) -> MessageContext:
+        """Get context window around a specific message by sequence."""
+        from .base import MessageContext, TranscriptMessage
+
+        container = self._get_container(TRANSCRIPTS_CONTAINER)
+
+        # Build user filter
+        user_filter = "c.user_id = @user_id" if user_id else "1=1"
+        params: list[dict[str, object]] = [{"name": "@session_id", "value": session_id}]
+        if user_id:
+            params.append({"name": "@user_id", "value": user_id})
+
+        # Get the target message and surrounding context
+        min_seq = max(0, sequence - before)
+        max_seq = sequence + after
+
+        query = f"""
+            SELECT c.sequence, c.turn, c.role, c.content, c.ts, c.project_slug
+            FROM c
+            WHERE c.session_id = @session_id AND {user_filter}
+              AND c.sequence >= @min_seq AND c.sequence <= @max_seq
+        """
+        params.extend(
+            [
+                {"name": "@min_seq", "value": min_seq},
+                {"name": "@max_seq", "value": max_seq},
+            ]
+        )
+
+        messages: list[TranscriptMessage] = []
+        project_slug = "unknown"
+
+        async for item in container.query_items(query=query, parameters=params):
+            # Filter out tool outputs if requested
+            if not include_tool_outputs and item.get("role") == "tool":
+                continue
+
+            project_slug = item.get("project_slug", project_slug)
+            messages.append(
+                TranscriptMessage(
+                    sequence=item.get("sequence", 0),
+                    turn=item.get("turn"),  # Can be None
+                    role=item.get("role", "unknown"),
+                    content=item.get("content", ""),
+                    ts=item.get("ts"),
+                    metadata={"session_id": session_id},
+                )
+            )
+
+        # Sort by sequence
+        messages.sort(key=lambda m: m.sequence)
+
+        # Separate into previous, current, following
+        previous: list[TranscriptMessage] = []
+        current: TranscriptMessage | None = None
+        following: list[TranscriptMessage] = []
+
+        for msg in messages:
+            if msg.sequence < sequence:
+                previous.append(msg)
+            elif msg.sequence == sequence:
+                current = msg
+            else:
+                following.append(msg)
+
+        # Get session sequence range for navigation metadata
+        range_query = f"""
+            SELECT VALUE MIN(c.sequence) FROM c
+            WHERE c.session_id = @session_id AND {user_filter}
+        """
+        first_sequence = 0
+        async for item in container.query_items(
+            query=range_query, parameters=params[:2] if user_id else params[:1]
+        ):
+            if item is not None:
+                first_sequence = item
+            break
+
+        range_query = f"""
+            SELECT VALUE MAX(c.sequence) FROM c
+            WHERE c.session_id = @session_id AND {user_filter}
+        """
+        last_sequence = sequence
+        async for item in container.query_items(
+            query=range_query, parameters=params[:2] if user_id else params[:1]
+        ):
+            if item is not None:
+                last_sequence = item
+            break
+
+        return MessageContext(
+            session_id=session_id,
+            project_slug=project_slug,
+            target_sequence=sequence,
+            previous=previous,
+            current=current,
+            following=following,
+            has_more_before=first_sequence < min_seq,
+            has_more_after=last_sequence > max_seq,
+            first_sequence=first_sequence,
+            last_sequence=last_sequence,
+        )

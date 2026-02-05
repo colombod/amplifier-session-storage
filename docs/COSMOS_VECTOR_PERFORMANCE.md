@@ -411,7 +411,7 @@ For high-performance Cosmos DB vector search, ensure:
 
 1. **Wait for RBAC propagation** (~10-15 min from role assignment)
 2. **Create database and containers** (via CLI or code auto-creation)
-3. **Load initial dataset** (team sessions with sanitization)
+3. **Load initial dataset** (team sessions)
 4. **Benchmark performance** (query latency, RU consumption)
 5. **Tune oversampling factor** based on accuracy needs
 6. **Configure MMR lambda** based on diversity preference

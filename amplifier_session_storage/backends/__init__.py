@@ -7,16 +7,26 @@ Each backend implements the same interface, allowing seamless switching.
 
 from .base import (
     EventSearchOptions,
+    MessageContext,
     SearchFilters,
     SearchResult,
     StorageBackend,
+    TranscriptMessage,
     TranscriptSearchOptions,
+    TurnContext,
 )
 
 __all__ = [
+    # Core classes
     "StorageBackend",
+    # Search options
     "SearchFilters",
-    "SearchResult",
     "TranscriptSearchOptions",
     "EventSearchOptions",
+    # Result types
+    "SearchResult",
+    "TranscriptMessage",
+    # Context types
+    "TurnContext",
+    "MessageContext",
 ]

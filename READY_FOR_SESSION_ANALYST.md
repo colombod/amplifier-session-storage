@@ -11,7 +11,7 @@
 
 ✅ **Rich and powerful retrieval** - Multi-vector semantic search across 4 content types  
 ✅ **In-memory AND disk persistence** - Both modes tested and working  
-✅ **Real data validated** - 649 transcript lines from actual Amplifier sessions loaded and sanitized  
+✅ **Real data validated** - 649 transcript lines from actual Amplifier sessions loaded  
 ✅ **Cosmos DB ready** - Account provisioned with vector search enabled  
 ✅ **Production tested** - Both OpenAI and Azure OpenAI providers working  
 
@@ -65,20 +65,18 @@ results = await storage.search_transcripts(
 
 ## 🧪 Testing Summary
 
-**Unit Tests**: 164 passing ✅
+**Unit Tests**: 152 passing ✅
 - Content extraction: 18 tests (handles real Amplifier messages)
 - DuckDB backend: 23 tests (multi-vector + HNSW indexes)
 - SQLite backend: 28 tests (multi-vector + numpy)
 - Schema validation: 9 tests (verified against real sessions)
 - MMR algorithm: 25 tests (ported from C# reference)
 - Embedding cache: 10 tests (LRU with 100% coverage)
-- Sanitization: 12 tests (removes keys/secrets safely)
 
 **Integration Tests**: 11 ready for Cosmos DB (require env vars)
 
 **Real Data Validation**:
 - ✅ Loaded 16 sessions (649 transcript lines) from `~/.amplifier/projects`
-- ✅ Sanitization verified (no API keys leaked)
 - ✅ Full-text search working on real conversations
 - ✅ DuckDB disk persistence with HNSW indexes
 - ✅ SQLite disk persistence verified
@@ -186,7 +184,6 @@ stats = await storage.get_session_statistics(
 **Key commits**:
 - Multi-vector embedding implementation (all 3 backends)
 - Content extraction utilities (handles complex assistant messages)
-- Data sanitization (safe loading of real sessions)
 - DuckDB disk persistence (HNSW on disk)
 - Comprehensive documentation
 

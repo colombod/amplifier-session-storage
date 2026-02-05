@@ -5,6 +5,7 @@ Provides abstractions for user identity, device tracking,
 and authentication across different providers.
 """
 
+from .azure_cli_provider import AzureCliIdentityProvider, get_current_user_id
 from .config_provider import ConfigFileIdentityProvider
 from .context import IdentityContext
 from .provider import IdentityProvider
@@ -24,9 +25,12 @@ __all__ = [
     # Errors
     "AuthenticationError",
     "AuthenticationRequiredError",
-    # Provider
+    # Providers
     "IdentityProvider",
     "ConfigFileIdentityProvider",
+    "AzureCliIdentityProvider",
+    # Utilities
+    "get_current_user_id",
     # Context
     "IdentityContext",
 ]

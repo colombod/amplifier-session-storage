@@ -24,6 +24,7 @@ from ..exceptions import StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
 from .base import (
     EventSearchOptions,
+    MessageContext,
     SearchFilters,
     SearchResult,
     StorageBackend,
@@ -1397,3 +1398,225 @@ class DuckDBBackend(StorageBackend):
             }
 
         return await asyncio.to_thread(_get_stats)
+
+    # =========================================================================
+    # Discovery APIs
+    # =========================================================================
+
+    async def list_users(
+        self,
+        filters: SearchFilters | None = None,
+    ) -> list[str]:
+        """List all unique user IDs in the storage."""
+
+        def _list_users() -> list[str]:
+            where_parts = ["1=1"]
+            params: list[Any] = []
+
+            if filters:
+                if filters.project_slug:
+                    where_parts.append("project_slug = ?")
+                    params.append(filters.project_slug)
+
+                if filters.start_date:
+                    where_parts.append("created >= ?")
+                    params.append(filters.start_date)
+
+                if filters.end_date:
+                    where_parts.append("created <= ?")
+                    params.append(filters.end_date)
+
+                if filters.bundle:
+                    where_parts.append("bundle = ?")
+                    params.append(filters.bundle)
+
+            where_clause = " AND ".join(where_parts)
+            query = f"SELECT DISTINCT user_id FROM sessions WHERE {where_clause} ORDER BY user_id"
+
+            results = self.conn.execute(query, params).fetchall()
+            return [row[0] for row in results if row[0]]
+
+        return await asyncio.to_thread(_list_users)
+
+    async def list_projects(
+        self,
+        user_id: str = "",
+        filters: SearchFilters | None = None,
+    ) -> list[str]:
+        """List all unique project slugs."""
+
+        def _list_projects() -> list[str]:
+            where_parts = ["1=1"]
+            params: list[Any] = []
+
+            if user_id:
+                where_parts.append("user_id = ?")
+                params.append(user_id)
+
+            if filters:
+                if filters.start_date:
+                    where_parts.append("created >= ?")
+                    params.append(filters.start_date)
+
+                if filters.end_date:
+                    where_parts.append("created <= ?")
+                    params.append(filters.end_date)
+
+                if filters.bundle:
+                    where_parts.append("bundle = ?")
+                    params.append(filters.bundle)
+
+            where_clause = " AND ".join(where_parts)
+            query = f"SELECT DISTINCT project_slug FROM sessions WHERE {where_clause} ORDER BY project_slug"
+
+            results = self.conn.execute(query, params).fetchall()
+            return [row[0] for row in results if row[0]]
+
+        return await asyncio.to_thread(_list_projects)
+
+    async def list_sessions(
+        self,
+        user_id: str = "",
+        project_slug: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List sessions with pagination."""
+
+        def _list_sessions() -> list[dict[str, Any]]:
+            where_parts = ["1=1"]
+            params: list[Any] = []
+
+            if user_id:
+                where_parts.append("user_id = ?")
+                params.append(user_id)
+
+            if project_slug:
+                where_parts.append("project_slug = ?")
+                params.append(project_slug)
+
+            where_clause = " AND ".join(where_parts)
+            query = f"""
+                SELECT session_id, user_id, project_slug, bundle, created, turn_count
+                FROM sessions
+                WHERE {where_clause}
+                ORDER BY created DESC
+                LIMIT ? OFFSET ?
+            """
+            params.extend([limit, offset])
+
+            results = self.conn.execute(query, params).fetchall()
+            return [
+                {
+                    "session_id": row[0],
+                    "user_id": row[1],
+                    "project_slug": row[2],
+                    "bundle": row[3],
+                    "created": row[4],
+                    "turn_count": row[5],
+                }
+                for row in results
+            ]
+
+        return await asyncio.to_thread(_list_sessions)
+
+    # =========================================================================
+    # Sequence-Based Navigation
+    # =========================================================================
+
+    async def get_message_context(
+        self,
+        session_id: str,
+        sequence: int,
+        user_id: str = "",
+        before: int = 5,
+        after: int = 5,
+        include_tool_outputs: bool = True,
+    ) -> MessageContext:
+        """Get context window around a specific message by sequence."""
+
+        def _get_context() -> MessageContext:
+            # Build user filter
+            user_filter = "user_id = ?" if user_id else "1=1"
+            params: list[Any] = [session_id]
+            if user_id:
+                params.append(user_id)
+
+            # Get the target message and surrounding context
+            min_seq = max(0, sequence - before)
+            max_seq = sequence + after
+
+            role_filter = "" if include_tool_outputs else "AND role != 'tool'"
+
+            query = f"""
+                SELECT sequence, turn, role, content, ts, project_slug
+                FROM transcripts
+                WHERE session_id = ? AND {user_filter}
+                  AND sequence >= ? AND sequence <= ?
+                  {role_filter}
+                ORDER BY sequence
+            """
+            params.extend([min_seq, max_seq])
+
+            results = self.conn.execute(query, params).fetchall()
+
+            messages: list[TranscriptMessage] = []
+            project_slug = "unknown"
+
+            for row in results:
+                project_slug = row[5] or project_slug
+                messages.append(
+                    TranscriptMessage(
+                        sequence=row[0],
+                        turn=row[1],  # Can be None
+                        role=row[2] or "unknown",
+                        content=row[3] or "",
+                        ts=row[4],
+                        metadata={"session_id": session_id},
+                    )
+                )
+
+            # Separate into previous, current, following
+            previous: list[TranscriptMessage] = []
+            current: TranscriptMessage | None = None
+            following: list[TranscriptMessage] = []
+
+            for msg in messages:
+                if msg.sequence < sequence:
+                    previous.append(msg)
+                elif msg.sequence == sequence:
+                    current = msg
+                else:
+                    following.append(msg)
+
+            # Get session sequence range for navigation metadata
+            range_params: list[Any] = [session_id]
+            if user_id:
+                range_params.append(user_id)
+
+            min_result = self.conn.execute(
+                f"SELECT MIN(sequence) FROM transcripts WHERE session_id = ? AND {user_filter}",
+                range_params,
+            ).fetchone()
+            first_sequence = min_result[0] if min_result and min_result[0] is not None else 0
+
+            max_result = self.conn.execute(
+                f"SELECT MAX(sequence) FROM transcripts WHERE session_id = ? AND {user_filter}",
+                range_params,
+            ).fetchone()
+            last_sequence = max_result[0] if max_result and max_result[0] is not None else sequence
+
+            return MessageContext(
+                session_id=session_id,
+                project_slug=project_slug,
+                target_sequence=sequence,
+                previous=previous,
+                current=current,
+                following=following,
+                has_more_before=first_sequence < min_seq,
+                has_more_after=last_sequence > max_seq,
+                first_sequence=first_sequence,
+                last_sequence=last_sequence,
+            )
+
+        return await asyncio.to_thread(_get_context)

@@ -36,11 +36,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from amplifier_session_storage.backends.base import SearchFilters, TranscriptSearchOptions
 from amplifier_session_storage.backends.cosmos import CosmosBackend, CosmosConfig
 from amplifier_session_storage.embeddings.azure_openai import AzureOpenAIEmbeddings
-from amplifier_session_storage.sanitization import (
-    sanitize_event,
-    sanitize_session_metadata,
-    sanitize_transcript_message,
-)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -88,7 +83,7 @@ async def load_project_sessions(project_path: Path, limit: int = 2) -> list[dict
         metadata_file = session_dir / "metadata.json"
         if metadata_file.exists():
             with open(metadata_file) as f:
-                session_data["metadata"] = sanitize_session_metadata(json.load(f))
+                session_data["metadata"] = json.load(f)
 
         # Load transcript (limit lines for test)
         transcript_file = session_dir / "transcript.jsonl"
@@ -97,7 +92,7 @@ async def load_project_sessions(project_path: Path, limit: int = 2) -> list[dict
                 for i, line in enumerate(f):
                     if i >= 50:  # Limit for testing
                         break
-                    msg = sanitize_transcript_message(json.loads(line.strip()))
+                    msg = json.loads(line.strip())
                     session_data["transcript"].append(msg)
 
         # Load events (limit for test)
@@ -108,7 +103,7 @@ async def load_project_sessions(project_path: Path, limit: int = 2) -> list[dict
                     if i >= 100:  # Limit for testing
                         break
                     try:
-                        event = sanitize_event(json.loads(line.strip()))
+                        event = json.loads(line.strip())
                         session_data["events"].append(event)
                     except json.JSONDecodeError:
                         continue

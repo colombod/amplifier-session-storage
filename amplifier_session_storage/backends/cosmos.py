@@ -44,6 +44,19 @@ EVENTS_CONTAINER = "events"
 AUTH_KEY = "key"
 AUTH_DEFAULT_CREDENTIAL = "default_credential"
 
+# Vector field names to exclude from metadata (to avoid bloating LLM context)
+VECTOR_FIELDS = {
+    "user_query_vector",
+    "assistant_response_vector",
+    "assistant_thinking_vector",
+    "tool_output_vector",
+}
+
+
+def _strip_vectors(item: dict[str, Any]) -> dict[str, Any]:
+    """Remove vector fields from item to avoid bloating LLM context."""
+    return {k: v for k, v in item.items() if k not in VECTOR_FIELDS}
+
 
 @dataclass
 class CosmosConfig:
@@ -717,7 +730,7 @@ class CosmosBackend(StorageBackend):
                     project_slug=item["project_slug"],
                     sequence=item["sequence"],
                     content=item.get("content", ""),
-                    metadata=item,
+                    metadata=_strip_vectors(item),
                     score=1.0,  # Full-text doesn't have scores
                     source="full_text",
                 )
@@ -1058,7 +1071,7 @@ class CosmosBackend(StorageBackend):
                     project_slug=item["project_slug"],
                     sequence=item["sequence"],
                     content=str(item.get("event", "")),
-                    metadata=item,
+                    metadata=_strip_vectors(item),
                     score=1.0,
                     source="event_search",
                 )
@@ -1209,7 +1222,7 @@ class CosmosBackend(StorageBackend):
                             project_slug=item["project_slug"],
                             sequence=item["sequence"],
                             content=item.get("content", ""),
-                            metadata=item,
+                            metadata=_strip_vectors(item),
                             score=similarity,
                             source=f"semantic_{vec_type}",
                         )
@@ -1333,7 +1346,7 @@ class CosmosBackend(StorageBackend):
                     project_slug=item["project_slug"],
                     sequence=item["sequence"],
                     content=item.get("content", ""),
-                    metadata=item,
+                    metadata=_strip_vectors(item),
                     score=similarity,
                     source="semantic",
                 )

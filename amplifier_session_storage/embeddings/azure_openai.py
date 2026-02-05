@@ -163,10 +163,12 @@ class AzureOpenAIEmbeddings(EmbeddingProvider):
         if self._client is None:
             if self.use_default_credential:
                 # Use Azure RBAC authentication
+                # credential_scopes required for Azure OpenAI endpoints
                 self._credential = DefaultAzureCredential()
                 self._client = EmbeddingsClient(
                     endpoint=self.endpoint,
                     credential=self._credential,
+                    credential_scopes=["https://cognitiveservices.azure.com/.default"],
                     model=self.deployment,  # Deployment name for routing
                 )
                 logger.info(

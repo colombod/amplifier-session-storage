@@ -23,9 +23,10 @@ from amplifier_session_storage.backends import (
     TranscriptSearchOptions,
 )
 from amplifier_session_storage.backends.cosmos import CosmosBackend, CosmosConfig
+from amplifier_session_storage.embeddings import EmbeddingProvider
 
 
-class MockEmbeddingProvider:
+class MockEmbeddingProvider(EmbeddingProvider):
     """Simple mock for testing without Azure OpenAI costs."""
 
     @property
@@ -58,8 +59,7 @@ async def cosmos_storage():
     """
     try:
         config = CosmosConfig.from_env()
-        # Override database name for testing
-        config.database_name = "your-database"
+        # Use database name from environment (AMPLIFIER_COSMOS_DATABASE)
 
         embeddings = MockEmbeddingProvider()
         storage = await CosmosBackend.create(config=config, embedding_provider=embeddings)

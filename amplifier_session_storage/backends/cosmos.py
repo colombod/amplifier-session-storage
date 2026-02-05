@@ -36,10 +36,19 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
-# Container names
-SESSIONS_CONTAINER = "sessions"
-TRANSCRIPTS_CONTAINER = "transcripts"
-EVENTS_CONTAINER = "events"
+# =============================================================================
+# Single Container Architecture (per COSMOS_DB_BEST_PRACTICES.md)
+# All session data (sessions, transcripts, events) stored in ONE container
+# with type discriminator for efficient single-partition queries
+# =============================================================================
+
+# Single container for all session data
+CONTAINER_NAME = "session_data"
+
+# Document types (type discriminator)
+DOC_TYPE_SESSION = "session"
+DOC_TYPE_TRANSCRIPT = "transcript"
+DOC_TYPE_EVENT = "event"
 
 # Auth methods
 AUTH_KEY = "key"
@@ -56,24 +65,25 @@ VECTOR_FIELDS = {
 # =============================================================================
 # Column Projections for RU Optimization (per COSMOS_DB_BEST_PRACTICES.md)
 # Using explicit projections reduces RU cost by not reading large vector fields
+# All projections include 'type' field for discriminator awareness
 # =============================================================================
 
-# Session fields (sessions container has no vectors, but explicit is still better)
+# Session fields (no vectors)
 SESSION_PROJECTION = """
-    c.id, c.user_id, c.session_id, c.host_id, c.project_slug,
+    c.id, c.type, c.partition_key, c.user_id, c.session_id, c.host_id, c.project_slug,
     c.bundle, c.created, c.updated, c.turn_count, c.metadata, c.synced_at
 """
 
 # Transcript fields WITHOUT vectors (most common read pattern)
 # This dramatically reduces RU cost vs SELECT * when vectors are ~48KB each
 TRANSCRIPT_PROJECTION = """
-    c.id, c.user_id, c.host_id, c.project_slug, c.session_id, c.sequence,
+    c.id, c.type, c.partition_key, c.user_id, c.host_id, c.project_slug, c.session_id, c.sequence,
     c.role, c.content, c.turn, c.ts, c.embedding_model, c.vector_metadata, c.synced_at
 """
 
-# Event fields (events container has no vectors)
+# Event fields (no vectors)
 EVENT_PROJECTION = """
-    c.id, c.user_id, c.host_id, c.project_slug, c.session_id, c.sequence,
+    c.id, c.type, c.partition_key, c.user_id, c.host_id, c.project_slug, c.session_id, c.sequence,
     c.ts, c.lvl, c.event, c.turn, c.data, c.data_truncated, c.data_size_bytes, c.synced_at
 """
 
@@ -207,14 +217,14 @@ class CosmosBackend(StorageBackend):
                 id=self.config.database_name
             )
 
-            # Create containers with vector support if enabled
-            await self._ensure_container(SESSIONS_CONTAINER, "/user_id", vector_enabled=False)
+            # Create single container with vector support if enabled
+            # All document types (session, transcript, event) share the same container
+            # partitioned by /partition_key (user_id|project_slug|session_id)
             await self._ensure_container(
-                TRANSCRIPTS_CONTAINER,
+                CONTAINER_NAME,
                 "/partition_key",
                 vector_enabled=self.config.enable_vector_search,
             )
-            await self._ensure_container(EVENTS_CONTAINER, "/partition_key", vector_enabled=False)
 
             self._initialized = True
             logger.info(
@@ -266,7 +276,7 @@ class CosmosBackend(StorageBackend):
         vector_embedding_policy: dict[str, Any] | None = None
 
         # Add vector indexes for transcripts if enabled
-        if vector_enabled and name == TRANSCRIPTS_CONTAINER:
+        if vector_enabled and name == CONTAINER_NAME:
             # Vector index configuration for Cosmos DB - one index per content type
             indexing_policy["vectorIndexes"] = [
                 {
@@ -340,7 +350,7 @@ class CosmosBackend(StorageBackend):
             props = await existing_container.read()
 
             # Check if vector upgrade is needed
-            if vector_enabled and name == TRANSCRIPTS_CONTAINER:
+            if vector_enabled and name == CONTAINER_NAME:
                 existing_vector_policy = props.get("vectorEmbeddingPolicy")
                 if not existing_vector_policy or not existing_vector_policy.get("vectorEmbeddings"):
                     logger.warning(
@@ -455,14 +465,19 @@ class CosmosBackend(StorageBackend):
         metadata: dict[str, Any],
     ) -> None:
         """Upsert session metadata."""
-        container = self._get_container(SESSIONS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
+
+        session_id = metadata.get("session_id", "")
+        project_slug = metadata.get("project_slug", "default")
+        partition_key = self.make_partition_key(user_id, project_slug, str(session_id))
 
         doc = {
             **metadata,
-            "id": metadata.get("session_id"),
+            "id": f"session_{session_id}",  # Prefix to avoid ID collision with transcripts
+            "type": DOC_TYPE_SESSION,  # Type discriminator
+            "partition_key": partition_key,
             "user_id": user_id,
             "host_id": host_id,
-            "_type": "session",
             "synced_at": datetime.now(UTC).isoformat(),
         }
 
@@ -474,12 +489,14 @@ class CosmosBackend(StorageBackend):
         session_id: str,
     ) -> dict[str, Any] | None:
         """Get session metadata by ID."""
-        container = self._get_container(SESSIONS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
 
         try:
             # Use explicit projection for RU optimization (per COSMOS_DB_BEST_PRACTICES.md)
-            query = f"SELECT {SESSION_PROJECTION} FROM c WHERE c.user_id = @user_id AND c.id = @session_id"
+            # Filter by type discriminator for single-container architecture
+            query = f"SELECT {SESSION_PROJECTION} FROM c WHERE c.type = @type AND c.user_id = @user_id AND c.session_id = @session_id"
             params: list[dict[str, object]] = [
+                {"name": "@type", "value": DOC_TYPE_SESSION},
                 {"name": "@user_id", "value": user_id},
                 {"name": "@session_id", "value": session_id},
             ]
@@ -496,11 +513,17 @@ class CosmosBackend(StorageBackend):
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Search sessions with advanced filters."""
-        container = self._get_container(SESSIONS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
 
         # Build query with explicit projection for RU optimization
-        query_parts = [f"SELECT {SESSION_PROJECTION} FROM c WHERE c.user_id = @user_id"]
-        params: list[dict[str, object]] = [{"name": "@user_id", "value": user_id}]
+        # Filter by type discriminator for single-container architecture
+        query_parts = [
+            f"SELECT {SESSION_PROJECTION} FROM c WHERE c.type = @type AND c.user_id = @user_id"
+        ]
+        params: list[dict[str, object]] = [
+            {"name": "@type", "value": DOC_TYPE_SESSION},
+            {"name": "@user_id", "value": user_id},
+        ]
 
         if filters.project_slug:
             query_parts.append("AND c.project_slug = @project")
@@ -548,43 +571,28 @@ class CosmosBackend(StorageBackend):
         project_slug: str,
         session_id: str,
     ) -> bool:
-        """Delete session and all its data."""
+        """Delete session and all its data (sessions, transcripts, events).
+
+        In single-container architecture, all documents for a session share
+        the same partition_key, so we can delete them all in one query.
+        """
         partition_key = self.make_partition_key(user_id, project_slug, session_id)
+        container = self._get_container(CONTAINER_NAME)
 
-        # Delete transcripts
-        transcripts = self._get_container(TRANSCRIPTS_CONTAINER)
-        async for doc in transcripts.query_items(
-            query="SELECT c.id, c.partition_key FROM c WHERE c.partition_key = @pk",
-            parameters=[{"name": "@pk", "value": partition_key}],  # type: ignore
-        ):
-            try:
-                await transcripts.delete_item(item=doc["id"], partition_key=doc["partition_key"])
-            except CosmosResourceNotFoundError:
-                pass
-
-        # Delete events
-        events = self._get_container(EVENTS_CONTAINER)
-        async for doc in events.query_items(
-            query="SELECT c.id, c.partition_key FROM c WHERE c.partition_key = @pk",
-            parameters=[{"name": "@pk", "value": partition_key}],  # type: ignore
-        ):
-            try:
-                await events.delete_item(item=doc["id"], partition_key=doc["partition_key"])
-            except CosmosResourceNotFoundError:
-                pass
-
-        # Delete session metadata
-        sessions = self._get_container(SESSIONS_CONTAINER)
+        deleted_count = 0
         try:
-            query = "SELECT c.id, c.user_id FROM c WHERE c.id = @sid AND c.user_id = @uid"
-            params: list[dict[str, object]] = [
-                {"name": "@sid", "value": session_id},
-                {"name": "@uid", "value": user_id},
-            ]
-            async for doc in sessions.query_items(query=query, parameters=params):
-                await sessions.delete_item(item=doc["id"], partition_key=doc["user_id"])
-                return True
-            return False
+            # Delete all documents with this partition key (sessions, transcripts, events)
+            async for doc in container.query_items(
+                query="SELECT c.id FROM c WHERE c.partition_key = @pk",
+                parameters=[{"name": "@pk", "value": partition_key}],  # type: ignore
+            ):
+                try:
+                    await container.delete_item(item=doc["id"], partition_key=partition_key)
+                    deleted_count += 1
+                except CosmosResourceNotFoundError:
+                    pass
+
+            return deleted_count > 0
         except CosmosResourceNotFoundError:
             return False
 
@@ -680,7 +688,7 @@ class CosmosBackend(StorageBackend):
                 f"{counts['tool_output']} tool"
             )
 
-        container = self._get_container(TRANSCRIPTS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
         partition_key = self.make_partition_key(user_id, project_slug, session_id)
 
         synced = 0
@@ -693,6 +701,7 @@ class CosmosBackend(StorageBackend):
             doc: dict[str, Any] = {
                 **line,
                 "id": doc_id,
+                "type": DOC_TYPE_TRANSCRIPT,  # Type discriminator for single-container
                 "partition_key": partition_key,
                 "user_id": user_id,
                 "host_id": host_id,
@@ -700,7 +709,6 @@ class CosmosBackend(StorageBackend):
                 "session_id": session_id,
                 "sequence": sequence,
                 "ts": ts,
-                "_type": "transcript_message",
                 "synced_at": datetime.now(UTC).isoformat(),
             }
 
@@ -748,17 +756,19 @@ class CosmosBackend(StorageBackend):
         after_sequence: int = -1,
     ) -> list[dict[str, Any]]:
         """Get transcript lines for a session."""
-        container = self._get_container(TRANSCRIPTS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
         partition_key = self.make_partition_key(user_id, project_slug, session_id)
 
         # Use explicit projection to exclude vectors at query time (reduces RU cost)
         # This is more efficient than SELECT * + _strip_vectors() because Cosmos
         # doesn't have to read the large vector fields at all
+        # Filter by type discriminator for single-container architecture
         query = (
-            f"SELECT {TRANSCRIPT_PROJECTION} FROM c WHERE c.partition_key = @pk "
-            "AND c.sequence > @after_seq ORDER BY c.sequence"
+            f"SELECT {TRANSCRIPT_PROJECTION} FROM c WHERE c.type = @type "
+            "AND c.partition_key = @pk AND c.sequence > @after_seq ORDER BY c.sequence"
         )
         params = [
+            {"name": "@type", "value": DOC_TYPE_TRANSCRIPT},
             {"name": "@pk", "value": partition_key},
             {"name": "@after_seq", "value": after_sequence},
         ]
@@ -806,17 +816,23 @@ class CosmosBackend(StorageBackend):
         limit: int,
     ) -> list[SearchResult]:
         """Full-text search using CONTAINS."""
-        container = self._get_container(TRANSCRIPTS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
 
         # Build query with explicit projection (excludes vectors, reduces RU cost)
+        # Filter by type discriminator for single-container architecture
         # Allow empty user_id for team-wide search
         if user_id:
-            query_parts = [f"SELECT {TRANSCRIPT_PROJECTION} FROM c WHERE c.user_id = @user_id"]
-            params: list[dict[str, object]] = [{"name": "@user_id", "value": user_id}]
+            query_parts = [
+                f"SELECT {TRANSCRIPT_PROJECTION} FROM c WHERE c.type = @type AND c.user_id = @user_id"
+            ]
+            params: list[dict[str, object]] = [
+                {"name": "@type", "value": DOC_TYPE_TRANSCRIPT},
+                {"name": "@user_id", "value": user_id},
+            ]
         else:
             # Team-wide search (all users)
-            query_parts = [f"SELECT {TRANSCRIPT_PROJECTION} FROM c WHERE 1=1"]
-            params: list[dict[str, object]] = []
+            query_parts = [f"SELECT {TRANSCRIPT_PROJECTION} FROM c WHERE c.type = @type"]
+            params: list[dict[str, object]] = [{"name": "@type", "value": DOC_TYPE_TRANSCRIPT}]
 
         # Role filters
         role_conditions = []
@@ -962,7 +978,7 @@ class CosmosBackend(StorageBackend):
 
         Queries Cosmos DB for messages in the turn range [turn-before, turn+after].
         """
-        container = self._get_container(TRANSCRIPTS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
 
         # Calculate turn range
         min_turn = max(1, turn - before)
@@ -970,15 +986,18 @@ class CosmosBackend(StorageBackend):
 
         # Query for messages in the turn range (no ORDER BY - Cosmos needs composite index)
         # We'll sort in Python instead
+        # Filter by type discriminator for single-container architecture
         query = """
             SELECT c.sequence, c.turn, c.role, c.content, c.ts, c.project_slug
             FROM c
-            WHERE c.user_id = @user_id
+            WHERE c.type = @type
+              AND c.user_id = @user_id
               AND c.session_id = @session_id
               AND c.turn >= @min_turn
               AND c.turn <= @max_turn
         """
         params = [
+            {"name": "@type", "value": DOC_TYPE_TRANSCRIPT},
             {"name": "@user_id", "value": user_id},
             {"name": "@session_id", "value": session_id},
             {"name": "@min_turn", "value": min_turn},
@@ -1011,9 +1030,11 @@ class CosmosBackend(StorageBackend):
 
         # Get session turn range for navigation metadata
         # Cosmos DB doesn't support composite aggregates, so run separate queries
-        min_query = "SELECT VALUE MIN(c.turn) FROM c WHERE c.user_id = @user_id AND c.session_id = @session_id"
-        max_query = "SELECT VALUE MAX(c.turn) FROM c WHERE c.user_id = @user_id AND c.session_id = @session_id"
+        # Filter by type discriminator for single-container architecture
+        min_query = "SELECT VALUE MIN(c.turn) FROM c WHERE c.type = @type AND c.user_id = @user_id AND c.session_id = @session_id"
+        max_query = "SELECT VALUE MAX(c.turn) FROM c WHERE c.type = @type AND c.user_id = @user_id AND c.session_id = @session_id"
         range_params = [
+            {"name": "@type", "value": DOC_TYPE_TRANSCRIPT},
             {"name": "@user_id", "value": user_id},
             {"name": "@session_id", "value": session_id},
         ]
@@ -1067,7 +1088,7 @@ class CosmosBackend(StorageBackend):
         if not lines:
             return 0
 
-        container = self._get_container(EVENTS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
         partition_key = self.make_partition_key(user_id, project_slug, session_id)
 
         synced = 0
@@ -1083,6 +1104,7 @@ class CosmosBackend(StorageBackend):
                 # Store summary only
                 doc = {
                     "id": doc_id,
+                    "type": DOC_TYPE_EVENT,  # Type discriminator for single-container
                     "partition_key": partition_key,
                     "user_id": user_id,
                     "host_id": host_id,
@@ -1095,7 +1117,6 @@ class CosmosBackend(StorageBackend):
                     "turn": line.get("turn"),
                     "data_truncated": True,
                     "data_size_bytes": data_size,
-                    "_type": "event",
                     "synced_at": datetime.now(UTC).isoformat(),
                 }
             else:
@@ -1103,6 +1124,7 @@ class CosmosBackend(StorageBackend):
                 doc = {
                     **line,
                     "id": doc_id,
+                    "type": DOC_TYPE_EVENT,  # Type discriminator for single-container
                     "partition_key": partition_key,
                     "user_id": user_id,
                     "host_id": host_id,
@@ -1111,7 +1133,6 @@ class CosmosBackend(StorageBackend):
                     "sequence": sequence,
                     "data_truncated": False,
                     "data_size_bytes": data_size,
-                    "_type": "event",
                     "synced_at": datetime.now(UTC).isoformat(),
                 }
 
@@ -1128,16 +1149,18 @@ class CosmosBackend(StorageBackend):
         after_sequence: int = -1,
     ) -> list[dict[str, Any]]:
         """Get event lines (summaries for large events)."""
-        container = self._get_container(EVENTS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
         partition_key = self.make_partition_key(user_id, project_slug, session_id)
 
+        # Filter by type discriminator for single-container architecture
         query = (
             "SELECT c.id, c.sequence, c.ts, c.lvl, c.event, c.turn, "
             "c.data_truncated, c.data_size_bytes "
-            "FROM c WHERE c.partition_key = @pk "
+            "FROM c WHERE c.type = @type AND c.partition_key = @pk "
             "AND c.sequence > @after_seq ORDER BY c.sequence"
         )
         params = [
+            {"name": "@type", "value": DOC_TYPE_EVENT},
             {"name": "@pk", "value": partition_key},
             {"name": "@after_seq", "value": after_sequence},
         ]
@@ -1155,11 +1178,17 @@ class CosmosBackend(StorageBackend):
         limit: int = 100,
     ) -> list[SearchResult]:
         """Search events by type, tool, and filters."""
-        container = self._get_container(EVENTS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
 
         # Build query with explicit projection for RU optimization
-        query_parts = [f"SELECT {EVENT_PROJECTION} FROM c WHERE c.user_id = @user_id"]
-        params: list[dict[str, object]] = [{"name": "@user_id", "value": user_id}]
+        # Filter by type discriminator for single-container architecture
+        query_parts = [
+            f"SELECT {EVENT_PROJECTION} FROM c WHERE c.type = @doc_type AND c.user_id = @user_id"
+        ]
+        params: list[dict[str, object]] = [
+            {"name": "@doc_type", "value": DOC_TYPE_EVENT},
+            {"name": "@user_id", "value": user_id},
+        ]
 
         if options.event_type:
             query_parts.append("AND c.event = @event_type")
@@ -1231,7 +1260,7 @@ class CosmosBackend(StorageBackend):
 
         Used for backfilling embeddings on existing data.
         """
-        container = self._get_container(TRANSCRIPTS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
         partition_key = self.make_partition_key(user_id, project_slug, session_id)
 
         updated = 0
@@ -1280,7 +1309,7 @@ class CosmosBackend(StorageBackend):
                 Options: ["user_query", "assistant_response",
                           "assistant_thinking", "tool_output"]
         """
-        container = self._get_container(TRANSCRIPTS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
 
         if vector_columns is None:
             # Search all vector columns by default
@@ -1299,16 +1328,19 @@ class CosmosBackend(StorageBackend):
         }
 
         # Build base filter conditions - allow empty user_id for team-wide search
+        # Always filter by type discriminator for single-container architecture
         if user_id:
-            filter_parts = ["c.user_id = @user_id"]
+            filter_parts = ["c.type = @doc_type", "c.user_id = @user_id"]
             base_params: list[dict[str, object]] = [
+                {"name": "@doc_type", "value": DOC_TYPE_TRANSCRIPT},
                 {"name": "@user_id", "value": user_id},
                 {"name": "@query_vector", "value": query_vector},
             ]
         else:
             # Team-wide search (all users)
-            filter_parts: list[str] = []
+            filter_parts: list[str] = ["c.type = @doc_type"]
             base_params: list[dict[str, object]] = [
+                {"name": "@doc_type", "value": DOC_TYPE_TRANSCRIPT},
                 {"name": "@query_vector", "value": query_vector},
             ]
 
@@ -1406,7 +1438,7 @@ class CosmosBackend(StorageBackend):
         DEPRECATED: Old implementation that used LEAST() - not supported by Cosmos DB.
         Kept for reference only.
         """
-        container = self._get_container(TRANSCRIPTS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
 
         if vector_columns is None:
             vector_columns = [
@@ -1508,11 +1540,14 @@ class CosmosBackend(StorageBackend):
         filters: SearchFilters | None = None,
     ) -> dict[str, Any]:
         """Get aggregate statistics across sessions."""
-        sessions = self._get_container(SESSIONS_CONTAINER)
+        sessions = self._get_container(CONTAINER_NAME)
 
-        # Build base query
-        where_parts = ["c.user_id = @user_id"]
-        params: list[dict[str, object]] = [{"name": "@user_id", "value": user_id}]
+        # Build base query - filter by type discriminator for single-container
+        where_parts = ["c.type = @doc_type", "c.user_id = @user_id"]
+        params: list[dict[str, object]] = [
+            {"name": "@doc_type", "value": DOC_TYPE_SESSION},
+            {"name": "@user_id", "value": user_id},
+        ]
 
         if filters:
             if filters.project_slug:
@@ -1564,11 +1599,11 @@ class CosmosBackend(StorageBackend):
         filters: SearchFilters | None = None,
     ) -> list[str]:
         """List all unique user IDs in the storage."""
-        container = self._get_container(SESSIONS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
 
-        # Build query with optional filters
-        where_parts: list[str] = []
-        params: list[dict[str, object]] = []
+        # Build query with optional filters - filter by type for single-container
+        where_parts: list[str] = ["c.type = @doc_type"]
+        params: list[dict[str, object]] = [{"name": "@doc_type", "value": DOC_TYPE_SESSION}]
 
         if filters:
             if filters.project_slug:
@@ -1587,7 +1622,7 @@ class CosmosBackend(StorageBackend):
                 where_parts.append("c.bundle = @bundle")
                 params.append({"name": "@bundle", "value": filters.bundle})
 
-        where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+        where_clause = " AND ".join(where_parts)
         query = f"SELECT DISTINCT VALUE c.user_id FROM c WHERE {where_clause}"
 
         users: list[str] = []
@@ -1603,11 +1638,11 @@ class CosmosBackend(StorageBackend):
         filters: SearchFilters | None = None,
     ) -> list[str]:
         """List all unique project slugs."""
-        container = self._get_container(SESSIONS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
 
-        # Build query with optional filters
-        where_parts: list[str] = []
-        params: list[dict[str, object]] = []
+        # Build query with optional filters - filter by type for single-container
+        where_parts: list[str] = ["c.type = @doc_type"]
+        params: list[dict[str, object]] = [{"name": "@doc_type", "value": DOC_TYPE_SESSION}]
 
         if user_id:
             where_parts.append("c.user_id = @user_id")
@@ -1626,7 +1661,7 @@ class CosmosBackend(StorageBackend):
                 where_parts.append("c.bundle = @bundle")
                 params.append({"name": "@bundle", "value": filters.bundle})
 
-        where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+        where_clause = " AND ".join(where_parts)
         query = f"SELECT DISTINCT VALUE c.project_slug FROM c WHERE {where_clause}"
 
         projects: list[str] = []
@@ -1644,11 +1679,11 @@ class CosmosBackend(StorageBackend):
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         """List sessions with pagination."""
-        container = self._get_container(SESSIONS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
 
-        # Build query with optional filters
-        where_parts: list[str] = []
-        params: list[dict[str, object]] = []
+        # Build query with optional filters - filter by type for single-container
+        where_parts: list[str] = ["c.type = @doc_type"]
+        params: list[dict[str, object]] = [{"name": "@doc_type", "value": DOC_TYPE_SESSION}]
 
         if user_id:
             where_parts.append("c.user_id = @user_id")
@@ -1658,7 +1693,7 @@ class CosmosBackend(StorageBackend):
             where_parts.append("c.project_slug = @project")
             params.append({"name": "@project", "value": project_slug})
 
-        where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+        where_clause = " AND ".join(where_parts)
 
         # Cosmos DB doesn't support OFFSET directly, use continuation token pattern
         # For simplicity, we'll fetch all and slice in Python (fine for moderate datasets)
@@ -1691,11 +1726,14 @@ class CosmosBackend(StorageBackend):
         """Get context window around a specific message by sequence."""
         from .base import MessageContext, TranscriptMessage
 
-        container = self._get_container(TRANSCRIPTS_CONTAINER)
+        container = self._get_container(CONTAINER_NAME)
 
-        # Build user filter
+        # Build user filter - filter by type for single-container architecture
         user_filter = "c.user_id = @user_id" if user_id else "1=1"
-        params: list[dict[str, object]] = [{"name": "@session_id", "value": session_id}]
+        params: list[dict[str, object]] = [
+            {"name": "@doc_type", "value": DOC_TYPE_TRANSCRIPT},
+            {"name": "@session_id", "value": session_id},
+        ]
         if user_id:
             params.append({"name": "@user_id", "value": user_id})
 
@@ -1706,7 +1744,7 @@ class CosmosBackend(StorageBackend):
         query = f"""
             SELECT c.sequence, c.turn, c.role, c.content, c.ts, c.project_slug
             FROM c
-            WHERE c.session_id = @session_id AND {user_filter}
+            WHERE c.type = @doc_type AND c.session_id = @session_id AND {user_filter}
               AND c.sequence >= @min_seq AND c.sequence <= @max_seq
         """
         params.extend(
@@ -1753,26 +1791,25 @@ class CosmosBackend(StorageBackend):
                 following.append(msg)
 
         # Get session sequence range for navigation metadata
+        # Filter by type for single-container architecture
         range_query = f"""
             SELECT VALUE MIN(c.sequence) FROM c
-            WHERE c.session_id = @session_id AND {user_filter}
+            WHERE c.type = @doc_type AND c.session_id = @session_id AND {user_filter}
         """
         first_sequence = 0
-        async for item in container.query_items(
-            query=range_query, parameters=params[:2] if user_id else params[:1]
-        ):
+        # params[:3] includes @doc_type, @session_id, and optionally @user_id
+        range_params = params[:3] if user_id else params[:2]
+        async for item in container.query_items(query=range_query, parameters=range_params):
             if item is not None:
                 first_sequence = item
             break
 
         range_query = f"""
             SELECT VALUE MAX(c.sequence) FROM c
-            WHERE c.session_id = @session_id AND {user_filter}
+            WHERE c.type = @doc_type AND c.session_id = @session_id AND {user_filter}
         """
         last_sequence = sequence
-        async for item in container.query_items(
-            query=range_query, parameters=params[:2] if user_id else params[:1]
-        ):
+        async for item in container.query_items(query=range_query, parameters=range_params):
             if item is not None:
                 last_sequence = item
             break

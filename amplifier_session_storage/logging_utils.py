@@ -1,53 +1,107 @@
 """
-Structured JSON logging utilities for cloud environments.
+Logging utilities for amplifier-session-storage.
 
-This module provides structured logging that works well with Azure Container Apps,
-Log Analytics, and other cloud logging systems that expect JSON-formatted logs.
+This module follows Python library logging best practices:
+- Library code uses standard logging.getLogger()
+- NullHandler is added to prevent "No handler found" warnings
+- Applications configure their own handlers and formatters
+
+The StructuredJsonFormatter is provided as a UTILITY for applications
+that want JSON logging (e.g., for Azure Container Apps). The library
+itself does NOT configure logging - that's the application's job.
+
+Usage in library code:
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("Something happened", extra={"key": "value"})
+
+Usage in applications:
+    from amplifier_session_storage.logging_utils import StructuredJsonFormatter
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(StructuredJsonFormatter())
+    logging.getLogger("amplifier_session_storage").addHandler(handler)
+    logging.getLogger("amplifier_session_storage").setLevel(logging.INFO)
 """
 
 import json
 import logging
-import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 
 class StructuredJsonFormatter(logging.Formatter):
     """
     JSON formatter for structured logging in cloud environments.
-    
+
+    This is a UTILITY for applications to use when configuring logging.
+    The library does NOT use this internally - it's provided for apps
+    that want JSON output (e.g., Azure Container Apps, Log Analytics).
+
     Outputs logs as single-line JSON objects with consistent fields:
     - timestamp: ISO 8601 format in UTC
     - level: Log level (INFO, WARNING, ERROR, etc.)
     - logger: Logger name
     - message: Log message
+    - module, function, line: Source location
     - Additional context fields from extra dict
+
+    Example application usage:
+        import logging
+        from amplifier_session_storage.logging_utils import StructuredJsonFormatter
+
+        # Configure root logger for JSON output
+        handler = logging.StreamHandler()
+        handler.setFormatter(StructuredJsonFormatter())
+        logging.root.addHandler(handler)
+        logging.root.setLevel(logging.INFO)
     """
 
     def format(self, record: logging.LogRecord) -> str:
         """Format log record as JSON."""
         log_obj: dict[str, Any] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
+            "module": record.module,
+            "function": record.funcName,
+            "line": record.lineno,
         }
 
         # Add exception info if present
         if record.exc_info:
             log_obj["exception"] = self.formatException(record.exc_info)
+            if record.exc_info[0]:
+                log_obj["exception_type"] = record.exc_info[0].__name__
 
         # Add extra fields (excluding standard LogRecord attributes)
         standard_attrs = {
-            "name", "msg", "args", "created", "filename", "funcName",
-            "levelname", "levelno", "lineno", "module", "msecs",
-            "pathname", "process", "processName", "relativeCreated",
-            "stack_info", "exc_info", "exc_text", "thread", "threadName",
-            "taskName", "message"
+            "name",
+            "msg",
+            "args",
+            "created",
+            "filename",
+            "funcName",
+            "levelname",
+            "levelno",
+            "lineno",
+            "module",
+            "msecs",
+            "pathname",
+            "process",
+            "processName",
+            "relativeCreated",
+            "stack_info",
+            "exc_info",
+            "exc_text",
+            "thread",
+            "threadName",
+            "taskName",
+            "message",
         }
         for key, value in record.__dict__.items():
             if key not in standard_attrs and not key.startswith("_"):
-                # Ensure value is JSON serializable
                 try:
                     json.dumps(value)
                     log_obj[key] = value
@@ -57,58 +111,6 @@ class StructuredJsonFormatter(logging.Formatter):
         return json.dumps(log_obj, default=str)
 
 
-def configure_structured_logging(
-    level: int = logging.INFO,
-    logger_name: str | None = None,
-) -> logging.Logger:
-    """
-    Configure structured JSON logging for cloud environments.
-    
-    Args:
-        level: Logging level (default: INFO)
-        logger_name: Specific logger to configure (default: root logger)
-    
-    Returns:
-        Configured logger instance
-    """
-    logger = logging.getLogger(logger_name)
-    
-    # Remove existing handlers to avoid duplicates
-    logger.handlers.clear()
-    
-    # Create stdout handler with JSON formatter
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(StructuredJsonFormatter())
-    
-    logger.addHandler(handler)
-    logger.setLevel(level)
-    
-    return logger
-
-
-def get_storage_logger(name: str) -> logging.Logger:
-    """
-    Get a logger for storage components with consistent naming.
-    
-    Args:
-        name: Component name (e.g., 'cosmos', 'duckdb')
-    
-    Returns:
-        Logger instance with name 'amplifier_session_storage.{name}'
-    """
-    return logging.getLogger(f"amplifier_session_storage.{name}")
-
-
-class StorageLoggerAdapter(logging.LoggerAdapter):
-    """
-    Logger adapter that adds storage context to all log messages.
-    
-    Useful for adding consistent context like user_id, session_id, etc.
-    """
-
-    def process(self, msg: str, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        """Add extra context to log record."""
-        extra = kwargs.get("extra", {})
-        extra.update(self.extra)
-        kwargs["extra"] = extra
-        return msg, kwargs
+# Set up NullHandler for library - prevents "No handler found" warnings
+# Applications should configure their own handlers
+logging.getLogger("amplifier_session_storage").addHandler(logging.NullHandler())

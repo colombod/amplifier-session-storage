@@ -8,6 +8,7 @@ Supports both traditional queries and vector similarity search.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -21,7 +22,6 @@ from azure.identity.aio import DefaultAzureCredential
 from ..content_extraction import count_embeddable_content_types, extract_all_embeddable_content
 from ..embeddings import EmbeddingProvider
 from ..exceptions import AuthenticationError, StorageConnectionError, StorageIOError
-from ..logging_utils import get_storage_logger
 from ..search.mmr import compute_mmr
 from .base import (
     EventSearchOptions,
@@ -33,7 +33,7 @@ from .base import (
     TurnContext,
 )
 
-logger = get_storage_logger("cosmos")
+logger = logging.getLogger(__name__)
 
 # Container names
 SESSIONS_CONTAINER = "sessions"

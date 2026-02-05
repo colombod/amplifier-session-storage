@@ -186,17 +186,9 @@ if _has_openai:
 
 __version__ = "0.2.0"  # Bumped for major enhancements
 
-# Logging utilities for cloud environments
-from .logging_utils import (
-    StructuredJsonFormatter,
-    configure_structured_logging,
-    get_storage_logger,
-    StorageLoggerAdapter,
-)
 
-__all__.extend([
-    "StructuredJsonFormatter",
-    "configure_structured_logging", 
-    "get_storage_logger",
-    "StorageLoggerAdapter",
-])
+# Logging utility for applications (NOT used by library internally)
+# Applications can use this formatter for JSON logging in cloud environments
+from .logging_utils import StructuredJsonFormatter  # noqa: F401
+
+__all__.extend(["StructuredJsonFormatter"])

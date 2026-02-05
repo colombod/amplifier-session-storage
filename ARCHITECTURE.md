@@ -4,185 +4,182 @@ This document describes the architecture of the Amplifier Session Storage librar
 
 ## Overview
 
-The library provides a simple, focused solution for syncing Amplifier CLI session data to Azure Cosmos DB. It mirrors the CLI's local file format (metadata.json, transcript.jsonl, events.jsonl) to cloud storage with complete data parity.
+The library provides a unified storage abstraction for Amplifier session data with support for multiple backends (DuckDB, SQLite, Cosmos DB). It includes semantic search capabilities via multi-vector embeddings for user queries, assistant responses, thinking blocks, and tool outputs.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Amplifier CLI (Local)                        │
-│                                                                 │
-│  ~/.amplifier/projects/{project}/sessions/{session}/            │
-│  ├── metadata.json      → Session metadata                      │
-│  ├── transcript.jsonl   → Conversation messages                 │
-│  └── events.jsonl       → Session events                        │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ Session Sync Daemon
-                              │ (reads local files)
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    CosmosFileStorage                            │
-│                                                                 │
-│  - upsert_session_metadata()                                    │
-│  - sync_transcript_lines()                                      │
-│  - sync_event_lines()                                           │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ Azure SDK
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Azure Cosmos DB                              │
-│                                                                 │
-│  Database: amplifier-db                                         │
-│  ├── sessions      (partition: /user_id)                        │
-│  ├── transcripts   (partition: /partition_key)                  │
-│  └── events        (partition: /partition_key)                  │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Application Layer                                │
+│                                                                         │
+│  Bundle Tools, Sync Daemons, Analytics, Search Interfaces               │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         StorageBackend (Abstract)                        │
+│                                                                         │
+│  - sync_session_metadata()        - search_transcripts()                │
+│  - sync_transcript_lines()        - search_events()                     │
+│  - sync_event_lines()             - get_turn_context()                  │
+│  - get_transcript_lines()         - get_session_statistics()            │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+              ┌─────────────────────┼─────────────────────┐
+              ▼                     ▼                     ▼
+┌──────────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐
+│   DuckDBBackend      │ │   SQLiteBackend      │ │   CosmosBackend      │
+│                      │ │                      │ │                      │
+│ - HNSW vector index  │ │ - Simple local       │ │ - Azure cloud        │
+│ - FTS5 full-text     │ │ - No vector ext      │ │ - Vector search      │
+│ - Local file         │ │ - Portable           │ │ - Team-wide sync     │
+└──────────────────────┘ └──────────────────────┘ └──────────────────────┘
 ```
 
 ## Design Principles
 
-### 1. CLI Format Parity
+### 1. Backend Abstraction
 
-The storage preserves the exact structure of local CLI files:
-- **metadata.json** → `sessions` container (one document per session)
-- **transcript.jsonl** → `transcripts` container (one document per line)
-- **events.jsonl** → `events` container (one document per line)
+All backends implement the `StorageBackend` protocol, enabling:
+- Swappable storage without code changes
+- Consistent API across local and cloud storage
+- Backend-specific optimizations (e.g., vector indexes)
 
-No data transformation or loss occurs during sync.
+### 2. Multi-Vector Semantic Search
 
-### 2. Multi-Device Origin Tracking
+Each transcript message generates up to 4 vectors:
+- `user_query_vector` - For user messages
+- `assistant_response_vector` - For assistant responses
+- `assistant_thinking_vector` - For thinking blocks
+- `tool_output_vector` - For tool outputs
 
-Every document includes:
-- `user_id`: The user who owns the session
-- `host_id`: The machine where the session originated
+This enables targeted search (e.g., "find similar reasoning patterns").
 
-This enables:
-- Querying sessions by origin machine
-- Detecting conflicts from concurrent edits
-- Audit trail for session activity
+### 3. Hybrid Search
 
-### 3. Incremental Sync
+Combines multiple search strategies:
+- **Full-text search** - Keyword matching (fast, precise)
+- **Semantic search** - Embedding similarity (meaning-based)
+- **Hybrid search** - Best of both with MMR diversity ranking
 
-Sequence numbers enable efficient delta sync:
-- Transcript lines have `sequence` (0, 1, 2, ...)
-- Event lines have `sequence` (0, 1, 2, ...)
-- Sync daemon queries current count, sends only new lines
+### 4. Vector Safety
 
-### 4. Query-Optimized Partitioning
-
-Container partition keys are chosen for efficient queries:
-
-| Container | Partition Key | Rationale |
-|-----------|---------------|-----------|
-| `sessions` | `/user_id` | List all sessions for a user efficiently |
-| `transcripts` | `/partition_key` | All messages for a session in one partition |
-| `events` | `/partition_key` | All events for a session in one partition |
-
-The composite partition key format is: `{user_id}|{project_slug}|{session_id}`
+Vectors are **never returned** in read API responses to prevent:
+- Bloating LLM context windows (3072-dim vectors are huge)
+- Unnecessary data transfer
+- Context overflow in agent tools
 
 ## Components
 
-### CosmosFileStorage
-
-The main storage class providing:
+### StorageBackend (Abstract Base)
 
 ```python
-class CosmosFileStorage:
+class StorageBackend(ABC):
     # Lifecycle
     async def initialize() -> None
     async def close() -> None
-    async def verify_connection() -> bool
-
-    # Session metadata (sessions container)
-    async def upsert_session_metadata(user_id, host_id, metadata) -> None
-    async def get_session_metadata(user_id, session_id) -> dict | None
-    async def list_sessions(user_id, project_slug?, limit?) -> list[dict]
+    
+    # Session metadata
+    async def sync_session_metadata(user_id, host_id, metadata) -> None
+    async def get_session(user_id, session_id) -> dict | None
+    async def search_sessions(user_id, filters, limit) -> list[dict]
     async def delete_session(user_id, project_slug, session_id) -> bool
-
-    # Transcript messages (transcripts container)
-    async def sync_transcript_lines(user_id, host_id, project_slug, session_id, lines, start_sequence?) -> int
-    async def get_transcript_lines(user_id, project_slug, session_id, after_sequence?) -> list[dict]
-    async def get_transcript_count(user_id, project_slug, session_id) -> int
-
-    # Events (events container)
-    async def sync_event_lines(user_id, host_id, project_slug, session_id, lines, start_sequence?) -> int
-    async def get_event_lines(user_id, project_slug, session_id, after_sequence?) -> list[dict]
-    async def get_event_count(user_id, project_slug, session_id) -> int
+    
+    # Transcripts
+    async def sync_transcript_lines(user_id, host_id, project_slug, session_id, lines) -> int
+    async def get_transcript_lines(user_id, project_slug, session_id, after_sequence) -> list[dict]
+    async def search_transcripts(user_id, options, limit) -> list[SearchResult]
+    async def get_turn_context(user_id, session_id, turn, before, after) -> TurnContext
+    
+    # Events
+    async def sync_event_lines(user_id, host_id, project_slug, session_id, lines) -> int
+    async def get_event_lines(user_id, project_slug, session_id, after_sequence) -> list[dict]
+    async def search_events(user_id, options, limit) -> list[SearchResult]
+    
+    # Analytics
+    async def get_session_statistics(user_id?, project_slug?) -> SessionStatistics
 ```
 
-### CosmosFileConfig
-
-Configuration for Cosmos DB connection:
+### Backend Configurations
 
 ```python
 @dataclass
-class CosmosFileConfig:
-    endpoint: str           # Cosmos DB account endpoint
-    database_name: str      # Database name (default: "amplifier-db")
-    auth_method: str        # "default_credential" or "key"
-    key: str | None         # Account key (only for key auth)
+class DuckDBConfig:
+    db_path: str = "~/.amplifier/sessions.duckdb"
 
+@dataclass
+class SQLiteConfig:
+    db_path: str = "~/.amplifier/sessions.sqlite"
+
+@dataclass
+class CosmosConfig:
+    endpoint: str
+    database_name: str = "amplifier-db"
+    auth_method: str = "default_credential"  # or "key"
+    key: str | None = None
+    enable_vector_search: bool = True
+    
     @classmethod
-    def from_env(cls) -> CosmosFileConfig
+    def from_env(cls) -> CosmosConfig
+```
+
+### Embedding Providers
+
+```python
+class EmbeddingProvider(ABC):
+    async def embed(text: str) -> list[float]
+    async def embed_batch(texts: list[str]) -> list[list[float]]
+
+# Implementations
+class AzureOpenAIEmbeddings(EmbeddingProvider)  # Azure AI Inference SDK
+class OpenAIEmbeddings(EmbeddingProvider)        # OpenAI direct
 ```
 
 ### Identity Module
 
-Utilities for consistent user/device identification:
-
 ```python
 class IdentityContext:
     @classmethod
-    def initialize() -> None
+    def get_user_id() -> str    # From config or system
     
-    @classmethod
-    def get_user_id() -> str
-    
-    @classmethod
-    def get_host_id() -> str
+    @classmethod  
+    def get_host_id() -> str    # Machine identifier
 ```
 
 ## Data Flow
 
-### Sync Flow (Daemon → Cosmos)
+### Sync Flow (Local → Storage)
 
 ```
-1. Daemon discovers local sessions
+1. Sync daemon discovers local sessions
    └── Scans ~/.amplifier/projects/*/sessions/*/
 
-2. For each session, daemon calls server API:
-   └── POST /api/v1/sessions/{id}/sync-status
-       Returns: { event_count, transcript_count }
+2. For each session, get current sync status:
+   └── storage.get_session() returns event_count, transcript_count
 
-3. Daemon reads local files and calculates delta:
-   └── new_events = local_events[event_count:]
-   └── new_transcripts = local_transcripts[transcript_count:]
+3. Calculate delta and sync new data:
+   └── storage.sync_transcript_lines(lines[transcript_count:])
+   └── storage.sync_event_lines(lines[event_count:])
 
-4. Daemon sends incremental updates:
-   └── POST /api/v1/sessions/{id}/metadata
-   └── POST /api/v1/sessions/{id}/events
-   └── POST /api/v1/sessions/{id}/transcript
-
-5. Server uses CosmosFileStorage to persist:
-   └── storage.upsert_session_metadata(...)
-   └── storage.sync_event_lines(...)
-   └── storage.sync_transcript_lines(...)
+4. Embedding provider generates vectors for new content:
+   └── Parallel embedding of user/assistant/thinking/tool content
 ```
 
-### Query Flow (Client → Cosmos)
+### Search Flow
 
 ```
-1. Client requests session list:
-   └── GET /api/v1/sessions?user_id=X&project=Y
+1. User issues search query
+   └── "How did we handle authentication errors?"
 
-2. Server queries Cosmos:
-   └── storage.list_sessions(user_id, project_slug)
+2. Search options determine strategy:
+   └── search_type: "hybrid" | "semantic" | "full_text"
+   └── search_in_user, search_in_assistant, search_in_thinking
 
-3. Cosmos executes efficient partition query:
-   └── Query scoped to user_id partition
-   └── Optional project_slug filter
+3. Backend executes search:
+   └── Full-text: SQL LIKE/CONTAINS queries
+   └── Semantic: Vector similarity with HNSW/Cosmos
+   └── Hybrid: Both + MMR diversity ranking
 
-4. Results returned with full metadata
+4. Results returned WITHOUT vectors:
+   └── SearchResult(content, score, metadata, session_id, turn)
 ```
 
 ## Document Schemas
@@ -191,20 +188,16 @@ class IdentityContext:
 
 ```json
 {
-    "id": "session-id",
-    "user_id": "user-123",
-    "host_id": "laptop-01",
-    "session_id": "session-id",
-    "project_slug": "my-project",
-    "bundle": "foundation",
-    "created": "2024-01-15T10:00:00Z",
-    "updated": "2024-01-15T12:00:00Z",
-    "turn_count": 5,
-    "parent_id": null,
-    "trace_id": "trace-xyz",
-    "config": { ... },
-    "_type": "session",
-    "synced_at": "2024-01-15T12:00:00Z"
+  "id": "session-uuid",
+  "user_id": "user-email",
+  "host_id": "machine-uuid", 
+  "project_slug": "my-project",
+  "bundle": "foundation:main",
+  "created": "2024-01-15T10:30:00Z",
+  "updated": "2024-01-15T11:45:00Z",
+  "turn_count": 15,
+  "event_count": 234,
+  "transcript_count": 45
 }
 ```
 
@@ -212,19 +205,16 @@ class IdentityContext:
 
 ```json
 {
-    "id": "session-id_msg_0",
-    "partition_key": "user-123|my-project|session-id",
-    "user_id": "user-123",
-    "host_id": "laptop-01",
-    "project_slug": "my-project",
-    "session_id": "session-id",
-    "sequence": 0,
-    "role": "user",
-    "content": "Hello",
-    "timestamp": "2024-01-15T10:00:00Z",
-    "turn": 0,
-    "_type": "transcript_message",
-    "synced_at": "2024-01-15T12:00:00Z"
+  "id": "transcript-line-uuid",
+  "user_id": "user-email",
+  "session_id": "session-uuid",
+  "project_slug": "my-project",
+  "sequence": 0,
+  "turn": 1,
+  "role": "user",
+  "content": "Help me understand...",
+  "ts": "2024-01-15T10:30:05Z",
+  "user_query_vector": [0.1, 0.2, ...]  // NOT returned in read APIs
 }
 ```
 
@@ -232,102 +222,93 @@ class IdentityContext:
 
 ```json
 {
-    "id": "session-id_evt_0",
-    "partition_key": "user-123|my-project|session-id",
-    "user_id": "user-123",
-    "host_id": "laptop-01",
-    "project_slug": "my-project",
-    "session_id": "session-id",
-    "sequence": 0,
-    "event": "session.start",
-    "ts": "2024-01-15T10:00:00Z",
-    "lvl": "info",
-    "turn": 0,
-    "data": { ... },
-    "data_truncated": false,
-    "data_size_bytes": 150,
-    "_type": "event",
-    "synced_at": "2024-01-15T12:00:00Z"
+  "id": "event-line-uuid",
+  "user_id": "user-email",
+  "session_id": "session-uuid",
+  "project_slug": "my-project",
+  "sequence": 0,
+  "turn": 1,
+  "event": "tool_call",
+  "lvl": "INFO",
+  "ts": "2024-01-15T10:30:10Z",
+  "data_truncated": true,
+  "data_size_bytes": 150000
 }
 ```
 
-## Large Event Handling
+## Backend Comparison
 
-Events larger than 400KB (Cosmos document size considerations) are handled specially:
-
-1. **Detection**: `len(json.dumps(event).encode()) > 400KB`
-2. **Truncation**: Only summary fields stored:
-   - `event`, `ts`, `lvl`, `turn`
-   - `data_truncated: true`
-   - `data_size_bytes`: original size
-3. **Full data**: Remains in local `events.jsonl` file
-
-This approach:
-- Prevents Cosmos document size limit issues
-- Maintains queryable metadata for all events
-- Preserves full data locally for session-analyst access
+| Feature | DuckDB | SQLite | Cosmos DB |
+|---------|--------|--------|-----------|
+| **Storage** | Local file | Local file | Azure cloud |
+| **Vector Search** | HNSW index | None | DiskANN |
+| **Full-Text** | FTS extension | FTS5 | CONTAINS |
+| **Concurrent** | Single process | Single process | Multi-region |
+| **Team Sync** | No | No | Yes |
+| **Best For** | Single-user, fast | Simple, portable | Team-wide |
 
 ## Authentication
 
-### DefaultAzureCredential (Recommended)
+### Azure (Cosmos + Azure OpenAI)
 
-Uses Azure Identity SDK's credential chain:
-1. Environment variables (AZURE_CLIENT_ID, etc.)
-2. Managed Identity (Azure-hosted services)
-3. Azure CLI (`az login`)
-4. Visual Studio Code
-5. Azure PowerShell
+```bash
+# RBAC authentication (recommended)
+export AMPLIFIER_COSMOS_AUTH_METHOD="default_credential"
+export AZURE_OPENAI_USE_RBAC="true"
+az login  # Authenticates both services
+```
 
-### Key-Based
+### API Keys
 
-Direct Cosmos DB account key for development/testing.
+```bash
+# Cosmos with key
+export AMPLIFIER_COSMOS_AUTH_METHOD="key"
+export AMPLIFIER_COSMOS_KEY="your-key"
 
-**Security Note**: Never commit keys to source control.
+# OpenAI direct
+export OPENAI_API_KEY="sk-..."
+```
 
 ## Error Handling
 
-The library defines specific exceptions:
+All operations use typed exceptions:
 
-| Exception | Cause |
-|-----------|-------|
-| `AuthenticationError` | Cosmos auth failed |
-| `StorageConnectionError` | Network/connection issues |
-| `StorageIOError` | Read/write operations failed |
-| `SessionNotFoundError` | Session doesn't exist |
-
-All exceptions inherit from `SessionStorageError` for unified handling.
+```python
+SessionStorageError        # Base exception
+├── SessionNotFoundError   # Session doesn't exist
+├── SessionExistsError     # Duplicate session
+├── StorageIOError         # Read/write failures
+├── StorageConnectionError # Connection issues
+├── AuthenticationError    # Auth failures
+├── ValidationError        # Invalid data
+├── RewindError           # Rewind operation failed
+└── EventTooLargeError    # Event exceeds size limit
+```
 
 ## Testing
 
-### Unit Tests
+### Unit Tests (No External Dependencies)
 
 ```bash
-uv run pytest tests/test_identity.py -v
+pytest tests/test_duckdb.py tests/test_sqlite.py -v
 ```
 
-### Integration Tests (Requires Cosmos)
+### Integration Tests (Requires Azure)
 
 ```bash
-export AMPLIFIER_COSMOS_ENDPOINT="https://..."
-uv run pytest tests/test_cosmos_file_storage.py -v
+# Set environment variables first
+pytest tests/test_cosmos_backend.py -v
 ```
-
-Integration tests:
-- Create unique test data (UUID-based IDs)
-- Clean up after each test
-- Skip automatically if Cosmos not configured
 
 ## Future Considerations
 
 ### Potential Enhancements
-
-1. **Batch Operations**: Use Cosmos transactional batch for atomic multi-document writes
-2. **Change Feed**: React to Cosmos changes for real-time sync
-3. **TTL Policies**: Auto-expire old session data
-4. **Compression**: Compress large event payloads before storage
+- PostgreSQL backend (pgvector)
+- Compression for large events
+- Cross-backend migration tools
+- Real-time sync via WebSocket
 
 ### Not In Scope
-
-- Local file storage (handled by Amplifier CLI)
-- Real-time WebSocket sync (separate service)
-- Session replay/analysis (session-analyst tool)
+- Direct CLI integration (handled by sync daemon)
+- User authentication (handled by identity providers)
+- Rate limiting (handled by Azure/application layer)

@@ -142,27 +142,33 @@ export AZURE_OPENAI_EMBEDDING_CACHE_SIZE="1000"
 
 ## API Changes
 
-### Backward Compatibility
+### Storage Backend Selection
 
-✅ **Preserved APIs** (work exactly as before):
-- `CosmosFileStorage` - Still available for legacy code
-- `CosmosFileConfig` - No changes
-- Basic sync operations - Same interface
-
-### New APIs
-
-#### Storage Backend Selection
+The library now provides a unified `StorageBackend` interface with multiple implementations:
 
 ```python
-# Old way (still works)
-from amplifier_session_storage import CosmosFileStorage, CosmosFileConfig
-storage = await CosmosFileStorage.create(config)
+from amplifier_session_storage import CosmosBackend, DuckDBBackend, SQLiteBackend
+from amplifier_session_storage import AzureOpenAIEmbeddings
 
-# New way (recommended)
-from amplifier_session_storage import CosmosBackend, AzureOpenAIEmbeddings
-
+# Create embedding provider (optional, enables semantic search)
 embeddings = AzureOpenAIEmbeddings.from_env()
+
+# Choose your backend:
+
+# Cosmos DB (cloud, team-wide sync)
 storage = await CosmosBackend.create(embedding_provider=embeddings)
+
+# DuckDB (local, fast with HNSW vector index)
+storage = await DuckDBBackend.create(
+    config=DuckDBConfig(db_path="~/.amplifier/sessions.duckdb"),
+    embedding_provider=embeddings
+)
+
+# SQLite (local, simplest)
+storage = await SQLiteBackend.create(
+    config=SQLiteConfig(db_path="~/.amplifier/sessions.sqlite"),
+    embedding_provider=embeddings
+)
 ```
 
 #### Search Operations

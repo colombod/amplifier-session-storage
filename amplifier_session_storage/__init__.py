@@ -131,9 +131,6 @@ try:
 except ImportError:
     _has_openai = False
 
-# Keep legacy exports for backward compatibility
-if _has_cosmos:
-    from .cosmos import CosmosFileConfig, CosmosFileStorage  # noqa: F401
 
 __all__ = [
     # Core abstractions
@@ -173,7 +170,7 @@ __all__ = [
 
 # Add optional exports
 if _has_cosmos:
-    __all__.extend(["CosmosBackend", "CosmosConfig", "CosmosFileStorage", "CosmosFileConfig"])
+    __all__.extend(["CosmosBackend", "CosmosConfig"])
 
 if _has_duckdb:
     __all__.extend(["DuckDBBackend", "DuckDBConfig"])

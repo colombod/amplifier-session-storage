@@ -18,7 +18,12 @@ from typing import Any
 import duckdb
 import numpy as np
 
-from ..content_extraction import count_embeddable_content_types
+from ..chunking import chunk_text
+from ..content_extraction import (
+    count_embeddable_content_types,
+    count_tokens,
+    extract_all_embeddable_content,
+)
 from ..embeddings import EmbeddingProvider
 from ..embeddings.mixin import EmbeddingMixin
 from ..exceptions import StorageConnectionError, StorageIOError
@@ -40,17 +45,7 @@ logger = logging.getLogger(__name__)
 # Column Definitions - Centralized for consistency and maintainability
 # =============================================================================
 
-# Vector column names - excluded from standard queries to avoid bloating LLM context
-VECTOR_COLUMNS = frozenset(
-    {
-        "user_query_vector",
-        "assistant_response_vector",
-        "assistant_thinking_vector",
-        "tool_output_vector",
-    }
-)
-
-# Transcript columns for standard read operations (excludes vectors)
+# Transcript columns for standard read operations
 TRANSCRIPT_READ_COLUMNS = (
     "id",
     "user_id",
@@ -62,8 +57,6 @@ TRANSCRIPT_READ_COLUMNS = (
     "content",
     "turn",
     "ts",
-    "embedding_model",
-    "vector_metadata",
 )
 
 # Event columns for standard read operations
@@ -96,27 +89,22 @@ SESSION_READ_COLUMNS = (
     "metadata",
 )
 
-# SQL for creating views that exclude vector columns
-# DuckDB supports SELECT * EXCLUDE syntax, making this especially clean
+# SQL for creating views over the externalized vector schema
 _CREATE_VIEWS_SQL = """
--- View for transcript reads without vectors (most common access pattern)
--- Uses DuckDB's EXCLUDE syntax for automatic vector exclusion
+-- Simple view since transcripts no longer has vectors
 CREATE OR REPLACE VIEW transcript_messages AS
-SELECT * EXCLUDE (
-    user_query_vector,
-    assistant_response_vector,
-    assistant_thinking_vector,
-    tool_output_vector
-)
-FROM transcripts;
+SELECT * FROM transcripts;
 
--- View for vector-only access (used by vector search operations)
-CREATE OR REPLACE VIEW transcript_vectors AS
+-- Join view for search result building
+CREATE OR REPLACE VIEW vectors_with_context AS
 SELECT
-    id, user_id, session_id, sequence,
-    user_query_vector, assistant_response_vector,
-    assistant_thinking_vector, tool_output_vector
-FROM transcripts;
+    v.id as vector_id, v.parent_id, v.content_type,
+    v.chunk_index, v.total_chunks, v.span_start, v.span_end,
+    v.source_text, v.token_count, v.vector, v.embedding_model,
+    t.user_id, t.session_id, t.project_slug, t.role, t.content,
+    t.sequence, t.turn, t.ts
+FROM transcript_vectors v
+JOIN transcripts t ON t.id = v.parent_id;
 """
 
 
@@ -252,8 +240,10 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
                 )
             """)
 
-            # Create transcripts table with multi-vector support
-            self.conn.execute(f"""
+            # Create transcripts table (vector-free since schema v2)
+            # CREATE TABLE IF NOT EXISTS won't modify existing tables, so old
+            # DBs keep their inline vector columns until migration runs.
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS transcripts (
                     id VARCHAR NOT NULL PRIMARY KEY,
                     user_id VARCHAR NOT NULL,
@@ -265,12 +255,6 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
                     content JSON,
                     turn INTEGER,
                     ts TIMESTAMP,
-                    user_query_vector FLOAT[{self.config.vector_dimensions}],
-                    assistant_response_vector FLOAT[{self.config.vector_dimensions}],
-                    assistant_thinking_vector FLOAT[{self.config.vector_dimensions}],
-                    tool_output_vector FLOAT[{self.config.vector_dimensions}],
-                    embedding_model VARCHAR,
-                    vector_metadata JSON,
                     synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -295,6 +279,15 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
                 )
             """)
 
+            # Always create schema_meta and transcript_vectors tables
+            self._create_schema_meta_table()
+            self._create_transcript_vectors_table()
+
+            # Schema versioning and migration
+            schema_version = self._get_schema_version()
+            if schema_version < 2:
+                self._migrate_to_externalized_vectors()
+
             # Create indexes
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, created DESC)"
@@ -311,36 +304,32 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
                 "CREATE INDEX IF NOT EXISTS idx_events_type ON events(user_id, event, ts)"
             )
 
-            # Create HNSW vector indexes for each content type
+            # Create HNSW vector index on transcript_vectors
             try:
                 self.conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_user_query_vector
-                    ON transcripts USING HNSW (user_query_vector)
+                    CREATE INDEX IF NOT EXISTS idx_vectors_hnsw
+                    ON transcript_vectors USING HNSW (vector)
                     WITH (metric = 'cosine')
                 """)
-                self.conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_assistant_response_vector
-                    ON transcripts USING HNSW (assistant_response_vector)
-                    WITH (metric = 'cosine')
-                """)
-                self.conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_assistant_thinking_vector
-                    ON transcripts USING HNSW (assistant_thinking_vector)
-                    WITH (metric = 'cosine')
-                """)
-                self.conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_tool_output_vector
-                    ON transcripts USING HNSW (tool_output_vector)
-                    WITH (metric = 'cosine')
-                """)
-                logger.info("HNSW vector indexes created for all content types")
+                logger.info("HNSW vector index created on transcript_vectors")
             except Exception as e:
-                logger.warning(f"Failed to create HNSW indexes: {e}")
+                logger.warning(f"Failed to create HNSW index: {e}")
 
-            # Create views for vector-free access (best practice per DUCKDB_BEST_PRACTICES.md)
-            # DuckDB's EXCLUDE syntax makes this especially clean
+            # Create indexes on transcript_vectors
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_vectors_parent ON transcript_vectors (parent_id)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_vectors_session "
+                "ON transcript_vectors (user_id, session_id)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_vectors_user ON transcript_vectors (user_id)"
+            )
+
+            # Create views
             self.conn.execute(_CREATE_VIEWS_SQL)
-            logger.debug("Created transcript_messages and transcript_vectors views")
+            logger.debug("Created transcript_messages and vectors_with_context views")
 
         try:
             await asyncio.to_thread(_init)
@@ -359,6 +348,195 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
             await self.embedding_provider.close()
 
         self._initialized = False
+
+    # =========================================================================
+    # Schema Management
+    # =========================================================================
+
+    def _create_schema_meta_table(self) -> None:
+        """Create schema_meta table for version tracking."""
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                key VARCHAR PRIMARY KEY,
+                value VARCHAR
+            )
+        """)
+
+    def _create_transcript_vectors_table(self) -> None:
+        """Create the externalized transcript_vectors table."""
+        self.conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS transcript_vectors (
+                id VARCHAR NOT NULL PRIMARY KEY,
+                parent_id VARCHAR NOT NULL,
+                user_id VARCHAR NOT NULL,
+                session_id VARCHAR NOT NULL,
+                project_slug VARCHAR,
+                content_type VARCHAR NOT NULL,
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                total_chunks INTEGER NOT NULL DEFAULT 1,
+                span_start INTEGER NOT NULL DEFAULT 0,
+                span_end INTEGER NOT NULL,
+                token_count INTEGER NOT NULL,
+                source_text TEXT NOT NULL,
+                vector FLOAT[{self.config.vector_dimensions}],
+                embedding_model VARCHAR,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+    def _get_schema_version(self) -> int:
+        """Get the current schema version (defaults to 1 for pre-versioned DBs)."""
+        try:
+            result = self.conn.execute(
+                "SELECT value FROM schema_meta WHERE key = 'version'"
+            ).fetchone()
+            return int(result[0]) if result else 1
+        except Exception:
+            return 1
+
+    def _set_schema_version(self, version: int) -> None:
+        """Set the schema version."""
+        self.conn.execute(
+            """
+            INSERT INTO schema_meta (key, value) VALUES ('version', ?)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            [str(version)],
+        )
+
+    def _migrate_to_externalized_vectors(self) -> None:
+        """Migrate inline vectors from transcripts to the transcript_vectors table."""
+        logger.info("Migrating inline vectors to transcript_vectors table...")
+
+        # Ensure new tables exist
+        self._create_transcript_vectors_table()
+
+        # Check if transcript_vectors already has data (idempotency)
+        count = self.conn.execute("SELECT COUNT(*) FROM transcript_vectors").fetchone()[0]
+        if count > 0:
+            logger.info(f"transcript_vectors already has {count} rows, skipping migration")
+            self._set_schema_version(2)
+            return
+
+        # Check if old vector columns exist
+        columns = [col[1] for col in self.conn.execute("PRAGMA table_info(transcripts)").fetchall()]
+        if "user_query_vector" not in columns:
+            logger.info("No inline vector columns found, skipping migration")
+            self._set_schema_version(2)
+            return
+
+        # Read all transcript rows that have at least one vector
+        rows = self.conn.execute("""
+            SELECT id, user_id, session_id, project_slug, role, content,
+                   user_query_vector, assistant_response_vector,
+                   assistant_thinking_vector, tool_output_vector,
+                   embedding_model
+            FROM transcripts
+            WHERE user_query_vector IS NOT NULL
+               OR assistant_response_vector IS NOT NULL
+               OR assistant_thinking_vector IS NOT NULL
+               OR tool_output_vector IS NOT NULL
+        """).fetchall()
+
+        migrated = 0
+        for row in rows:
+            parent_id = row[0]
+            user_id = row[1]
+            session_id = row[2]
+            project_slug = row[3]
+            role = row[4]
+            content = row[5]
+            vectors = {
+                "user_query": row[6],
+                "assistant_response": row[7],
+                "assistant_thinking": row[8],
+                "tool_output": row[9],
+            }
+            embedding_model = row[10]
+
+            # Re-extract content to get correct source_text
+            # Parse content from JSON if it's a string
+            if isinstance(content, str):
+                try:
+                    parsed_content = json.loads(content)
+                except (json.JSONDecodeError, TypeError):
+                    parsed_content = content
+            else:
+                parsed_content = content
+
+            message = {"role": role, "content": parsed_content}
+            extracted = extract_all_embeddable_content(message)
+
+            for content_type, vector in vectors.items():
+                if vector is None:
+                    continue
+
+                source_text = extracted.get(content_type) or ""
+                if not source_text:
+                    # Fallback: use str(content) if extraction returned None
+                    source_text = str(content)[:1000] if content else ""
+
+                token_count_val = count_tokens(source_text) if source_text else 0
+                vector_id = f"{parent_id}_{content_type}_0"
+
+                vec_literal = self._format_vector_literal(vector)
+                self.conn.execute(
+                    f"""
+                    INSERT INTO transcript_vectors (
+                        id, parent_id, user_id, session_id, project_slug,
+                        content_type, chunk_index, total_chunks,
+                        span_start, span_end, token_count,
+                        source_text, vector, embedding_model
+                    ) VALUES (
+                        ?, ?, ?, ?, ?,
+                        ?, 0, 1,
+                        0, ?, ?,
+                        ?, {vec_literal}, ?
+                    )
+                    """,
+                    [
+                        vector_id,
+                        parent_id,
+                        user_id,
+                        session_id,
+                        project_slug,
+                        content_type,
+                        len(source_text),
+                        token_count_val,
+                        source_text,
+                        embedding_model,
+                    ],
+                )
+                migrated += 1
+
+        # Drop old vector columns
+        for col in [
+            "user_query_vector",
+            "assistant_response_vector",
+            "assistant_thinking_vector",
+            "tool_output_vector",
+            "embedding_model",
+            "vector_metadata",
+        ]:
+            try:
+                self.conn.execute(f"ALTER TABLE transcripts DROP COLUMN IF EXISTS {col}")
+            except Exception as e:
+                logger.warning(f"Could not drop column {col}: {e}")
+
+        # Drop old HNSW indexes
+        for idx in [
+            "idx_user_query_vector",
+            "idx_assistant_response_vector",
+            "idx_assistant_thinking_vector",
+            "idx_tool_output_vector",
+        ]:
+            try:
+                self.conn.execute(f"DROP INDEX IF EXISTS {idx}")
+            except Exception:
+                pass
+
+        self._set_schema_version(2)
+        logger.info(f"Migration complete: {migrated} vectors moved to transcript_vectors")
 
     # =========================================================================
     # Session Metadata Operations
@@ -511,6 +689,12 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
             # Delete in transaction
             self.conn.begin()
             try:
+                # Delete transcript vectors
+                self.conn.execute(
+                    "DELETE FROM transcript_vectors WHERE user_id = ? AND session_id = ?",
+                    [user_id, session_id],
+                )
+
                 # Delete transcripts
                 self.conn.execute(
                     "DELETE FROM transcripts WHERE user_id = ? AND session_id = ?",
@@ -559,102 +743,277 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
         start_sequence: int = 0,
         embeddings: dict[str, list[list[float] | None]] | None = None,
     ) -> int:
-        """Sync transcript lines with optional multi-vector embeddings."""
+        """Sync transcript lines with externalized vector storage.
+
+        Step 1: Store transcript rows (content only, no vectors).
+        Step 2: Generate and store vectors in transcript_vectors table.
+        """
         if not lines:
             return 0
 
-        # Generate embeddings if not provided and we have a provider
-        if embeddings is None and self.embedding_provider:
-            embeddings = await self._generate_multi_vector_embeddings(lines)
-            counts = count_embeddable_content_types(lines)
-            logger.info(
-                f"Generated embeddings: {counts['user_query']} user, "
-                f"{counts['assistant_response']} responses, "
-                f"{counts['assistant_thinking']} thinking, "
-                f"{counts['tool_output']} tool"
+        # Step 1: Store transcript rows (content only)
+        stored = await asyncio.to_thread(
+            self._store_transcript_rows,
+            user_id,
+            host_id,
+            project_slug,
+            session_id,
+            lines,
+            start_sequence,
+        )
+
+        # Step 2: Generate and store vectors
+        if self.embedding_provider and embeddings is None:
+            await self._generate_and_store_vectors(
+                user_id, project_slug, session_id, lines, start_sequence
+            )
+        elif embeddings is not None:
+            # Pre-computed embeddings (from sync daemon) - store as single-chunk vectors
+            await asyncio.to_thread(
+                self._store_precomputed_vectors,
+                user_id,
+                project_slug,
+                session_id,
+                lines,
+                start_sequence,
+                embeddings,
             )
 
-        def _sync() -> int:
-            if self.conn is None:
-                raise StorageIOError("sync_transcript", cause=RuntimeError("Not initialized"))
+        return stored
 
-            synced = 0
-            for i, line in enumerate(lines):
-                sequence = start_sequence + i
-                doc_id = f"{session_id}_msg_{sequence}"
+    def _store_transcript_rows(
+        self,
+        user_id: str,
+        host_id: str,
+        project_slug: str,
+        session_id: str,
+        lines: list[dict[str, Any]],
+        start_sequence: int,
+    ) -> int:
+        """Store transcript rows (content only, no vectors)."""
+        if self.conn is None:
+            raise StorageIOError("sync_transcript", cause=RuntimeError("Not initialized"))
 
-                # Extract vectors for each content type
-                user_query_vec = None
-                assistant_response_vec = None
-                assistant_thinking_vec = None
-                tool_output_vec = None
+        synced = 0
+        for i, line in enumerate(lines):
+            sequence = start_sequence + i
+            doc_id = f"{session_id}_msg_{sequence}"
 
-                if embeddings:
-                    user_query_vec = embeddings.get("user_query", [None] * len(lines))[i]
-                    assistant_response_vec = embeddings.get(
-                        "assistant_response", [None] * len(lines)
-                    )[i]
-                    assistant_thinking_vec = embeddings.get(
-                        "assistant_thinking", [None] * len(lines)
-                    )[i]
-                    tool_output_vec = embeddings.get("tool_output", [None] * len(lines))[i]
+            # Store content as JSON (handles both string and array formats)
+            content = line.get("content")
+            content_json = json.dumps(content) if content is not None else None
 
-                # Build vector metadata
-                vector_metadata = {
-                    "has_user_query": user_query_vec is not None,
-                    "has_assistant_response": assistant_response_vec is not None,
-                    "has_assistant_thinking": assistant_thinking_vec is not None,
-                    "has_tool_output": tool_output_vec is not None,
-                }
+            now = datetime.now(UTC).isoformat()
+            self.conn.execute(
+                """
+                INSERT INTO transcripts (
+                    id, user_id, host_id, project_slug, session_id, sequence,
+                    role, content, turn, ts, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (id) DO UPDATE SET
+                    content = EXCLUDED.content,
+                    role = EXCLUDED.role,
+                    turn = EXCLUDED.turn,
+                    ts = EXCLUDED.ts,
+                    synced_at = EXCLUDED.synced_at
+                """,
+                [
+                    doc_id,
+                    user_id,
+                    host_id,
+                    project_slug,
+                    session_id,
+                    sequence,
+                    line.get("role"),
+                    content_json,
+                    line.get("turn"),
+                    line.get("ts") or line.get("timestamp"),
+                    now,
+                ],
+            )
+            synced += 1
 
-                # Store content as JSON (handles both string and array formats)
-                content = line.get("content")
-                content_json = json.dumps(content) if content is not None else None
+        return synced
 
-                self.conn.execute(
-                    """
-                    INSERT INTO transcripts (
-                        id, user_id, host_id, project_slug, session_id, sequence,
-                        role, content, turn, ts,
-                        user_query_vector, assistant_response_vector,
-                        assistant_thinking_vector, tool_output_vector,
-                        embedding_model, vector_metadata, synced_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (id) DO UPDATE SET
-                        content = EXCLUDED.content,
-                        user_query_vector = EXCLUDED.user_query_vector,
-                        assistant_response_vector = EXCLUDED.assistant_response_vector,
-                        assistant_thinking_vector = EXCLUDED.assistant_thinking_vector,
-                        tool_output_vector = EXCLUDED.tool_output_vector,
-                        embedding_model = EXCLUDED.embedding_model,
-                        vector_metadata = EXCLUDED.vector_metadata,
-                        synced_at = EXCLUDED.synced_at
-                    """,
-                    [
-                        doc_id,
-                        user_id,
-                        host_id,
-                        project_slug,
-                        session_id,
-                        sequence,
-                        line.get("role"),
-                        content_json,
-                        line.get("turn"),
-                        line.get("ts") or line.get("timestamp"),
-                        user_query_vec,
-                        assistant_response_vec,
-                        assistant_thinking_vec,
-                        tool_output_vec,
-                        self.embedding_provider.model_name if self.embedding_provider else None,
-                        json.dumps(vector_metadata),
-                        datetime.now(UTC).isoformat(),
-                    ],
+    async def _generate_and_store_vectors(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+        lines: list[dict[str, Any]],
+        start_sequence: int,
+    ) -> None:
+        """Extract content, chunk, embed, and store vectors."""
+        all_vector_records: list[dict[str, Any]] = []
+        all_texts_to_embed: list[str] = []
+
+        for i, line in enumerate(lines):
+            sequence = start_sequence + i
+            parent_id = f"{session_id}_msg_{sequence}"
+            content = extract_all_embeddable_content(line)
+
+            for content_type, text in content.items():
+                if text is None:
+                    continue
+
+                chunks = chunk_text(text, content_type)
+
+                for chunk in chunks:
+                    vector_id = f"{parent_id}_{content_type}_{chunk.chunk_index}"
+                    record = {
+                        "id": vector_id,
+                        "parent_id": parent_id,
+                        "user_id": user_id,
+                        "session_id": session_id,
+                        "project_slug": project_slug,
+                        "content_type": content_type,
+                        "chunk_index": chunk.chunk_index,
+                        "total_chunks": chunk.total_chunks,
+                        "span_start": chunk.span_start,
+                        "span_end": chunk.span_end,
+                        "token_count": chunk.token_count,
+                        "source_text": chunk.text,
+                        "embedding_model": (
+                            self.embedding_provider.model_name if self.embedding_provider else None
+                        ),
+                    }
+                    all_vector_records.append(record)
+                    all_texts_to_embed.append(chunk.text)
+
+        if not all_texts_to_embed:
+            return
+
+        # Batch embed all chunk texts (all entries are non-None strings)
+        texts_for_embed: list[str | None] = list(all_texts_to_embed)
+        embeddings_list = await self._embed_non_none(texts_for_embed)
+
+        # Attach vectors to records
+        for idx, embedding in enumerate(embeddings_list):
+            all_vector_records[idx]["vector"] = embedding
+
+        # Bulk store vectors
+        await asyncio.to_thread(self._store_vector_records, all_vector_records)
+
+        total_chunks = len(all_vector_records)
+        total_messages = len(lines)
+        counts = count_embeddable_content_types(lines)
+        logger.info(
+            f"Stored {total_chunks} vectors for {total_messages} messages "
+            f"in session {session_id} "
+            f"({counts['user_query']} user, "
+            f"{counts['assistant_response']} responses, "
+            f"{counts['assistant_thinking']} thinking, "
+            f"{counts['tool_output']} tool)"
+        )
+
+    def _store_vector_records(self, records: list[dict[str, Any]]) -> None:
+        """Store vector records in transcript_vectors table.
+
+        Uses delete-before-insert for idempotent re-sync.
+        """
+        if not records:
+            return
+
+        # Group by parent_id for cleanup
+        parent_ids = {r["parent_id"] for r in records}
+
+        # Delete existing vectors for these parents
+        for parent_id in parent_ids:
+            self.conn.execute(
+                "DELETE FROM transcript_vectors WHERE parent_id = ?",
+                [parent_id],
+            )
+
+        # Insert new vectors
+        for record in records:
+            vector = record.get("vector")
+            if vector is not None:
+                vec_sql = self._format_vector_literal(vector)
+            else:
+                vec_sql = "NULL"
+
+            self.conn.execute(
+                f"""
+                INSERT INTO transcript_vectors (
+                    id, parent_id, user_id, session_id, project_slug,
+                    content_type, chunk_index, total_chunks,
+                    span_start, span_end, token_count,
+                    source_text, vector, embedding_model
+                ) VALUES (
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, ?,
+                    ?, {vec_sql}, ?
                 )
-                synced += 1
+                """,
+                [
+                    record["id"],
+                    record["parent_id"],
+                    record["user_id"],
+                    record["session_id"],
+                    record["project_slug"],
+                    record["content_type"],
+                    record["chunk_index"],
+                    record["total_chunks"],
+                    record["span_start"],
+                    record["span_end"],
+                    record["token_count"],
+                    record["source_text"],
+                    record["embedding_model"],
+                ],
+            )
 
-            return synced
+    def _store_precomputed_vectors(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+        lines: list[dict[str, Any]],
+        start_sequence: int,
+        embeddings: dict[str, list[list[float] | None]],
+    ) -> None:
+        """Store pre-computed embeddings as single-chunk vector records."""
+        records: list[dict[str, Any]] = []
 
-        return await asyncio.to_thread(_sync)
+        for i, line in enumerate(lines):
+            sequence = start_sequence + i
+            parent_id = f"{session_id}_msg_{sequence}"
+            content = extract_all_embeddable_content(line)
+
+            for content_type in [
+                "user_query",
+                "assistant_response",
+                "assistant_thinking",
+                "tool_output",
+            ]:
+                emb_list = embeddings.get(content_type, [])
+                vector = emb_list[i] if i < len(emb_list) else None
+                if vector is None:
+                    continue
+
+                source_text = content.get(content_type) or ""
+                records.append(
+                    {
+                        "id": f"{parent_id}_{content_type}_0",
+                        "parent_id": parent_id,
+                        "user_id": user_id,
+                        "session_id": session_id,
+                        "project_slug": project_slug,
+                        "content_type": content_type,
+                        "chunk_index": 0,
+                        "total_chunks": 1,
+                        "span_start": 0,
+                        "span_end": len(source_text),
+                        "token_count": count_tokens(source_text) if source_text else 0,
+                        "source_text": source_text,
+                        "vector": vector,
+                        "embedding_model": (
+                            self.embedding_provider.model_name if self.embedding_provider else None
+                        ),
+                    }
+                )
+
+        self._store_vector_records(records)
 
     async def get_transcript_lines(
         self,
@@ -806,21 +1165,21 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
 
         query_vector = await self.embedding_provider.embed_text(options.query)
 
-        # Translate search_in_* flags to vector_columns
-        vector_columns: list[str] | None = []
+        # Translate search_in_* flags to content_type filters
+        content_types: list[str] | None = []
         if options.search_in_user:
-            vector_columns.append("user_query_vector")
+            content_types.append("user_query")
         if options.search_in_assistant:
-            vector_columns.append("assistant_response_vector")
+            content_types.append("assistant_response")
         if options.search_in_thinking:
-            vector_columns.append("assistant_thinking_vector")
+            content_types.append("assistant_thinking")
         if options.search_in_tool:
-            vector_columns.append("tool_output_vector")
-        if not vector_columns:
-            vector_columns = None  # None = search all
+            content_types.append("tool_output")
+        if not content_types:
+            content_types = None  # None = search all
 
         return await self.vector_search(
-            user_id, query_vector, options.filters, limit, vector_columns=vector_columns
+            user_id, query_vector, options.filters, limit, content_types=content_types
         )
 
     async def _hybrid_search_transcripts(
@@ -888,7 +1247,7 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
         """
         Fetch first available embedding for a transcript message.
 
-        Returns the first non-null vector from any of the 4 vector columns.
+        Returns the first non-null vector from transcript_vectors.
         Used primarily for testing.
         """
 
@@ -896,21 +1255,20 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
             if self.conn is None:
                 return None
 
+            parent_id = f"{session_id}_msg_{sequence}"
             result = self.conn.execute(
                 """
-                SELECT user_query_vector, assistant_response_vector,
-                       assistant_thinking_vector, tool_output_vector
-                FROM transcripts
-                WHERE user_id = ? AND session_id = ? AND sequence = ?
+                SELECT vector
+                FROM transcript_vectors
+                WHERE parent_id = ? AND user_id = ? AND vector IS NOT NULL
+                ORDER BY chunk_index
+                LIMIT 1
                 """,
-                [user_id, session_id, sequence],
+                [parent_id, user_id],
             ).fetchone()
 
-            if result:
-                # Return first non-null vector
-                for vec in result:
-                    if vec is not None:
-                        return vec
+            if result and result[0] is not None:
+                return result[0]
             return None
 
         return await asyncio.to_thread(_get)
@@ -1277,38 +1635,42 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
         query_vector: list[float],
         filters: SearchFilters | None = None,
         top_k: int = 100,
-        vector_columns: list[str] | None = None,
+        content_types: list[str] | None = None,
     ) -> list[SearchResult]:
         """
-        Perform multi-vector similarity search using DuckDB VSS.
+        Perform vector similarity search using the transcript_vectors table.
 
-        Searches across specified vector columns and returns best matches.
+        Searches across the externalized vector table and joins back to
+        transcripts for message context.
 
         Args:
             user_id: User identifier
             query_vector: Query embedding vector
             filters: Optional search filters
             top_k: Number of results to return
-            vector_columns: Which vector columns to search. Default: all non-null vectors.
-                Options: ["user_query_vector", "assistant_response_vector",
-                          "assistant_thinking_vector", "tool_output_vector"]
+            content_types: Which content types to search. Default: all.
+                Options: ["user_query", "assistant_response",
+                          "assistant_thinking", "tool_output"]
         """
-        if vector_columns is None:
-            # Search all vector columns by default
-            vector_columns = [
-                "user_query_vector",
-                "assistant_response_vector",
-                "assistant_thinking_vector",
-                "tool_output_vector",
-            ]
 
         def _search() -> list[SearchResult]:
             if self.conn is None:
                 raise StorageIOError("vector_search", cause=RuntimeError("Not initialized"))
 
-            # Build base WHERE clause
+            vec_literal = self._format_vector_literal(query_vector)
+
+            # Build WHERE clause on the vectors_with_context view
             where_parts = ["user_id = ?"]
             params: list[Any] = [user_id]
+
+            # Filter by content type
+            if content_types:
+                placeholders = ", ".join(["?"] * len(content_types))
+                where_parts.append(f"content_type IN ({placeholders})")
+                params.extend(content_types)
+
+            # Require non-null vectors
+            where_parts.append("vector IS NOT NULL")
 
             if filters:
                 if filters.project_slug:
@@ -1323,57 +1685,50 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
                     where_parts.append("ts <= ?")
                     params.append(filters.end_date)
 
-            # DuckDB vector search - use GREATEST to find best match across all vector columns
-            vec_literal = self._format_vector_literal(query_vector)
-
-            # Build similarity expressions for each vector column
-            similarity_exprs = []
-            for vec_col in vector_columns:
-                similarity_exprs.append(
-                    f"CASE WHEN {vec_col} IS NOT NULL "
-                    f"THEN array_cosine_similarity({vec_col}, {vec_literal}) "
-                    f"ELSE 0.0 END"
-                )
-
-            # Use GREATEST to find the maximum similarity across all vectors
-            max_similarity = f"GREATEST({', '.join(similarity_exprs)})"
-
-            # Ensure at least one vector is not null
-            any_vector_not_null = " OR ".join([f"{v} IS NOT NULL" for v in vector_columns])
-            where_parts.append(f"({any_vector_not_null})")
-
             where_clause = " AND ".join(where_parts)
 
+            # Query vectors_with_context view, deduplicate by parent message
+            # taking the best similarity score per message
             query = f"""
-                SELECT id, session_id, project_slug, sequence, content, role, turn, ts,
-                       {max_similarity} AS similarity
-                FROM transcripts
+                SELECT parent_id, session_id, project_slug, sequence,
+                       content, role, turn, ts, content_type,
+                       array_cosine_similarity(vector, {vec_literal}) AS similarity
+                FROM vectors_with_context
                 WHERE {where_clause}
                 ORDER BY similarity DESC
                 LIMIT ?
             """
 
-            params.append(top_k)
+            params.append(top_k * 3)  # Over-fetch to allow dedup
 
             results_raw = self.conn.execute(query, params).fetchall()
 
-            return [
-                SearchResult(
-                    session_id=row[1],
-                    project_slug=row[2],
-                    sequence=row[3],
-                    content=json.loads(row[4]) if row[4] else "",
-                    metadata={
-                        "id": row[0],
-                        "role": row[5],
-                        "turn": row[6],
-                        "ts": row[7],
-                    },
-                    score=float(row[8]) if row[8] is not None else 0.0,
-                    source="semantic",
-                )
-                for row in results_raw
-            ]
+            # Deduplicate by parent message, keeping best score
+            seen: dict[str, SearchResult] = {}
+            for row in results_raw:
+                parent_id = row[0]
+                score = float(row[9]) if row[9] is not None else 0.0
+
+                if parent_id not in seen or score > seen[parent_id].score:
+                    seen[parent_id] = SearchResult(
+                        session_id=row[1],
+                        project_slug=row[2],
+                        sequence=row[3],
+                        content=json.loads(row[4]) if row[4] else "",
+                        metadata={
+                            "id": parent_id,
+                            "role": row[5],
+                            "turn": row[6],
+                            "ts": row[7],
+                            "content_type": row[8],
+                        },
+                        score=score,
+                        source="semantic",
+                    )
+
+            # Sort by score descending and limit
+            results = sorted(seen.values(), key=lambda r: r.score, reverse=True)
+            return results[:top_k]
 
         return await asyncio.to_thread(_search)
 

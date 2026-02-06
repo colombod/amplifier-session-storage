@@ -2,13 +2,19 @@
 Abstract base classes for storage backends.
 
 All storage implementations (Cosmos, DuckDB, SQLite) must implement these interfaces.
+
+The backend protocol is split into focused ABCs for granular dependency control:
+- StorageReader: read, query, and search operations
+- StorageWriter: write and sync operations
+- StorageAdmin: administrative operations
+- StorageBackend: composed type combining all three (backward-compatible)
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Self
 
 
 @dataclass
@@ -173,21 +179,13 @@ class SessionSyncStats:
     transcript_ts_range: tuple[str | None, str | None]  # (earliest, latest)
 
 
-class StorageBackend(ABC):
-    """
-    Abstract base for all storage backends.
+# =============================================================================
+# Protocol ABCs
+# =============================================================================
 
-    Implementations must support:
-    - Session metadata storage and retrieval
-    - Transcript line storage and search
-    - Event line storage and search
-    - Vector embeddings for semantic search
-    - Graceful degradation when embeddings unavailable
 
-    Note on user_id parameter:
-    - Empty string ("") means search across ALL users (team-wide)
-    - Non-empty string filters to that specific user
-    """
+class _StorageLifecycle(ABC):
+    """Shared lifecycle management for storage backends."""
 
     @abstractmethod
     async def initialize(self) -> None:
@@ -199,7 +197,7 @@ class StorageBackend(ABC):
         """Close connections and cleanup resources."""
         pass
 
-    async def __aenter__(self) -> StorageBackend:
+    async def __aenter__(self) -> Self:
         """Async context manager entry."""
         await self.initialize()
         return self
@@ -208,26 +206,17 @@ class StorageBackend(ABC):
         """Async context manager exit."""
         await self.close()
 
-    # =========================================================================
-    # Session Metadata Operations
-    # =========================================================================
 
-    @abstractmethod
-    async def upsert_session_metadata(
-        self,
-        user_id: str,
-        host_id: str,
-        metadata: dict[str, Any],
-    ) -> None:
-        """
-        Upsert session metadata.
+class StorageReader(_StorageLifecycle):
+    """Read, query, and search operations.
 
-        Args:
-            user_id: User identifier
-            host_id: Host/device identifier
-            metadata: Session metadata dict (must include session_id)
-        """
-        pass
+    Used by consumers that only need to retrieve and search session data
+    (e.g., session-analyst search tool, analytics dashboards).
+    """
+
+    # =========================================================================
+    # Session Read
+    # =========================================================================
 
     @abstractmethod
     async def get_session_metadata(
@@ -238,67 +227,9 @@ class StorageBackend(ABC):
         """Get session metadata by ID."""
         pass
 
-    @abstractmethod
-    async def search_sessions(
-        self,
-        user_id: str,
-        filters: SearchFilters,
-        limit: int = 100,
-    ) -> list[dict[str, Any]]:
-        """
-        Search sessions with advanced filters.
-
-        Args:
-            user_id: User identifier
-            filters: Search filters (project, date range, bundle, etc.)
-            limit: Maximum number of results
-
-        Returns:
-            List of session metadata dicts matching criteria
-        """
-        pass
-
-    @abstractmethod
-    async def delete_session(
-        self,
-        user_id: str,
-        project_slug: str,
-        session_id: str,
-    ) -> bool:
-        """Delete a session and all its data."""
-        pass
-
     # =========================================================================
-    # Transcript Operations
+    # Transcript Read
     # =========================================================================
-
-    @abstractmethod
-    async def sync_transcript_lines(
-        self,
-        user_id: str,
-        host_id: str,
-        project_slug: str,
-        session_id: str,
-        lines: list[dict[str, Any]],
-        start_sequence: int = 0,
-        embeddings: dict[str, list[list[float] | None]] | None = None,
-    ) -> int:
-        """
-        Sync transcript lines with optional embeddings.
-
-        Args:
-            user_id: User identifier
-            host_id: Host/device identifier
-            project_slug: Project slug
-            session_id: Session identifier
-            lines: Transcript message dicts
-            start_sequence: Starting sequence number
-            embeddings: Optional pre-computed embeddings (same order as lines)
-
-        Returns:
-            Number of lines synced
-        """
-        pass
 
     @abstractmethod
     async def get_transcript_lines(
@@ -309,26 +240,6 @@ class StorageBackend(ABC):
         after_sequence: int = -1,
     ) -> list[dict[str, Any]]:
         """Get transcript lines for a session."""
-        pass
-
-    @abstractmethod
-    async def search_transcripts(
-        self,
-        user_id: str,
-        options: TranscriptSearchOptions,
-        limit: int = 100,
-    ) -> list[SearchResult]:
-        """
-        Search transcript messages with hybrid search support.
-
-        Args:
-            user_id: User identifier
-            options: Search configuration (includes mmr_lambda for diversity control)
-            limit: Maximum results
-
-        Returns:
-            List of search results with relevance scores
-        """
         pass
 
     @abstractmethod
@@ -373,35 +284,50 @@ class StorageBackend(ABC):
         """
         pass
 
-    # =========================================================================
-    # Event Operations
-    # =========================================================================
-
     @abstractmethod
-    async def sync_event_lines(
+    async def get_message_context(
         self,
-        user_id: str,
-        host_id: str,
-        project_slug: str,
         session_id: str,
-        lines: list[dict[str, Any]],
-        start_sequence: int = 0,
-    ) -> int:
+        sequence: int,
+        user_id: str = "",
+        before: int = 5,
+        after: int = 5,
+        include_tool_outputs: bool = True,
+    ) -> MessageContext:
         """
-        Sync event lines to storage.
+        Get context window around a specific message by sequence.
+
+        Use this when:
+        - Turn is null in the transcript
+        - You need precise sequence-based navigation
+        - You want to expand search results by sequence
 
         Args:
-            user_id: User identifier
-            host_id: Host/device identifier
-            project_slug: Project slug
             session_id: Session identifier
-            lines: Event dicts
-            start_sequence: Starting sequence number
+            sequence: Target sequence number
+            user_id: User ID (empty = search all users for session)
+            before: Messages to include before target (default 5)
+            after: Messages to include after target (default 5)
+            include_tool_outputs: Include tool outputs (default True)
 
         Returns:
-            Number of lines synced
+            MessageContext with surrounding messages
+
+        Example:
+            # Search returns sequence 42 as relevant
+            context = await storage.get_message_context(
+                session_id="sess123",
+                sequence=42,
+                before=3,  # Get sequences 39, 40, 41
+                after=2,   # Get sequences 43, 44
+            )
+            # Now have full context: sequences 39-44
         """
         pass
+
+    # =========================================================================
+    # Event Read
+    # =========================================================================
 
     @abstractmethod
     async def get_event_lines(
@@ -412,6 +338,50 @@ class StorageBackend(ABC):
         after_sequence: int = -1,
     ) -> list[dict[str, Any]]:
         """Get event lines for a session (may return summaries for large events)."""
+        pass
+
+    # =========================================================================
+    # Search
+    # =========================================================================
+
+    @abstractmethod
+    async def search_sessions(
+        self,
+        user_id: str,
+        filters: SearchFilters,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        Search sessions with advanced filters.
+
+        Args:
+            user_id: User identifier
+            filters: Search filters (project, date range, bundle, etc.)
+            limit: Maximum number of results
+
+        Returns:
+            List of session metadata dicts matching criteria
+        """
+        pass
+
+    @abstractmethod
+    async def search_transcripts(
+        self,
+        user_id: str,
+        options: TranscriptSearchOptions,
+        limit: int = 100,
+    ) -> list[SearchResult]:
+        """
+        Search transcript messages with hybrid search support.
+
+        Args:
+            user_id: User identifier
+            options: Search configuration (includes mmr_lambda for diversity control)
+            limit: Maximum results
+
+        Returns:
+            List of search results with relevance scores
+        """
         pass
 
     @abstractmethod
@@ -451,39 +421,9 @@ class StorageBackend(ABC):
         """
         pass
 
-    # =========================================================================
-    # Vector/Embedding Operations
-    # =========================================================================
-
     @abstractmethod
     async def supports_vector_search(self) -> bool:
         """Check if this backend supports vector similarity search."""
-        pass
-
-    @abstractmethod
-    async def upsert_embeddings(
-        self,
-        user_id: str,
-        project_slug: str,
-        session_id: str,
-        embeddings: list[dict[str, Any]],
-    ) -> int:
-        """
-        Upsert embeddings for semantic search.
-
-        Args:
-            user_id: User identifier
-            project_slug: Project slug
-            session_id: Session identifier
-            embeddings: List of embedding dicts with:
-                - sequence: int
-                - text: str (original text)
-                - vector: list[float] (embedding vector)
-                - metadata: dict (role, turn, etc.)
-
-        Returns:
-            Number of embeddings stored
-        """
         pass
 
     @abstractmethod
@@ -509,45 +449,7 @@ class StorageBackend(ABC):
         pass
 
     # =========================================================================
-    # Analytics & Aggregations
-    # =========================================================================
-
-    @abstractmethod
-    async def get_session_statistics(
-        self,
-        user_id: str,
-        filters: SearchFilters | None = None,
-    ) -> dict[str, Any]:
-        """
-        Get aggregate statistics across sessions.
-
-        Returns dict with:
-            - total_sessions: int
-            - total_messages: int
-            - total_events: int
-            - sessions_by_project: dict[str, int]
-            - sessions_by_bundle: dict[str, int]
-            - events_by_type: dict[str, int]
-            - tools_used: dict[str, int]
-        """
-        pass
-
-    @abstractmethod
-    async def get_session_sync_stats(
-        self,
-        user_id: str,
-        project_slug: str,
-        session_id: str,
-    ) -> SessionSyncStats:
-        """Get lightweight sync statistics for a session.
-
-        Returns counts and timestamp ranges for events and transcripts
-        using aggregate queries. Much cheaper than loading all documents.
-        """
-        ...
-
-    # =========================================================================
-    # Discovery APIs
+    # Discovery / Analytics
     # =========================================================================
 
     @abstractmethod
@@ -615,47 +517,176 @@ class StorageBackend(ABC):
         """
         pass
 
-    # =========================================================================
-    # Sequence-Based Navigation
-    # =========================================================================
-
     @abstractmethod
-    async def get_message_context(
+    async def get_session_statistics(
         self,
-        session_id: str,
-        sequence: int,
-        user_id: str = "",
-        before: int = 5,
-        after: int = 5,
-        include_tool_outputs: bool = True,
-    ) -> MessageContext:
+        user_id: str,
+        filters: SearchFilters | None = None,
+    ) -> dict[str, Any]:
         """
-        Get context window around a specific message by sequence.
+        Get aggregate statistics across sessions.
 
-        Use this when:
-        - Turn is null in the transcript
-        - You need precise sequence-based navigation
-        - You want to expand search results by sequence
-
-        Args:
-            session_id: Session identifier
-            sequence: Target sequence number
-            user_id: User ID (empty = search all users for session)
-            before: Messages to include before target (default 5)
-            after: Messages to include after target (default 5)
-            include_tool_outputs: Include tool outputs (default True)
-
-        Returns:
-            MessageContext with surrounding messages
-
-        Example:
-            # Search returns sequence 42 as relevant
-            context = await storage.get_message_context(
-                session_id="sess123",
-                sequence=42,
-                before=3,  # Get sequences 39, 40, 41
-                after=2,   # Get sequences 43, 44
-            )
-            # Now have full context: sequences 39-44
+        Returns dict with:
+            - total_sessions: int
+            - total_messages: int
+            - total_events: int
+            - sessions_by_project: dict[str, int]
+            - sessions_by_bundle: dict[str, int]
+            - events_by_type: dict[str, int]
+            - tools_used: dict[str, int]
         """
         pass
+
+
+class StorageWriter(_StorageLifecycle):
+    """Write and sync operations.
+
+    Used by consumers that ingest session data
+    (e.g., sync daemon, session upload server).
+    """
+
+    @abstractmethod
+    async def upsert_session_metadata(
+        self,
+        user_id: str,
+        host_id: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        """
+        Upsert session metadata.
+
+        Args:
+            user_id: User identifier
+            host_id: Host/device identifier
+            metadata: Session metadata dict (must include session_id)
+        """
+        pass
+
+    @abstractmethod
+    async def sync_transcript_lines(
+        self,
+        user_id: str,
+        host_id: str,
+        project_slug: str,
+        session_id: str,
+        lines: list[dict[str, Any]],
+        start_sequence: int = 0,
+        embeddings: dict[str, list[list[float] | None]] | None = None,
+    ) -> int:
+        """
+        Sync transcript lines with optional embeddings.
+
+        Args:
+            user_id: User identifier
+            host_id: Host/device identifier
+            project_slug: Project slug
+            session_id: Session identifier
+            lines: Transcript message dicts
+            start_sequence: Starting sequence number
+            embeddings: Optional pre-computed embeddings (same order as lines)
+
+        Returns:
+            Number of lines synced
+        """
+        pass
+
+    @abstractmethod
+    async def sync_event_lines(
+        self,
+        user_id: str,
+        host_id: str,
+        project_slug: str,
+        session_id: str,
+        lines: list[dict[str, Any]],
+        start_sequence: int = 0,
+    ) -> int:
+        """
+        Sync event lines to storage.
+
+        Args:
+            user_id: User identifier
+            host_id: Host/device identifier
+            project_slug: Project slug
+            session_id: Session identifier
+            lines: Event dicts
+            start_sequence: Starting sequence number
+
+        Returns:
+            Number of lines synced
+        """
+        pass
+
+    @abstractmethod
+    async def upsert_embeddings(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+        embeddings: list[dict[str, Any]],
+    ) -> int:
+        """
+        Upsert embeddings for semantic search.
+
+        Args:
+            user_id: User identifier
+            project_slug: Project slug
+            session_id: Session identifier
+            embeddings: List of embedding dicts with:
+                - sequence: int
+                - text: str (original text)
+                - vector: list[float] (embedding vector)
+                - metadata: dict (role, turn, etc.)
+
+        Returns:
+            Number of embeddings stored
+        """
+        pass
+
+    @abstractmethod
+    async def get_session_sync_stats(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> SessionSyncStats:
+        """Get lightweight sync statistics for a session.
+
+        Returns counts and timestamp ranges for events and transcripts
+        using aggregate queries. Much cheaper than loading all documents.
+        """
+        ...
+
+
+class StorageAdmin(_StorageLifecycle):
+    """Administrative operations.
+
+    Used by management tools for session lifecycle management.
+    """
+
+    @abstractmethod
+    async def delete_session(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> bool:
+        """Delete a session and all its data."""
+        pass
+
+
+class StorageBackend(StorageReader, StorageWriter, StorageAdmin):
+    """
+    Complete storage backend combining all capabilities.
+
+    Concrete backends implement this class to provide full functionality.
+    Consumers should depend on the narrowest interface they need:
+    - StorageReader for read/query/search operations
+    - StorageWriter for write/sync operations
+    - StorageAdmin for administrative operations
+
+    Note on user_id parameter:
+    - Empty string ("") means search across ALL users (team-wide)
+    - Non-empty string filters to that specific user
+    """
+
+    pass

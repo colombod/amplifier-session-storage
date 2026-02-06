@@ -3,7 +3,7 @@
 > **Supersedes**: Sections 7, 8, 9 of `CHUNKING_ARCHITECTURE_PLAN.md`
 > **Builds on**: Sections 1-5 (problem analysis, root causes, research) remain valid
 > **Date**: 2026-02-06
-> **Status**: PLAN - Not yet implemented
+> **Status**: IMPLEMENTED - Phase 0, 0.5, 1, 2 complete. Checkpoint (search quality measurement) pending.
 
 ---
 

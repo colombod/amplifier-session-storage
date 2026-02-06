@@ -19,7 +19,12 @@ from azure.cosmos.aio import ContainerProxy, CosmosClient, DatabaseProxy
 from azure.cosmos.exceptions import CosmosHttpResponseError, CosmosResourceNotFoundError
 from azure.identity.aio import DefaultAzureCredential
 
-from ..content_extraction import count_embeddable_content_types
+from ..chunking import chunk_text
+from ..content_extraction import (
+    count_embeddable_content_types,
+    count_tokens,
+    extract_all_embeddable_content,
+)
 from ..embeddings import EmbeddingProvider
 from ..embeddings.mixin import EmbeddingMixin
 from ..exceptions import AuthenticationError, StorageConnectionError, StorageIOError
@@ -49,13 +54,16 @@ CONTAINER_NAME = "session_data"
 DOC_TYPE_SESSION = "session"
 DOC_TYPE_TRANSCRIPT = "transcript"
 DOC_TYPE_EVENT = "event"
+DOC_TYPE_VECTOR = "transcript_vector"
 
 # Auth methods
 AUTH_KEY = "key"
 AUTH_DEFAULT_CREDENTIAL = "default_credential"
 
-# Vector field names to exclude from metadata (to avoid bloating LLM context)
+# Vector field names to exclude from results (to avoid bloating LLM context)
+# Covers both old inline fields (backward compat) and new externalized field
 VECTOR_FIELDS = {
+    "vector",
     "user_query_vector",
     "assistant_response_vector",
     "assistant_thinking_vector",
@@ -75,10 +83,10 @@ SESSION_PROJECTION = """
 """
 
 # Transcript fields WITHOUT vectors (most common read pattern)
-# This dramatically reduces RU cost vs SELECT * when vectors are ~48KB each
+# With externalized vectors, transcript documents no longer contain vector data at all
 TRANSCRIPT_PROJECTION = """
     c.id, c.type, c.partition_key, c.user_id, c.host_id, c.project_slug, c.session_id, c.sequence,
-    c.role, c.content, c.turn, c.ts, c.embedding_model, c.vector_metadata, c.synced_at
+    c.role, c.content, c.turn, c.ts, c.synced_at
 """
 
 # Event fields (no vectors)
@@ -203,6 +211,7 @@ class CosmosConfig:
     auth_method: str = AUTH_DEFAULT_CREDENTIAL
     key: str | None = None
     enable_vector_search: bool = True  # Enable vector indexes on containers
+    vector_dimensions: int = 3072  # text-embedding-3-large
 
     @classmethod
     def from_env(cls) -> CosmosConfig:
@@ -214,6 +223,7 @@ class CosmosConfig:
         auth_method = os.environ.get("AMPLIFIER_COSMOS_AUTH_METHOD", AUTH_DEFAULT_CREDENTIAL)
         key = os.environ.get("AMPLIFIER_COSMOS_KEY")
         enable_vector = os.environ.get("AMPLIFIER_COSMOS_ENABLE_VECTOR", "true").lower() == "true"
+        dimensions = int(os.environ.get("AMPLIFIER_COSMOS_VECTOR_DIMENSIONS", "3072"))
 
         if not endpoint:
             raise AuthenticationError("cosmos", "AMPLIFIER_COSMOS_ENDPOINT not set")
@@ -227,6 +237,7 @@ class CosmosConfig:
             auth_method=auth_method,
             key=key,
             enable_vector_search=enable_vector,
+            vector_dimensions=dimensions,
         )
 
 
@@ -383,13 +394,13 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
                 {"path": "/bundle/?"},
                 {"path": "/event/?"},
                 {"path": "/lvl/?"},
+                {"path": "/parent_id/?"},  # For vector doc lookups
+                {"path": "/content_type/?"},  # For vector doc filtering
             ],
             "excludedPaths": [
                 {"path": "/content/*"},  # Don't index full content text
-                {"path": "/user_query_vector/*"},  # Handled by vector index
-                {"path": "/assistant_response_vector/*"},
-                {"path": "/assistant_thinking_vector/*"},
-                {"path": "/tool_output_vector/*"},
+                {"path": "/source_text/*"},  # Don't index vector source text
+                {"path": "/vector/*"},  # Handled by vector index
                 {"path": "/*"},  # Exclude everything else by default
             ],
         }
@@ -397,70 +408,29 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         # Vector embedding policy for Cosmos DB (required for vector search)
         vector_embedding_policy: dict[str, Any] | None = None
 
-        # Add vector indexes for transcripts if enabled
+        # Add vector indexes if enabled - single /vector path on vector documents
         if vector_enabled and name == CONTAINER_NAME:
-            # Vector index configuration for Cosmos DB - one index per content type
             indexing_policy["vectorIndexes"] = [
-                {
-                    "path": "/user_query_vector",
-                    "type": "quantizedFlat",
-                },
-                {
-                    "path": "/assistant_response_vector",
-                    "type": "quantizedFlat",
-                },
-                {
-                    "path": "/assistant_thinking_vector",
-                    "type": "quantizedFlat",
-                },
-                {
-                    "path": "/tool_output_vector",
-                    "type": "quantizedFlat",
-                },
+                {"path": "/vector", "type": "quantizedFlat"},
             ]
 
-            # Vector embedding policy defines the embedding paths and their properties
-            # This is REQUIRED for vector search to work in Cosmos DB
             vector_embedding_policy = {
                 "vectorEmbeddings": [
                     {
-                        "path": "/user_query_vector",
+                        "path": "/vector",
                         "dataType": "float32",
-                        "dimensions": 3072,
-                        "distanceFunction": "cosine",
-                    },
-                    {
-                        "path": "/assistant_response_vector",
-                        "dataType": "float32",
-                        "dimensions": 3072,
-                        "distanceFunction": "cosine",
-                    },
-                    {
-                        "path": "/assistant_thinking_vector",
-                        "dataType": "float32",
-                        "dimensions": 3072,
-                        "distanceFunction": "cosine",
-                    },
-                    {
-                        "path": "/tool_output_vector",
-                        "dataType": "float32",
-                        "dimensions": 3072,
+                        "dimensions": self.config.vector_dimensions,
                         "distanceFunction": "cosine",
                     },
                 ]
             }
             logger.info(
-                "Configuring vector search support",
+                "Configuring vector search support (externalized vectors)",
                 extra={
                     "container": name,
-                    "dimensions": 3072,
+                    "dimensions": self.config.vector_dimensions,
                     "distance_function": "cosine",
-                    "vector_paths": [
-                        "/user_query_vector",
-                        "/assistant_response_vector",
-                        "/assistant_thinking_vector",
-                        "/tool_output_vector",
-                    ],
+                    "vector_path": "/vector",
                 },
             )
 
@@ -471,24 +441,41 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
             # Try to read container properties to verify it exists
             props = await existing_container.read()
 
-            # Check if vector upgrade is needed
+            # Check if vector policy needs migration
             if vector_enabled and name == CONTAINER_NAME:
                 existing_vector_policy = props.get("vectorEmbeddingPolicy")
                 if not existing_vector_policy or not existing_vector_policy.get("vectorEmbeddings"):
+                    # No vector support at all - needs migration
                     logger.warning(
                         "Container exists without vector support - migration required",
                         extra={
                             "container": name,
                             "action": "will_recreate",
-                            "warning": "Existing data will be preserved but vector indexes need rebuild",
+                            "warning": "Existing data preserved, vector indexes need rebuild",
                         },
                     )
                     needs_migration = True
                 else:
-                    logger.info(
-                        "Container already has vector support",
-                        extra={"container": name, "status": "no_migration_needed"},
-                    )
+                    # Check if using old 4-path policy vs new single-path
+                    existing_paths = [
+                        e.get("path") for e in existing_vector_policy.get("vectorEmbeddings", [])
+                    ]
+                    if "/vector" not in existing_paths and len(existing_paths) >= 4:
+                        logger.warning(
+                            "Container has old 4-path vector policy - migrating to "
+                            "single /vector path for externalized vectors",
+                            extra={
+                                "container": name,
+                                "old_paths": existing_paths,
+                                "new_path": "/vector",
+                            },
+                        )
+                        needs_migration = True
+                    else:
+                        logger.info(
+                            "Container already has externalized vector support",
+                            extra={"container": name, "status": "no_migration_needed"},
+                        )
         except CosmosResourceNotFoundError:
             # Container doesn't exist, will be created
             logger.info(
@@ -694,10 +681,11 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         project_slug: str,
         session_id: str,
     ) -> bool:
-        """Delete session and all its data (sessions, transcripts, events).
+        """Delete session and all its data (sessions, transcripts, events, vectors).
 
         In single-container architecture, all documents for a session share
-        the same partition_key, so we can delete them all in one query.
+        the same partition_key (including vector documents), so we can
+        delete them all in one query.
         """
         partition_key = self.make_partition_key(user_id, project_slug, session_id)
         container = self._get_container(CONTAINER_NAME)
@@ -733,41 +721,54 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         start_sequence: int = 0,
         embeddings: dict[str, list[list[float] | None]] | None = None,
     ) -> int:
-        """
-        Sync transcript lines with optional multi-vector embeddings.
+        """Sync transcript lines with externalized vector storage.
 
-        Args:
-            embeddings: Pre-computed embeddings dict with keys: user_query, assistant_response,
-                        assistant_thinking, tool_output
+        Step 1: Store transcript documents (content only, no vectors).
+        Step 2: Generate and store vector documents separately.
         """
         if not lines:
             return 0
 
-        # Generate embeddings if not provided and we have a provider
-        if embeddings is None and self.embedding_provider:
-            embeddings = await self._generate_multi_vector_embeddings(lines)
-            counts = count_embeddable_content_types(lines)
-            logger.info(
-                f"Generated embeddings: {counts['user_query']} user, "
-                f"{counts['assistant_response']} responses, "
-                f"{counts['assistant_thinking']} thinking, "
-                f"{counts['tool_output']} tool"
+        # Step 1: Store transcript documents (no vectors)
+        stored = await self._store_transcript_docs(
+            user_id, host_id, project_slug, session_id, lines, start_sequence
+        )
+
+        # Step 2: Generate and store vector documents
+        if self.embedding_provider and embeddings is None:
+            await self._generate_and_store_vectors(
+                user_id, host_id, project_slug, session_id, lines, start_sequence
+            )
+        elif embeddings is not None:
+            await self._store_precomputed_vectors(
+                user_id, host_id, project_slug, session_id, lines, start_sequence, embeddings
             )
 
+        return stored
+
+    async def _store_transcript_docs(
+        self,
+        user_id: str,
+        host_id: str,
+        project_slug: str,
+        session_id: str,
+        lines: list[dict[str, Any]],
+        start_sequence: int,
+    ) -> int:
+        """Store transcript documents WITHOUT any vector fields."""
         container = self._get_container(CONTAINER_NAME)
         partition_key = self.make_partition_key(user_id, project_slug, session_id)
 
         synced = 0
         for i, line in enumerate(lines):
             sequence = start_sequence + i
-
             doc_id = f"{session_id}_msg_{sequence}"
             ts = line.get("ts") or line.get("timestamp")
 
             doc: dict[str, Any] = {
                 **line,
                 "id": doc_id,
-                "type": DOC_TYPE_TRANSCRIPT,  # Type discriminator for single-container
+                "type": DOC_TYPE_TRANSCRIPT,
                 "partition_key": partition_key,
                 "user_id": user_id,
                 "host_id": host_id,
@@ -778,79 +779,217 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
                 "synced_at": datetime.now(UTC).isoformat(),
             }
 
-            # Add multi-vector embeddings if available
-            if embeddings:
-                user_query_vec = embeddings.get("user_query", [None] * len(lines))[i]
-                assistant_response_vec = embeddings.get("assistant_response", [None] * len(lines))[
-                    i
-                ]
-                assistant_thinking_vec = embeddings.get("assistant_thinking", [None] * len(lines))[
-                    i
-                ]
-                tool_output_vec = embeddings.get("tool_output", [None] * len(lines))[i]
-
-                if user_query_vec:
-                    doc["user_query_vector"] = user_query_vec
-                if assistant_response_vec:
-                    doc["assistant_response_vector"] = assistant_response_vec
-                if assistant_thinking_vec:
-                    doc["assistant_thinking_vector"] = assistant_thinking_vec
-                if tool_output_vec:
-                    doc["tool_output_vector"] = tool_output_vec
-
-                # Store metadata about which vectors exist
-                doc["vector_metadata"] = {
-                    "has_user_query": user_query_vec is not None,
-                    "has_assistant_response": assistant_response_vec is not None,
-                    "has_assistant_thinking": assistant_thinking_vec is not None,
-                    "has_tool_output": tool_output_vec is not None,
-                }
-
-                if self.embedding_provider:
-                    doc["embedding_model"] = self.embedding_provider.model_name
+            # Strip any old-style inline vector fields that may come from the line data
+            for vec_field in (
+                "user_query_vector",
+                "assistant_response_vector",
+                "assistant_thinking_vector",
+                "tool_output_vector",
+                "vector_metadata",
+                "embedding_model",
+            ):
+                doc.pop(vec_field, None)
 
             # Safety check: validate document size before upsert (Cosmos 2MB limit)
+            # Without vectors, transcripts are much smaller, but check as defense-in-depth
             doc_json = json.dumps(doc)
             doc_size = len(doc_json.encode("utf-8"))
-            COSMOS_TRANSCRIPT_SIZE_LIMIT = 1_800_000  # 1.8MB safety margin below 2MB
+            cosmos_size_limit = 1_800_000  # 1.8MB safety margin below 2MB
 
-            if doc_size > COSMOS_TRANSCRIPT_SIZE_LIMIT:
+            if doc_size > cosmos_size_limit:
                 logger.warning(
                     f"Transcript document {doc_id} exceeds Cosmos size limit "
-                    f"({doc_size:,} bytes > {COSMOS_TRANSCRIPT_SIZE_LIMIT:,}). "
-                    f"Stripping vectors to reduce size."
+                    f"({doc_size:,} bytes > {cosmos_size_limit:,}). "
+                    f"Truncating content field."
                 )
-                # Strip vector fields to reduce size
-                for vec_field in (
-                    "user_query_vector",
-                    "assistant_response_vector",
-                    "assistant_thinking_vector",
-                    "tool_output_vector",
-                ):
-                    doc.pop(vec_field, None)
-
-                # Re-check after stripping vectors
-                doc_json = json.dumps(doc)
-                doc_size = len(doc_json.encode("utf-8"))
-
-                if doc_size > COSMOS_TRANSCRIPT_SIZE_LIMIT:
-                    logger.warning(
-                        f"Transcript document {doc_id} still too large after "
-                        f"stripping vectors ({doc_size:,} bytes). "
-                        f"Truncating content field."
-                    )
-                    # Preserve metadata, truncate content
-                    original_content = doc.get("content")
-                    doc["content"] = "[Content truncated - original size exceeded Cosmos limit]"
-                    doc["content_truncated"] = True
-                    doc["original_content_size"] = (
-                        len(json.dumps(original_content).encode("utf-8")) if original_content else 0
-                    )
+                original_content = doc.get("content")
+                doc["content"] = "[Content truncated - original size exceeded Cosmos limit]"
+                doc["content_truncated"] = True
+                doc["original_content_size"] = (
+                    len(json.dumps(original_content).encode("utf-8")) if original_content else 0
+                )
 
             await container.upsert_item(body=doc)
             synced += 1
 
         return synced
+
+    async def _generate_and_store_vectors(
+        self,
+        user_id: str,
+        host_id: str,
+        project_slug: str,
+        session_id: str,
+        lines: list[dict[str, Any]],
+        start_sequence: int,
+    ) -> None:
+        """Extract content, chunk, embed, and store as separate vector documents."""
+        all_vector_records: list[dict[str, Any]] = []
+        all_texts_to_embed: list[str] = []
+        partition_key = self.make_partition_key(user_id, project_slug, session_id)
+
+        for i, line in enumerate(lines):
+            sequence = start_sequence + i
+            parent_id = f"{session_id}_msg_{sequence}"
+            content = extract_all_embeddable_content(line)
+
+            for content_type, text in content.items():
+                if text is None:
+                    continue
+
+                chunks = chunk_text(text, content_type)
+
+                for chunk in chunks:
+                    vector_id = f"{parent_id}_{content_type}_{chunk.chunk_index}"
+                    record = {
+                        "id": vector_id,
+                        "type": DOC_TYPE_VECTOR,
+                        "partition_key": partition_key,
+                        "user_id": user_id,
+                        "host_id": host_id,
+                        "project_slug": project_slug,
+                        "session_id": session_id,
+                        "parent_id": parent_id,
+                        "content_type": content_type,
+                        "chunk_index": chunk.chunk_index,
+                        "total_chunks": chunk.total_chunks,
+                        "span_start": chunk.span_start,
+                        "span_end": chunk.span_end,
+                        "token_count": chunk.token_count,
+                        "source_text": chunk.text,
+                        "embedding_model": (
+                            self.embedding_provider.model_name if self.embedding_provider else None
+                        ),
+                    }
+                    all_vector_records.append(record)
+                    all_texts_to_embed.append(chunk.text)
+
+        if not all_texts_to_embed:
+            return
+
+        # Batch embed all chunk texts
+        texts_for_embed: list[str | None] = list(all_texts_to_embed)
+        embeddings_list = await self._embed_non_none(texts_for_embed)
+
+        # Attach vectors to records
+        for idx, embedding in enumerate(embeddings_list):
+            all_vector_records[idx]["vector"] = embedding
+
+        # Store vector documents
+        await self._store_vector_records(all_vector_records)
+
+        total_chunks = len(all_vector_records)
+        total_messages = len(lines)
+        counts = count_embeddable_content_types(lines)
+        logger.info(
+            f"Stored {total_chunks} vector docs for {total_messages} messages "
+            f"in session {session_id} "
+            f"({counts['user_query']} user, "
+            f"{counts['assistant_response']} responses, "
+            f"{counts['assistant_thinking']} thinking, "
+            f"{counts['tool_output']} tool)"
+        )
+
+    async def _store_precomputed_vectors(
+        self,
+        user_id: str,
+        host_id: str,
+        project_slug: str,
+        session_id: str,
+        lines: list[dict[str, Any]],
+        start_sequence: int,
+        embeddings: dict[str, list[list[float] | None]],
+    ) -> None:
+        """Store pre-computed embeddings as single-chunk vector documents."""
+        records: list[dict[str, Any]] = []
+        partition_key = self.make_partition_key(user_id, project_slug, session_id)
+
+        for i, line in enumerate(lines):
+            sequence = start_sequence + i
+            parent_id = f"{session_id}_msg_{sequence}"
+            content = extract_all_embeddable_content(line)
+
+            for content_type in [
+                "user_query",
+                "assistant_response",
+                "assistant_thinking",
+                "tool_output",
+            ]:
+                emb_list = embeddings.get(content_type, [])
+                vector = emb_list[i] if i < len(emb_list) else None
+                if vector is None:
+                    continue
+
+                source_text = content.get(content_type) or ""
+                records.append(
+                    {
+                        "id": f"{parent_id}_{content_type}_0",
+                        "type": DOC_TYPE_VECTOR,
+                        "partition_key": partition_key,
+                        "user_id": user_id,
+                        "host_id": host_id,
+                        "project_slug": project_slug,
+                        "session_id": session_id,
+                        "parent_id": parent_id,
+                        "content_type": content_type,
+                        "chunk_index": 0,
+                        "total_chunks": 1,
+                        "span_start": 0,
+                        "span_end": len(source_text),
+                        "token_count": count_tokens(source_text) if source_text else 0,
+                        "source_text": source_text,
+                        "vector": vector,
+                        "embedding_model": (
+                            self.embedding_provider.model_name if self.embedding_provider else None
+                        ),
+                    }
+                )
+
+        await self._store_vector_records(records)
+
+    async def _store_vector_records(self, records: list[dict[str, Any]]) -> None:
+        """Store vector records as separate Cosmos documents.
+
+        Uses delete-before-insert per parent_id for idempotent re-sync.
+        """
+        if not records:
+            return
+
+        container = self._get_container(CONTAINER_NAME)
+
+        # Group by parent_id for cleanup
+        parent_ids = {r["parent_id"] for r in records}
+
+        # Delete existing vector docs for these parents
+        for parent_id in parent_ids:
+            # Get partition_key from the first record with this parent_id
+            pk = next(r["partition_key"] for r in records if r["parent_id"] == parent_id)
+            await self._delete_vectors_for_parent(container, parent_id, pk)
+
+        # Insert new vector documents
+        for record in records:
+            if record.get("vector") is not None:
+                await container.upsert_item(body=record)
+
+    async def _delete_vectors_for_parent(
+        self, container: ContainerProxy, parent_id: str, partition_key: str
+    ) -> None:
+        """Delete all vector documents for a given parent transcript."""
+        query = "SELECT c.id FROM c WHERE c.type = @type AND c.parent_id = @parentId"
+        params: list[dict[str, object]] = [
+            {"name": "@type", "value": DOC_TYPE_VECTOR},
+            {"name": "@parentId", "value": parent_id},
+        ]
+
+        doc_ids: list[str] = []
+        async for item in container.query_items(query=query, parameters=params):
+            doc_ids.append(item["id"])
+
+        for doc_id in doc_ids:
+            try:
+                await container.delete_item(item=doc_id, partition_key=partition_key)
+            except CosmosResourceNotFoundError:
+                pass  # Already deleted
 
     async def get_transcript_lines(
         self,
@@ -1002,26 +1141,26 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         # Generate query embedding
         query_vector = await self.embedding_provider.embed_text(options.query)
 
-        # Translate search_in_* flags to vector_columns
-        vector_columns: list[str] | None = []
+        # Translate search_in_* flags to content_types
+        content_types: list[str] | None = []
         if options.search_in_user:
-            vector_columns.append("user_query")
+            content_types.append("user_query")
         if options.search_in_assistant:
-            vector_columns.append("assistant_response")
+            content_types.append("assistant_response")
         if options.search_in_thinking:
-            vector_columns.append("assistant_thinking")
+            content_types.append("assistant_thinking")
         if options.search_in_tool:
-            vector_columns.append("tool_output")
-        if not vector_columns:
-            vector_columns = None  # None = search all
+            content_types.append("tool_output")
+        if not content_types:
+            content_types = None  # None = search all
 
-        # Perform vector search
+        # Perform vector search on externalized vector documents
         return await self.vector_search(
             user_id=user_id,
             query_vector=query_vector,
             filters=options.filters,
             top_k=limit,
-            vector_columns=vector_columns,
+            content_types=content_types,
         )
 
     async def _hybrid_search_transcripts(
@@ -1062,14 +1201,18 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         query_vector = await self.embedding_provider.embed_text(options.query)
         query_np = np.array(query_vector)
 
-        # Extract embeddings from results
+        # Fetch embeddings from vector documents for MMR
         vectors = []
         for result in combined:
             if "embedding" in result.metadata and result.metadata["embedding"]:
                 vectors.append(np.array(result.metadata["embedding"]))
             else:
-                # No embedding available, use zero vector (will rank low)
-                vectors.append(np.zeros(len(query_vector)))
+                # Fetch embedding from vector documents
+                embedding = await self._get_embedding(user_id, result.session_id, result.sequence)
+                if embedding:
+                    vectors.append(np.array(embedding))
+                else:
+                    vectors.append(np.zeros(len(query_vector)))
 
         # Apply MMR
         mmr_results = compute_mmr(
@@ -1081,6 +1224,32 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
 
         # Return re-ranked results
         return [combined[idx] for idx, _ in mmr_results]
+
+    async def _get_embedding(
+        self, user_id: str, session_id: str, sequence: int
+    ) -> list[float] | None:
+        """Fetch first available embedding for a transcript message.
+
+        Queries vector documents by parent_id, returns first vector found.
+        """
+        container = self._get_container(CONTAINER_NAME)
+        parent_id = f"{session_id}_msg_{sequence}"
+
+        query = (
+            "SELECT c.vector FROM c "
+            "WHERE c.type = @type AND c.parent_id = @parentId "
+            "AND IS_DEFINED(c.vector)"
+        )
+        params: list[dict[str, object]] = [
+            {"name": "@type", "value": DOC_TYPE_VECTOR},
+            {"name": "@parentId", "value": parent_id},
+        ]
+
+        async for item in container.query_items(query=query, parameters=params, max_item_count=1):
+            vec = item.get("vector")
+            if vec is not None:
+                return vec
+        return None
 
     async def get_turn_context(
         self,
@@ -1457,9 +1626,9 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         session_id: str,
         embeddings: list[dict[str, Any]],
     ) -> int:
-        """
-        Upsert embeddings for existing transcript messages.
+        """Upsert embeddings for existing transcript messages.
 
+        Stores embeddings as single-chunk vector documents (externalized pattern).
         Used for backfilling embeddings on existing data.
         """
         container = self._get_container(CONTAINER_NAME)
@@ -1467,23 +1636,35 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
 
         updated = 0
         for emb in embeddings:
-            doc_id = f"{session_id}_msg_{emb['sequence']}"
+            parent_id = f"{session_id}_msg_{emb['sequence']}"
+            vector_id = f"{parent_id}_user_query_0"
 
-            # Read existing document
-            try:
-                existing = await container.read_item(item=doc_id, partition_key=partition_key)
+            # Delete existing vectors for this parent
+            await self._delete_vectors_for_parent(container, parent_id, partition_key)
 
-                # Update with embedding
-                existing["embedding"] = emb["vector"]
-                existing["embedding_model"] = emb.get("metadata", {}).get("model", "unknown")
-                existing["synced_at"] = datetime.now(UTC).isoformat()
+            # Create new vector document
+            vector_doc: dict[str, Any] = {
+                "id": vector_id,
+                "type": DOC_TYPE_VECTOR,
+                "partition_key": partition_key,
+                "user_id": user_id,
+                "host_id": "",
+                "project_slug": project_slug,
+                "session_id": session_id,
+                "parent_id": parent_id,
+                "content_type": "user_query",
+                "chunk_index": 0,
+                "total_chunks": 1,
+                "span_start": 0,
+                "span_end": 0,
+                "token_count": 0,
+                "source_text": "",
+                "vector": emb["vector"],
+                "embedding_model": emb.get("metadata", {}).get("model", "unknown"),
+            }
 
-                await container.upsert_item(body=existing)
-                updated += 1
-
-            except CosmosResourceNotFoundError:
-                logger.warning(f"Transcript message not found: {doc_id}")
-                continue
+            await container.upsert_item(body=vector_doc)
+            updated += 1
 
         return updated
 
@@ -1493,242 +1674,132 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         query_vector: list[float],
         filters: SearchFilters | None = None,
         top_k: int = 100,
+        content_types: list[str] | None = None,
+        # Backward compat alias
         vector_columns: list[str] | None = None,
     ) -> list[SearchResult]:
-        """
-        Perform multi-vector similarity search in Cosmos DB.
+        """Perform vector similarity search on externalized vector documents.
 
-        Since Cosmos DB doesn't support LEAST/GREATEST functions, we run separate
-        queries for each vector column and merge results, keeping the best score
-        for each document.
+        Queries the transcript_vector documents, deduplicates by parent_id
+        (keeping best score), then fetches parent transcript documents for
+        content.
 
         Args:
-            user_id: User identifier
+            user_id: User identifier (empty string for team-wide search)
             query_vector: Query embedding vector
             filters: Optional search filters
             top_k: Number of results to return
-            vector_columns: Which vector columns to search. Default: all non-null vectors.
+            content_types: Which content types to search. Default: all.
                 Options: ["user_query", "assistant_response",
                           "assistant_thinking", "tool_output"]
+            vector_columns: Deprecated alias for content_types
         """
         container = self._get_container(CONTAINER_NAME)
 
-        if vector_columns is None:
-            # Search all vector columns by default
-            vector_columns = [
-                "user_query",
-                "assistant_response",
-                "assistant_thinking",
-                "tool_output",
-            ]
+        # Support old parameter name
+        if content_types is None and vector_columns is not None:
+            content_types = vector_columns
 
-        vector_field_names = {
-            "user_query": "user_query_vector",
-            "assistant_response": "assistant_response_vector",
-            "assistant_thinking": "assistant_thinking_vector",
-            "tool_output": "tool_output_vector",
-        }
+        # Build filter conditions for vector document query
+        filter_parts = ["c.type = @docType"]
+        params: list[dict[str, object]] = [
+            {"name": "@docType", "value": DOC_TYPE_VECTOR},
+            {"name": "@queryVector", "value": query_vector},
+        ]
 
-        # Build base filter conditions - allow empty user_id for team-wide search
-        # Always filter by type discriminator for single-container architecture
         if user_id:
-            filter_parts = ["c.type = @doc_type", "c.user_id = @user_id"]
-            base_params: list[dict[str, object]] = [
-                {"name": "@doc_type", "value": DOC_TYPE_TRANSCRIPT},
-                {"name": "@user_id", "value": user_id},
-                {"name": "@query_vector", "value": query_vector},
-            ]
-        else:
-            # Team-wide search (all users)
-            filter_parts: list[str] = ["c.type = @doc_type"]
-            base_params: list[dict[str, object]] = [
-                {"name": "@doc_type", "value": DOC_TYPE_TRANSCRIPT},
-                {"name": "@query_vector", "value": query_vector},
-            ]
+            filter_parts.append("c.user_id = @userId")
+            params.append({"name": "@userId", "value": user_id})
+
+        # Filter by content type
+        if content_types:
+            filter_parts.append("ARRAY_CONTAINS(@contentTypes, c.content_type)")
+            params.append({"name": "@contentTypes", "value": content_types})
 
         if filters:
             if filters.project_slug:
                 filter_parts.append("c.project_slug = @project")
-                base_params.append({"name": "@project", "value": filters.project_slug})
-
-            if filters.start_date:
-                filter_parts.append("c.ts >= @start_date")
-                base_params.append({"name": "@start_date", "value": filters.start_date})
-
-            if filters.end_date:
-                filter_parts.append("c.ts <= @end_date")
-                base_params.append({"name": "@end_date", "value": filters.end_date})
-
-        # Build where clause - handle empty filter_parts for team-wide search
-        if filter_parts:
-            where_clause = " AND ".join(filter_parts)
-            where_prefix = f"WHERE {where_clause} AND"
-        else:
-            where_prefix = "WHERE"
-
-        # Run separate query for each vector column and merge results
-        # This is necessary because Cosmos DB doesn't support LEAST() function
-        all_results: dict[str, SearchResult] = {}  # keyed by doc id
-
-        for vec_type in vector_columns:
-            field = vector_field_names[vec_type]
-
-            # Query for this vector column only - TOP is REQUIRED for vector search in Cosmos DB
-            query = f"""
-                SELECT TOP {top_k} c.id, c.session_id, c.project_slug, c.user_id, c.host_id,
-                       c.sequence, c.content, c.role, c.turn, c.ts,
-                       VectorDistance(c.{field}, @query_vector) AS distance
-                FROM c
-                {where_prefix} IS_DEFINED(c.{field})
-                ORDER BY VectorDistance(c.{field}, @query_vector)
-            """
-
-            try:
-                async for item in container.query_items(
-                    query=query, parameters=base_params, max_item_count=top_k
-                ):
-                    doc_id = item["id"]
-                    distance = item.get("distance", 1.0)
-                    similarity = 1.0 - min(distance, 1.0)
-
-                    # Keep the best score for each document
-                    if doc_id not in all_results or similarity > all_results[doc_id].score:
-                        all_results[doc_id] = SearchResult(
-                            session_id=item["session_id"],
-                            project_slug=item["project_slug"],
-                            sequence=item["sequence"],
-                            content=_extract_display_content(item.get("content")),
-                            metadata=_strip_vectors(item),
-                            score=similarity,
-                            source=f"semantic_{vec_type}",
-                        )
-            except CosmosHttpResponseError as e:
-                # Log but continue with other vector columns
-                logger.warning(f"Vector search failed for {vec_type}: {e}")
-                continue
-
-        # Sort by score and return top_k
-        results = sorted(all_results.values(), key=lambda r: r.score, reverse=True)[:top_k]
-        return results
-
-    async def _vector_search_single_column(
-        self,
-        user_id: str,
-        query_vector: list[float],
-        vector_column: str,
-        filters: SearchFilters | None = None,
-        top_k: int = 100,
-    ) -> list[SearchResult]:
-        """Helper for single-column vector search."""
-        return await self.vector_search(
-            user_id=user_id,
-            query_vector=query_vector,
-            filters=filters,
-            top_k=top_k,
-            vector_columns=[vector_column],
-        )
-
-    async def _old_vector_search(
-        self,
-        user_id: str,
-        query_vector: list[float],
-        filters: SearchFilters | None = None,
-        top_k: int = 100,
-        vector_columns: list[str] | None = None,
-    ) -> list[SearchResult]:
-        """
-        DEPRECATED: Old implementation that used LEAST() - not supported by Cosmos DB.
-        Kept for reference only.
-        """
-        container = self._get_container(CONTAINER_NAME)
-
-        if vector_columns is None:
-            vector_columns = [
-                "user_query",
-                "assistant_response",
-                "assistant_thinking",
-                "tool_output",
-            ]
-
-        vector_field_names = {
-            "user_query": "user_query_vector",
-            "assistant_response": "assistant_response_vector",
-            "assistant_thinking": "assistant_thinking_vector",
-            "tool_output": "tool_output_vector",
-        }
-
-        vector_distance_exprs = []
-        for vec_type in vector_columns:
-            field = vector_field_names[vec_type]
-            vector_distance_exprs.append(
-                f"(IS_DEFINED(c.{field}) ? VectorDistance(c.{field}, @query_vector) : 1.0)"
-            )
-
-        # NOTE: LEAST() is NOT supported in Cosmos DB SQL
-        min_distance_expr = (
-            f"LEAST({', '.join(vector_distance_exprs)})"
-            if len(vector_distance_exprs) > 1
-            else vector_distance_exprs[0]
-        )
-
-        query_parts = [
-            f"SELECT c.id, c.session_id, c.project_slug, c.sequence, c.content, c.role, "
-            f"c.turn, c.ts, {min_distance_expr} AS best_distance "
-            f"FROM c "
-            f"WHERE c.user_id = @user_id"
-        ]
-
-        params: list[dict[str, object]] = [
-            {"name": "@user_id", "value": user_id},
-            {"name": "@query_vector", "value": query_vector},
-        ]
-
-        # Require at least one vector to be defined
-        vector_exists_conditions = [
-            f"IS_DEFINED(c.{vector_field_names[v]})" for v in vector_columns
-        ]
-        query_parts.append(f"AND ({' OR '.join(vector_exists_conditions)})")
-
-        # Apply filters
-        if filters:
-            if filters.project_slug:
-                query_parts.append("AND c.project_slug = @project")
                 params.append({"name": "@project", "value": filters.project_slug})
 
-            if filters.start_date:
-                query_parts.append("AND c.ts >= @start_date")
-                params.append({"name": "@start_date", "value": filters.start_date})
+        where_clause = " AND ".join(filter_parts)
 
-            if filters.end_date:
-                query_parts.append("AND c.ts <= @end_date")
-                params.append({"name": "@end_date", "value": filters.end_date})
+        # Over-fetch to allow dedup by parent_id
+        fetch_limit = top_k * 3
 
-        # Order by best distance (lowest = most similar)
-        query_parts.append(f"ORDER BY {min_distance_expr}")
+        # Query vector documents with VectorDistance
+        # TOP is REQUIRED for vector search in Cosmos DB
+        query = f"""
+            SELECT TOP {fetch_limit}
+                c.id, c.parent_id, c.session_id, c.project_slug,
+                c.partition_key, c.content_type, c.chunk_index,
+                c.source_text, c.token_count,
+                VectorDistance(c.vector, @queryVector) AS distance
+            FROM c
+            WHERE {where_clause}
+            ORDER BY VectorDistance(c.vector, @queryVector)
+        """
 
-        query = " ".join(query_parts)
+        # Collect vector matches, dedup by parent_id keeping best score
+        best_by_parent: dict[str, dict[str, Any]] = {}
+        try:
+            async for item in container.query_items(
+                query=query, parameters=params, max_item_count=fetch_limit
+            ):
+                parent_id = item["parent_id"]
+                distance = item.get("distance", 1.0)
+                similarity = 1.0 - min(distance, 1.0)
 
+                if parent_id not in best_by_parent or similarity > (
+                    1.0 - min(best_by_parent[parent_id].get("distance", 1.0), 1.0)
+                ):
+                    best_by_parent[parent_id] = item
+        except CosmosHttpResponseError as e:
+            logger.warning(f"Vector search failed: {e}")
+            return []
+
+        if not best_by_parent:
+            return []
+
+        # Sort by score descending and take top_k
+        sorted_matches = sorted(best_by_parent.values(), key=lambda x: x.get("distance", 1.0))[
+            :top_k
+        ]
+
+        # Fetch parent transcript documents for content
         results: list[SearchResult] = []
-        async for item in container.query_items(
-            query=query, parameters=params, max_item_count=top_k
-        ):
-            # Convert distance to similarity score (1 - distance)
-            distance = item.get("best_distance", 1.0)
+        for match in sorted_matches:
+            parent_id = match["parent_id"]
+            pk = match.get("partition_key", "")
+            distance = match.get("distance", 1.0)
             similarity = 1.0 - min(distance, 1.0)
+
+            # Point read for parent transcript (most RU-efficient)
+            try:
+                parent_doc = await container.read_item(item=parent_id, partition_key=pk)
+            except CosmosResourceNotFoundError:
+                logger.warning(f"Parent transcript not found: {parent_id}")
+                continue
+
+            # Apply date filters on parent (vector docs don't have ts)
+            if filters:
+                ts = parent_doc.get("ts")
+                if ts:
+                    if filters.start_date and ts < filters.start_date:
+                        continue
+                    if filters.end_date and ts > filters.end_date:
+                        continue
 
             results.append(
                 SearchResult(
-                    session_id=item["session_id"],
-                    project_slug=item["project_slug"],
-                    sequence=item["sequence"],
-                    content=item.get("content", ""),
-                    metadata=_strip_vectors(item),
+                    session_id=parent_doc.get("session_id", match["session_id"]),
+                    project_slug=parent_doc.get("project_slug", match["project_slug"]),
+                    sequence=parent_doc.get("sequence", 0),
+                    content=_extract_display_content(parent_doc.get("content")),
+                    metadata=_strip_vectors(parent_doc),
                     score=similarity,
                     source="semantic",
                 )
             )
-            if len(results) >= top_k:
-                break
 
         return results
 

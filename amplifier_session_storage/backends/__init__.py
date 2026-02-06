@@ -11,7 +11,10 @@ from .base import (
     SearchFilters,
     SearchResult,
     SessionSyncStats,
+    StorageAdmin,
     StorageBackend,
+    StorageReader,
+    StorageWriter,
     TranscriptMessage,
     TranscriptSearchOptions,
     TurnContext,
@@ -20,6 +23,10 @@ from .base import (
 __all__ = [
     # Core classes
     "StorageBackend",
+    # Protocol ABCs
+    "StorageReader",
+    "StorageWriter",
+    "StorageAdmin",
     # Search options
     "SearchFilters",
     "TranscriptSearchOptions",

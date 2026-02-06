@@ -313,10 +313,14 @@ class TestCosmosVectorSearch:
             lines=lines,
         )
 
-        # Try semantic search
+        # Try semantic search - filter to this session's project to avoid stale data
         results = await cosmos_storage.search_transcripts(
             user_id="test-user",
-            options=TranscriptSearchOptions(query="semantic query", search_type="semantic"),
+            options=TranscriptSearchOptions(
+                query="semantic query",
+                search_type="semantic",
+                filters=SearchFilters(project_slug="test-project"),
+            ),
             limit=10,
         )
 

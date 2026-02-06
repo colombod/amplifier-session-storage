@@ -476,6 +476,13 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
                             "Container already has externalized vector support",
                             extra={"container": name, "status": "no_migration_needed"},
                         )
+                        # Container exists and is correct - use it directly
+                        self._containers[name] = existing_container
+                        return
+            else:
+                # Container exists, no vector needed - use it directly
+                self._containers[name] = existing_container
+                return
         except CosmosResourceNotFoundError:
             # Container doesn't exist, will be created
             logger.info(
@@ -506,12 +513,12 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
                     "Container replaced with vector support",
                     extra={"container": name, "status": "migration_complete"},
                 )
-            except CosmosHttpResponseError as e:
-                logger.error(
-                    "Failed to replace container for vector migration",
-                    extra={"container": name, "error": str(e), "status_code": e.status_code},
+            except Exception as e:
+                logger.warning(
+                    "Failed to replace container for vector migration, using existing",
+                    extra={"container": name, "error": str(e)},
                 )
-                # Fall back to using existing container without vector
+                # Fall back to using existing container as-is
                 container = self._database.get_container_client(name)
         elif vector_embedding_policy:
             container = await self._database.create_container_if_not_exists(

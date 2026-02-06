@@ -33,6 +33,7 @@ from .base import (
     MessageContext,
     SearchFilters,
     SearchResult,
+    SessionSyncStats,
     StorageBackend,
     TranscriptMessage,
     TranscriptSearchOptions,
@@ -2042,6 +2043,57 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
             "sessions_by_bundle": bundles,
             "filters_applied": filters is not None,
         }
+
+    async def get_session_sync_stats(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> SessionSyncStats:
+        """Get lightweight sync statistics using a single aggregate query."""
+        container = self._get_container(CONTAINER_NAME)
+        partition_key = self.make_partition_key(user_id, project_slug, session_id)
+
+        # Single query - aggregate both types
+        query = """
+            SELECT
+                c.type,
+                COUNT(1) as count,
+                MIN(c.ts) as earliest_ts,
+                MAX(c.ts) as latest_ts
+            FROM c
+            WHERE c.partition_key = @pk
+              AND c.type IN ('event', 'transcript')
+            GROUP BY c.type
+        """
+
+        event_count = transcript_count = 0
+        event_earliest = event_latest = None
+        transcript_earliest = transcript_latest = None
+
+        async for row in container.query_items(
+            query=query,
+            parameters=[{"name": "@pk", "value": partition_key}],
+        ):
+            doc_type = row.get("type")
+            count = row.get("count", 0)
+            earliest = row.get("earliest_ts")
+            latest = row.get("latest_ts")
+            if doc_type == "event":
+                event_count = count
+                event_earliest = earliest
+                event_latest = latest
+            elif doc_type == "transcript":
+                transcript_count = count
+                transcript_earliest = earliest
+                transcript_latest = latest
+
+        return SessionSyncStats(
+            event_count=event_count,
+            transcript_count=transcript_count,
+            event_ts_range=(event_earliest, event_latest),
+            transcript_ts_range=(transcript_earliest, transcript_latest),
+        )
 
     # =========================================================================
     # Discovery APIs

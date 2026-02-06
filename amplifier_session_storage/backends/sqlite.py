@@ -31,6 +31,7 @@ from .base import (
     MessageContext,
     SearchFilters,
     SearchResult,
+    SessionSyncStats,
     StorageBackend,
     TranscriptMessage,
     TranscriptSearchOptions,
@@ -1846,6 +1847,60 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
             "sessions_by_bundle": bundles,
             "filters_applied": filters is not None,
         }
+
+    async def get_session_sync_stats(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> SessionSyncStats:
+        """Get lightweight sync statistics using aggregate queries."""
+        if self.conn is None:
+            raise StorageIOError("get_session_sync_stats", cause=RuntimeError("Not initialized"))
+
+        async with self.conn.execute(
+            """
+            SELECT
+                'event' as type,
+                COUNT(*) as count,
+                MIN(ts) as earliest,
+                MAX(ts) as latest
+            FROM events
+            WHERE user_id = ? AND session_id = ?
+            UNION ALL
+            SELECT
+                'transcript' as type,
+                COUNT(*) as count,
+                MIN(ts) as earliest,
+                MAX(ts) as latest
+            FROM transcripts
+            WHERE user_id = ? AND session_id = ?
+            """,
+            (user_id, session_id, user_id, session_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        event_count = transcript_count = 0
+        event_earliest = event_latest = None
+        transcript_earliest = transcript_latest = None
+
+        for row in rows:
+            doc_type, count, earliest, latest = row
+            if doc_type == "event":
+                event_count = count
+                event_earliest = earliest
+                event_latest = latest
+            elif doc_type == "transcript":
+                transcript_count = count
+                transcript_earliest = earliest
+                transcript_latest = latest
+
+        return SessionSyncStats(
+            event_count=event_count,
+            transcript_count=transcript_count,
+            event_ts_range=(event_earliest, event_latest),
+            transcript_ts_range=(transcript_earliest, transcript_latest),
+        )
 
     # =========================================================================
     # Discovery APIs

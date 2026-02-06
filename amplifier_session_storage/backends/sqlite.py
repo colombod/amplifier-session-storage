@@ -966,10 +966,36 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
         options: TranscriptSearchOptions,
         limit: int,
     ) -> list[SearchResult]:
-        """Full-text search using SQLite FTS or LIKE."""
+        """Full-text search across transcripts and vector source texts."""
         if self.conn is None:
             raise StorageIOError("search", cause=RuntimeError("Not initialized"))
 
+        # Search transcript content
+        transcript_results = await self._full_text_search_transcript_content(
+            user_id, options, limit
+        )
+
+        # Also search transcript_vectors.source_text (BUG 1+5)
+        vector_text_results = await self._full_text_search_vector_sources(user_id, options, limit)
+
+        # Merge and deduplicate by (session_id, sequence)
+        seen: set[tuple[str, int]] = set()
+        combined: list[SearchResult] = []
+        for r in transcript_results + vector_text_results:
+            key = (r.session_id, r.sequence)
+            if key not in seen:
+                seen.add(key)
+                combined.append(r)
+
+        return combined[:limit]
+
+    async def _full_text_search_transcript_content(
+        self,
+        user_id: str,
+        options: TranscriptSearchOptions,
+        limit: int,
+    ) -> list[SearchResult]:
+        """Search transcript content_json column."""
         # Build WHERE clause
         where_parts = ["user_id = ?"]
         params: list[Any] = [user_id]
@@ -1033,6 +1059,102 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
                 for row in rows
             ]
 
+    async def _full_text_search_vector_sources(
+        self,
+        user_id: str,
+        options: TranscriptSearchOptions,
+        limit: int,
+    ) -> list[SearchResult]:
+        """Search source_text in transcript_vectors for span-level full-text matching.
+
+        This catches extracted thinking blocks, tool outputs, and chunked content
+        that wouldn't be found by searching transcripts.content_json alone.
+        """
+        if self.conn is None:
+            return []
+
+        # Build content_type filter from search_in_* flags
+        content_types: list[str] = []
+        if options.search_in_user:
+            content_types.append("user_query")
+        if options.search_in_assistant:
+            content_types.append("assistant_response")
+        if options.search_in_thinking:
+            content_types.append("assistant_thinking")
+        if options.search_in_tool:
+            content_types.append("tool_output")
+
+        if not content_types:
+            return []
+
+        where_parts = ["v.user_id = ?", "v.source_text LIKE ?"]
+        params: list[Any] = [user_id, f"%{options.query}%"]
+
+        placeholders = ", ".join(["?"] * len(content_types))
+        where_parts.append(f"v.content_type IN ({placeholders})")
+        params.extend(content_types)
+
+        if options.filters:
+            if options.filters.project_slug:
+                where_parts.append("t.project_slug = ?")
+                params.append(options.filters.project_slug)
+
+            if options.filters.start_date:
+                where_parts.append("t.ts >= ?")
+                params.append(options.filters.start_date)
+
+            if options.filters.end_date:
+                where_parts.append("t.ts <= ?")
+                params.append(options.filters.end_date)
+
+        where_clause = " AND ".join(where_parts)
+
+        query = f"""
+            SELECT v.parent_id, v.session_id, v.source_text, v.content_type,
+                   v.span_start, v.span_end,
+                   t.project_slug, t.sequence, t.content_json, t.role, t.turn, t.ts
+            FROM transcript_vectors v
+            JOIN transcripts t ON t.id = v.parent_id
+            WHERE {where_clause}
+            LIMIT ?
+        """
+        params.append(limit * 3)  # Over-fetch for dedup
+
+        async with self.conn.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+
+        # Deduplicate by parent_id, keeping first match
+        seen: dict[str, SearchResult] = {}
+        for row in rows:
+            parent_id = row[0]
+            if parent_id not in seen:
+                content_raw = row[8] or ""
+                try:
+                    content = json.loads(content_raw)
+                except (json.JSONDecodeError, TypeError):
+                    content = content_raw
+
+                seen[parent_id] = SearchResult(
+                    session_id=row[1],
+                    project_slug=row[6],
+                    sequence=row[7],
+                    content=content,
+                    metadata={
+                        "id": parent_id,
+                        "role": row[9],
+                        "turn": row[10],
+                        "ts": row[11],
+                        "content_type": row[3],
+                        "matched_text": row[2],
+                        "span_start": row[4],
+                        "span_end": row[5],
+                    },
+                    score=1.0,
+                    source="full_text",
+                )
+
+        return list(seen.values())[:limit]
+
     async def _semantic_search(
         self,
         user_id: str,
@@ -1044,8 +1166,16 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
             raise ValueError("Embedding provider required for semantic search")
 
         query_vector = await self.embedding_provider.embed_text(options.query)
+        return await self._semantic_search_with_vector(user_id, options, limit, query_vector)
 
-        # Translate search_in_* flags to content_type filters
+    async def _semantic_search_with_vector(
+        self,
+        user_id: str,
+        options: TranscriptSearchOptions,
+        limit: int,
+        query_vector: list[float],
+    ) -> list[SearchResult]:
+        """Semantic search with pre-computed query vector (avoids double embedding)."""
         content_types: list[str] | None = []
         if options.search_in_user:
             content_types.append("user_query")
@@ -1080,9 +1210,15 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
         # Get more candidates
         candidate_limit = limit * 3
 
-        # Get both result sets
+        # Compute query embedding ONCE
+        query_vector = await self.embedding_provider.embed_text(options.query)
+        query_np = np.array(query_vector)
+
+        # Get both result sets (semantic reuses pre-computed vector)
         text_results = await self._full_text_search(user_id, options, candidate_limit)
-        semantic_results = await self._semantic_search(user_id, options, candidate_limit)
+        semantic_results = await self._semantic_search_with_vector(
+            user_id, options, candidate_limit, query_vector
+        )
 
         # Merge and deduplicate
         seen = set()
@@ -1096,14 +1232,11 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
         if len(combined) <= limit:
             return combined[:limit]
 
-        # Apply MMR
-        query_vector = await self.embedding_provider.embed_text(options.query)
-        query_np = np.array(query_vector)
-
-        # Get embeddings
+        # Get embeddings for MMR
         vectors = []
         for result in combined:
-            embedding = await self._get_embedding(user_id, result.session_id, result.sequence)
+            ct = result.metadata.get("content_type")
+            embedding = await self._get_embedding(user_id, result.session_id, result.sequence, ct)
             if embedding:
                 vectors.append(np.array(embedding))
             else:
@@ -1120,30 +1253,47 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
         return [combined[idx] for idx, _ in mmr_results]
 
     async def _get_embedding(
-        self, user_id: str, session_id: str, sequence: int
+        self, user_id: str, session_id: str, sequence: int, content_type: str | None = None
     ) -> list[float] | None:
-        """Fetch first available embedding for a transcript message.
+        """Fetch embedding for a transcript message, optionally by content_type.
 
-        Returns the first non-null vector from transcript_vectors.
+        When content_type is provided, fetches the specific matched vector.
+        Otherwise returns the first available vector.
         """
         if self.conn is None:
             return None
 
         parent_id = f"{session_id}_msg_{sequence}"
-        async with self.conn.execute(
-            """
-            SELECT vector_json
-            FROM transcript_vectors
-            WHERE parent_id = ? AND user_id = ? AND vector_json IS NOT NULL
-            ORDER BY chunk_index
-            LIMIT 1
-            """,
-            (parent_id, user_id),
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row and row[0]:
-                return json.loads(row[0])
-            return None
+
+        if content_type:
+            async with self.conn.execute(
+                """
+                SELECT vector_json
+                FROM transcript_vectors
+                WHERE parent_id = ? AND user_id = ? AND content_type = ?
+                  AND vector_json IS NOT NULL
+                ORDER BY chunk_index
+                LIMIT 1
+                """,
+                (parent_id, user_id, content_type),
+            ) as cursor:
+                row = await cursor.fetchone()
+        else:
+            async with self.conn.execute(
+                """
+                SELECT vector_json
+                FROM transcript_vectors
+                WHERE parent_id = ? AND user_id = ? AND vector_json IS NOT NULL
+                ORDER BY chunk_index
+                LIMIT 1
+                """,
+                (parent_id, user_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+
+        if row and row[0]:
+            return json.loads(row[0])
+        return None
 
     async def get_turn_context(
         self,

@@ -1082,13 +1082,13 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
         options: TranscriptSearchOptions,
         limit: int,
     ) -> list[SearchResult]:
-        """Full-text search using SQL LIKE."""
+        """Full-text search across transcripts and vector source texts."""
 
-        def _search() -> list[SearchResult]:
+        def _search_transcripts() -> list[SearchResult]:
             if self.conn is None:
                 raise StorageIOError("search_transcripts", cause=RuntimeError("Not initialized"))
 
-            # Build WHERE clause
+            # Build WHERE clause for transcript content search
             where_parts = ["user_id = ?"]
             params: list[Any] = [user_id]
 
@@ -1133,25 +1133,145 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
 
             results_raw = self.conn.execute(query, params).fetchall()
 
-            return [
-                SearchResult(
+            results = []
+            for row in results_raw:
+                # Parse JSON content for consistency with semantic search (BUG 2)
+                content_raw = row[4] or ""
+                try:
+                    content = json.loads(content_raw)
+                except (json.JSONDecodeError, TypeError):
+                    content = content_raw
+
+                results.append(
+                    SearchResult(
+                        session_id=row[1],
+                        project_slug=row[2],
+                        sequence=row[3],
+                        content=content,
+                        metadata={
+                            "id": row[0],
+                            "role": row[5],
+                            "turn": row[6],
+                            "ts": row[7],
+                        },
+                        score=1.0,
+                        source="full_text",
+                    )
+                )
+            return results
+
+        transcript_results = await asyncio.to_thread(_search_transcripts)
+
+        # Also search transcript_vectors.source_text (BUG 1+5)
+        vector_text_results = await asyncio.to_thread(
+            self._full_text_search_vector_sources, user_id, options, limit
+        )
+
+        # Merge and deduplicate by (session_id, sequence)
+        seen: set[tuple[str, int]] = set()
+        combined: list[SearchResult] = []
+        for r in transcript_results + vector_text_results:
+            key = (r.session_id, r.sequence)
+            if key not in seen:
+                seen.add(key)
+                combined.append(r)
+
+        return combined[:limit]
+
+    def _full_text_search_vector_sources(
+        self,
+        user_id: str,
+        options: TranscriptSearchOptions,
+        limit: int,
+    ) -> list[SearchResult]:
+        """Search source_text in transcript_vectors for span-level full-text matching.
+
+        This catches extracted thinking blocks, tool outputs, and chunked content
+        that wouldn't be found by searching transcripts.content alone.
+        """
+        if self.conn is None:
+            return []
+
+        # Build content_type filter from search_in_* flags
+        content_types: list[str] = []
+        if options.search_in_user:
+            content_types.append("user_query")
+        if options.search_in_assistant:
+            content_types.append("assistant_response")
+        if options.search_in_thinking:
+            content_types.append("assistant_thinking")
+        if options.search_in_tool:
+            content_types.append("tool_output")
+
+        if not content_types:
+            return []
+
+        where_parts = ["v.user_id = ?", "v.source_text LIKE ?"]
+        params: list[Any] = [user_id, f"%{options.query}%"]
+
+        placeholders = ", ".join(["?"] * len(content_types))
+        where_parts.append(f"v.content_type IN ({placeholders})")
+        params.extend(content_types)
+
+        if options.filters:
+            if options.filters.project_slug:
+                where_parts.append("t.project_slug = ?")
+                params.append(options.filters.project_slug)
+
+            if options.filters.start_date:
+                where_parts.append("t.ts >= ?")
+                params.append(options.filters.start_date)
+
+            if options.filters.end_date:
+                where_parts.append("t.ts <= ?")
+                params.append(options.filters.end_date)
+
+        where_clause = " AND ".join(where_parts)
+
+        query = f"""
+            SELECT v.parent_id, v.session_id, v.source_text, v.content_type,
+                   v.span_start, v.span_end,
+                   t.project_slug, t.sequence, t.content, t.role, t.turn, t.ts
+            FROM transcript_vectors v
+            JOIN transcripts t ON t.id = v.parent_id
+            WHERE {where_clause}
+            LIMIT ?
+        """
+        params.append(limit * 3)  # Over-fetch for dedup
+
+        results_raw = self.conn.execute(query, params).fetchall()
+
+        # Deduplicate by parent_id, keeping first match
+        seen: dict[str, SearchResult] = {}
+        for row in results_raw:
+            parent_id = row[0]
+            if parent_id not in seen:
+                content_raw = row[8] or ""
+                try:
+                    content = json.loads(content_raw)
+                except (json.JSONDecodeError, TypeError):
+                    content = content_raw
+
+                seen[parent_id] = SearchResult(
                     session_id=row[1],
-                    project_slug=row[2],
-                    sequence=row[3],
-                    content=row[4] or "",
+                    project_slug=row[6],
+                    sequence=row[7],
+                    content=content,
                     metadata={
-                        "id": row[0],
-                        "role": row[5],
-                        "turn": row[6],
-                        "ts": row[7],
+                        "id": parent_id,
+                        "role": row[9],
+                        "turn": row[10],
+                        "ts": row[11],
+                        "content_type": row[3],
+                        "matched_text": row[2],
+                        "span_start": row[4],
+                        "span_end": row[5],
                     },
                     score=1.0,
                     source="full_text",
                 )
-                for row in results_raw
-            ]
 
-        return await asyncio.to_thread(_search)
+        return list(seen.values())[:limit]
 
     async def _semantic_search_transcripts(
         self,
@@ -1164,8 +1284,16 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
             raise ValueError("Embedding provider required for semantic search")
 
         query_vector = await self.embedding_provider.embed_text(options.query)
+        return await self._semantic_search_with_vector(user_id, options, limit, query_vector)
 
-        # Translate search_in_* flags to content_type filters
+    async def _semantic_search_with_vector(
+        self,
+        user_id: str,
+        options: TranscriptSearchOptions,
+        limit: int,
+        query_vector: list[float],
+    ) -> list[SearchResult]:
+        """Semantic search with pre-computed query vector (avoids double embedding)."""
         content_types: list[str] | None = []
         if options.search_in_user:
             content_types.append("user_query")
@@ -1196,10 +1324,14 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
         # Get more candidates
         candidate_limit = limit * 3
 
-        # Get both result sets
+        # Compute query embedding ONCE
+        query_vector = await self.embedding_provider.embed_text(options.query)
+        query_np = np.array(query_vector)
+
+        # Get both result sets (semantic reuses pre-computed vector)
         text_results = await self._full_text_search_transcripts(user_id, options, candidate_limit)
-        semantic_results = await self._semantic_search_transcripts(
-            user_id, options, candidate_limit
+        semantic_results = await self._semantic_search_with_vector(
+            user_id, options, candidate_limit, query_vector
         )
 
         # Merge and deduplicate
@@ -1214,24 +1346,23 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
         if len(combined) <= limit:
             return combined[:limit]
 
-        # Apply MMR re-ranking
-        query_vector = await self.embedding_provider.embed_text(options.query)
-        query_np = np.array(query_vector)
-
-        # Extract embeddings (fetch from DB if not in metadata)
+        # Extract embeddings for MMR (fetch from DB if not in metadata)
         vectors = []
         for result in combined:
             if "embedding" in result.metadata and result.metadata["embedding"]:
                 vectors.append(np.array(result.metadata["embedding"]))
             else:
-                # Fetch embedding from DB
-                embedding = await self._get_embedding(user_id, result.session_id, result.sequence)
+                # Fetch embedding from DB, using content_type for precision
+                ct = result.metadata.get("content_type")
+                embedding = await self._get_embedding(
+                    user_id, result.session_id, result.sequence, ct
+                )
                 if embedding:
                     vectors.append(np.array(embedding))
                 else:
                     vectors.append(np.zeros(len(query_vector)))
 
-        # Apply MMR
+        # Apply MMR re-ranking
         mmr_results = compute_mmr(
             vectors=vectors,
             query=query_np,
@@ -1242,13 +1373,13 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
         return [combined[idx] for idx, _ in mmr_results]
 
     async def _get_embedding(
-        self, user_id: str, session_id: str, sequence: int
+        self, user_id: str, session_id: str, sequence: int, content_type: str | None = None
     ) -> list[float] | None:
         """
-        Fetch first available embedding for a transcript message.
+        Fetch embedding for a transcript message, optionally by content_type.
 
-        Returns the first non-null vector from transcript_vectors.
-        Used primarily for testing.
+        When content_type is provided, fetches the specific matched vector.
+        Otherwise returns the first available vector.
         """
 
         def _get() -> list[float] | None:
@@ -1256,16 +1387,30 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
                 return None
 
             parent_id = f"{session_id}_msg_{sequence}"
-            result = self.conn.execute(
-                """
-                SELECT vector
-                FROM transcript_vectors
-                WHERE parent_id = ? AND user_id = ? AND vector IS NOT NULL
-                ORDER BY chunk_index
-                LIMIT 1
-                """,
-                [parent_id, user_id],
-            ).fetchone()
+
+            if content_type:
+                result = self.conn.execute(
+                    """
+                    SELECT vector
+                    FROM transcript_vectors
+                    WHERE parent_id = ? AND user_id = ? AND content_type = ?
+                      AND vector IS NOT NULL
+                    ORDER BY chunk_index
+                    LIMIT 1
+                    """,
+                    [parent_id, user_id, content_type],
+                ).fetchone()
+            else:
+                result = self.conn.execute(
+                    """
+                    SELECT vector
+                    FROM transcript_vectors
+                    WHERE parent_id = ? AND user_id = ? AND vector IS NOT NULL
+                    ORDER BY chunk_index
+                    LIMIT 1
+                    """,
+                    [parent_id, user_id],
+                ).fetchone()
 
             if result and result[0] is not None:
                 return result[0]
@@ -1597,7 +1742,10 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
         session_id: str,
         embeddings: list[dict[str, Any]],
     ) -> int:
-        """Upsert embeddings for existing transcript messages."""
+        """Upsert embeddings for existing transcript messages.
+
+        Stores embeddings as single-chunk vector records in transcript_vectors.
+        """
 
         def _upsert() -> int:
             if self.conn is None:
@@ -1605,22 +1753,38 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
 
             updated = 0
             for emb in embeddings:
-                doc_id = f"{session_id}_msg_{emb['sequence']}"
+                parent_id = f"{session_id}_msg_{emb['sequence']}"
+                vector_id = f"{parent_id}_user_query_0"
+                vector = emb["vector"]
 
+                # Delete existing vectors for this parent
                 self.conn.execute(
-                    """
-                    UPDATE transcripts
-                    SET embedding = ?,
-                        embedding_model = ?,
-                        synced_at = ?
-                    WHERE id = ? AND user_id = ?
+                    "DELETE FROM transcript_vectors WHERE parent_id = ?",
+                    [parent_id],
+                )
+
+                vec_literal = self._format_vector_literal(vector)
+                self.conn.execute(
+                    f"""
+                    INSERT INTO transcript_vectors (
+                        id, parent_id, user_id, session_id, project_slug,
+                        content_type, chunk_index, total_chunks,
+                        span_start, span_end, token_count,
+                        source_text, vector, embedding_model
+                    ) VALUES (
+                        ?, ?, ?, ?, ?,
+                        'user_query', 0, 1,
+                        0, 0, 0,
+                        '', {vec_literal}, ?
+                    )
                     """,
                     [
-                        emb["vector"],
-                        emb.get("metadata", {}).get("model", "unknown"),
-                        datetime.now(UTC).isoformat(),
-                        doc_id,
+                        vector_id,
+                        parent_id,
                         user_id,
+                        session_id,
+                        project_slug,
+                        emb.get("metadata", {}).get("model", "unknown"),
                     ],
                 )
                 updated += 1

@@ -1,12 +1,12 @@
-# Vector Schema Design - Multi-Embedding Strategy
+# Vector Schema Design - Externalized Multi-Vector Strategy
 
-> **Version**: 1.0.0  
-> **Last Updated**: 2025-02-05  
+> **Version**: 2.0.0  
+> **Last Updated**: 2025-02-06  
 > **Status**: Implemented across all 3 backends (DuckDB, SQLite, Cosmos DB)
 
-**Purpose**: Technical reference for how embeddings are stored and what content they represent.
+**Purpose**: Technical reference for how embeddings are stored externally from transcripts and what content they represent.
 
-**Key Insight**: Different content types need different embeddings for effective search.
+**Key Insight**: Different content types need different embeddings for effective search. Vectors are stored in a dedicated table, not inline on transcript rows.
 
 ---
 
@@ -22,76 +22,155 @@ CREATE TABLE transcripts (
 ```
 
 **Issues**:
-1. ❌ Can't search "only in assistant responses" vs "only in thinking"
-2. ❌ Can't weight different content types differently
-3. ❌ Loses information about what the vector represents
-4. ❌ Mixed signal (user question + assistant reasoning + tool output all look the same)
+1. Can't search "only in assistant responses" vs "only in thinking"
+2. Can't weight different content types differently
+3. Loses information about what the vector represents
+4. Mixed signal (user question + assistant reasoning + tool output all look the same)
 
 ---
 
-## Implemented Design: Multi-Vector Schema
+## Design Evolution
 
-### Transcripts Table Schema
+### Previously Considered: Inline Multi-Column (Option A)
+
+The earlier v0.2.0 design placed 4 vector columns directly on the `transcripts` table:
+
+```sql
+-- v0.2.0 approach (NO LONGER USED)
+CREATE TABLE transcripts (
+    ...
+    user_query_vector FLOAT[3072],
+    assistant_response_vector FLOAT[3072],
+    assistant_thinking_vector FLOAT[3072],
+    tool_output_vector FLOAT[3072]
+)
+```
+
+**Problems discovered**:
+- No chunking support: texts exceeding embedding model token limits (8192) could not be split
+- 4 HNSW indexes required (storage and rebuild overhead)
+- Sparse table: most rows had 3 of 4 vector columns as NULL
+- Tight coupling between conversation content and vector data
+
+### Implemented Design: Externalized Vector Table (Option C)
+
+Vectors are stored in a dedicated `transcript_vectors` table. Each row has a single `vector` column and a `content_type` discriminator. Multiple rows per transcript message are supported for chunked content.
+
+---
+
+## Implemented Design: Externalized Vectors
+
+### Transcripts Table (Vector-Free)
 
 ```sql
 CREATE TABLE transcripts (
     id VARCHAR PRIMARY KEY,
     user_id VARCHAR NOT NULL,
     session_id VARCHAR NOT NULL,
+    project_slug VARCHAR,
     sequence INTEGER NOT NULL,
-    
+
     -- Original Amplifier fields
-    role VARCHAR NOT NULL,  -- "user", "assistant", "tool"
-    content JSON,           -- Full original content (preserved as-is)
+    role VARCHAR NOT NULL,
+    content JSON NOT NULL,
     turn INTEGER,
     ts TIMESTAMP,
-    
+
     -- Extracted text for display/search
-    text_content TEXT,      -- Combined readable text
-    
-    -- Multiple embedding vectors (each for specific content type)
-    user_query_embedding FLOAT[3072],      -- User questions/input
-    assistant_response_embedding FLOAT[3072],  -- Assistant text responses
-    assistant_thinking_embedding FLOAT[3072],  -- Assistant reasoning
-    tool_output_embedding FLOAT[3072],     -- Tool execution results
-    
-    -- Metadata about embeddings
-    embedding_model VARCHAR,
-    embedding_metadata JSON,  -- {has_user_query, has_response, has_thinking, has_tool_output}
-    
-    synced_at TIMESTAMP
+    text_content TEXT,
+
+    -- Sync metadata
+    synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 ```
 
-### Why Multiple Embedding Columns?
+No embedding columns. No vector metadata. This table stores only conversation data.
 
-**Enables precise search queries**:
+### Transcript Vectors Table
+
+```sql
+CREATE TABLE transcript_vectors (
+    id VARCHAR NOT NULL PRIMARY KEY,
+    parent_id VARCHAR NOT NULL,         -- References transcripts.id
+    user_id VARCHAR NOT NULL,
+    session_id VARCHAR NOT NULL,
+    project_slug VARCHAR,
+    content_type VARCHAR NOT NULL,      -- 'user_query', 'assistant_response', etc.
+    chunk_index INTEGER NOT NULL DEFAULT 0,
+    total_chunks INTEGER NOT NULL DEFAULT 1,
+    span_start INTEGER NOT NULL DEFAULT 0,
+    span_end INTEGER NOT NULL,
+    token_count INTEGER NOT NULL,
+    source_text TEXT NOT NULL,          -- The text that was embedded
+    vector FLOAT[3072],                -- Single vector column
+    embedding_model VARCHAR,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+
+-- Single HNSW index (replaces 4 per-column indexes)
+CREATE INDEX idx_vectors_hnsw
+ON transcript_vectors USING HNSW (vector)
+WITH (metric = 'cosine');
+
+-- Supporting indexes for lookups and filtering
+CREATE INDEX idx_vectors_parent ON transcript_vectors (parent_id);
+CREATE INDEX idx_vectors_session ON transcript_vectors (user_id, session_id);
+CREATE INDEX idx_vectors_user ON transcript_vectors (user_id);
+```
+
+### Why This Design?
+
+**Enables precise search queries** via `content_type` filtering:
 
 ```sql
 -- Search ONLY user questions
-SELECT * FROM transcripts
-WHERE user_query_embedding IS NOT NULL
-  AND array_cosine_similarity(user_query_embedding, @query) > 0.8
+SELECT tv.*, t.content, t.role
+FROM transcript_vectors tv
+JOIN transcripts t ON tv.parent_id = t.id
+WHERE tv.content_type = 'user_query'
+  AND array_cosine_similarity(tv.vector, @query) > 0.8
 
 -- Search ONLY assistant reasoning
-SELECT * FROM transcripts
-WHERE assistant_thinking_embedding IS NOT NULL
-  AND array_cosine_similarity(assistant_thinking_embedding, @query) > 0.8
+SELECT tv.*, t.content, t.role
+FROM transcript_vectors tv
+JOIN transcripts t ON tv.parent_id = t.id
+WHERE tv.content_type = 'assistant_thinking'
+  AND array_cosine_similarity(tv.vector, @query) > 0.8
 
--- Search responses but NOT thinking
-SELECT * FROM transcripts
-WHERE assistant_response_embedding IS NOT NULL
-  AND array_cosine_similarity(assistant_response_embedding, @query) > 0.8
-
--- Search everything (hybrid across all vectors)
-SELECT * FROM transcripts
-WHERE (
-    array_cosine_similarity(user_query_embedding, @query) > 0.7 OR
-    array_cosine_similarity(assistant_response_embedding, @query) > 0.7 OR
-    array_cosine_similarity(assistant_thinking_embedding, @query) > 0.7 OR
-    array_cosine_similarity(tool_output_embedding, @query) > 0.7
-)
+-- Search everything (all content types)
+SELECT tv.*, t.content, t.role
+FROM transcript_vectors tv
+JOIN transcripts t ON tv.parent_id = t.id
+ORDER BY array_cosine_similarity(tv.vector, @query) DESC
+LIMIT 10
 ```
+
+**Additional benefits**:
+- Single HNSW index covers all content types
+- Chunking is natural (multiple rows with different `chunk_index`)
+- `source_text` enables full-text search on the embedded content
+- Dense table (every row has exactly one non-NULL vector)
+- Clean separation of concerns
+
+### HNSW Index Limitation
+
+DuckDB's HNSW index does not support pre-filtered queries. When a `WHERE user_id = ?` clause is present, DuckDB falls back to sequential scan instead of using the HNSW index. This is acceptable because DuckDB databases are single-user (one `.db` file per user), meaning the `WHERE` filter matches all rows in the database. The sequential scan effectively searches the same dataset the HNSW index would.
+
+---
+
+## Schema Versioning
+
+A `schema_meta` table tracks the current schema version:
+
+```sql
+CREATE TABLE schema_meta (
+    key VARCHAR PRIMARY KEY,
+    value VARCHAR
+)
+-- key='version', value='2' for externalized vectors
+```
+
+On initialization, backends check the version and auto-migrate from version 1 (inline vectors) to version 2 (externalized vectors). See `MULTI_VECTOR_IMPLEMENTATION.md` for migration details.
 
 ---
 
@@ -101,57 +180,54 @@ WHERE (
 
 ```python
 if message["role"] == "user":
-    user_query_embedding = embed(message["content"])
-    # All other embeddings: NULL
+    # -> content_type = "user_query"
+    # -> source_text = message["content"]
+    # -> vector = embed(source_text)
+    # All stored in transcript_vectors
 ```
 
-**Result**:
-```
-sequence=0, role=user, user_query_embedding=[0.1, 0.2, ...], others=NULL
-```
+**Result**: One `transcript_vectors` row with `content_type='user_query'`
 
 ### Assistant Messages (Complex)
 
 ```python
 if message["role"] == "assistant":
     content_blocks = message["content"]  # Array
-    
+
     # Extract thinking
     thinking_parts = [b["thinking"] for b in content_blocks if b["type"] == "thinking"]
     if thinking_parts:
-        assistant_thinking_embedding = embed("\n".join(thinking_parts))
-    
+        text = "\n\n".join(thinking_parts)
+        chunks = chunk_text(text, "assistant_thinking")  # May produce multiple chunks
+        # Each chunk -> one transcript_vectors row
+
     # Extract text responses
     text_parts = [b["text"] for b in content_blocks if b["type"] == "text"]
     if text_parts:
-        assistant_response_embedding = embed("\n".join(text_parts))
-    
+        text = "\n\n".join(text_parts)
+        chunks = chunk_text(text, "assistant_response")
+        # Each chunk -> one transcript_vectors row
+
     # Skip tool_call blocks - not embeddable
 ```
 
-**Result**:
-```
-sequence=1, role=assistant,
-    assistant_thinking_embedding=[0.3, 0.4, ...],
-    assistant_response_embedding=[0.5, 0.6, ...],
-    others=NULL
-```
+**Result**: 1-N `transcript_vectors` rows (1 per content type per chunk)
 
 ### Tool Messages
 
 ```python
 if message["role"] == "tool":
-    # Tool output (may be large!)
     tool_content = message["content"]
-    if isinstance(tool_content, str) and len(tool_content) < 10000:
-        tool_output_embedding = embed(tool_content)
-    # All other embeddings: NULL
+    if isinstance(tool_content, str) and len(tool_content) <= 10000:
+        # -> content_type = "tool_output"
+        # -> source_text = tool_content
+        # -> chunks if > 8192 tokens
+    elif isinstance(tool_content, str):
+        # Truncate to MAX_TOOL_OUTPUT_LENGTH (10000 chars) first
+        tool_content = tool_content[:10000]
 ```
 
-**Result**:
-```
-sequence=2, role=tool, tool_output_embedding=[0.7, 0.8, ...], others=NULL
-```
+**Result**: One or more `transcript_vectors` rows with `content_type='tool_output'`
 
 ---
 
@@ -165,294 +241,38 @@ CREATE TABLE events (
     user_id VARCHAR NOT NULL,
     session_id VARCHAR NOT NULL,
     sequence INTEGER NOT NULL,
-    
-    -- Event fields
-    event VARCHAR NOT NULL,     -- "llm.request", "tool.call", etc.
-    ts TIMESTAMP NOT NULL,
-    lvl VARCHAR,                -- "INFO", "DEBUG", "ERROR"
-    turn INTEGER,
-    
-    -- Event data (may be large)
-    data JSON,
-    data_truncated BOOLEAN,
-    data_size_bytes INTEGER,
-    
-    -- Extracted fields for structured search
-    tool_name VARCHAR,          -- Extracted from data.tool
-    error_type VARCHAR,         -- Extracted from data.error_type
-    model_used VARCHAR,         -- Extracted from data.model
-    
-    synced_at TIMESTAMP
-)
 
--- Indexes for structured search
-CREATE INDEX idx_events_type ON events(user_id, event, ts);
-CREATE INDEX idx_events_tool ON events(user_id, tool_name, ts);
-CREATE INDEX idx_events_level ON events(user_id, lvl, ts);
-```
-
-### Why NO Embeddings for Events?
-
-**Reasons**:
-1. **Events are telemetry** - Structured data optimized for filtering
-2. **High volume** - Thousands of events per session
-3. **Not conversational** - Event types are categorical, not semantic
-4. **Storage cost** - Would 10x embedding storage requirements
-5. **Search patterns** - Users search by event type, tool, level (structured)
-
-**Search queries for events** (all structured, no embeddings needed):
-
-```python
-# Find all bash tool executions
-await storage.search_events(
-    options=EventSearchOptions(
-        event_type="tool.call",
-        tool_name="bash"
-    )
-)
-
-# Find all errors
-await storage.search_events(
-    options=EventSearchOptions(
-        level="ERROR"
-    )
-)
-
-# Find LLM requests for specific model
-await storage.search_events(
-    options=EventSearchOptions(
-        event_type="llm.request",
-        filters=SearchFilters(
-            start_date="2024-01-01",
-            end_date="2024-02-01"
-        )
-    )
-)
-```
-
-**No semantic search needed** - these are precise, structured queries.
-
-**Future consideration**: If we want to search error messages semantically:
-```python
-# Extract error message text from data field
-error_message = event["data"].get("error", {}).get("message", "")
-# Could embed this for "find similar errors"
-# But this is rare and can be added later
-```
-
----
-
-## Embedding Metadata Strategy
-
-### Option A: Separate Columns (Implemented)
-
-**Schema**:
-```sql
-user_query_embedding FLOAT[3072],
-assistant_response_embedding FLOAT[3072],
-assistant_thinking_embedding FLOAT[3072],
-tool_output_embedding FLOAT[3072],
-embedding_model VARCHAR
-```
-
-**Pros**:
-- ✅ Clear what each vector represents
-- ✅ Easy to search specific content types
-- ✅ No parsing needed to understand vector source
-- ✅ Standard SQL NULL handling
-
-**Cons**:
-- Sparse table (most rows have 1-2 NULLs)
-- Slightly more storage overhead
-
-### Option B: Single Column + Metadata
-
-**Schema**:
-```sql
-embedding FLOAT[3072],
-embedding_source VARCHAR,  -- "user_query", "assistant_response", "assistant_thinking", "tool_output"
-embedding_model VARCHAR
-```
-
-**Pros**:
-- Single vector column
-- Dense table
-
-**Cons**:
-- ❌ Can't search multiple content types in single query efficiently
-- ❌ Need to parse embedding_source to filter
-- ❌ More complex query logic
-
-### Option C: Separate Rows per Content Type
-
-**Schema** (each content type = separate row):
-```sql
-sequence INTEGER,          -- Logical message sequence
-sub_sequence INTEGER,      -- 0=thinking, 1=response, 2=tool_output
-content_type VARCHAR,      -- "user_query", "assistant_thinking", "assistant_response"
-text_content TEXT,
-embedding FLOAT[3072],
-```
-
-**Pros**:
-- Clean separation
-- Easy to search by content type
-- Standard row-based approach
-
-**Cons**:
-- Breaks 1:1 mapping with transcript.jsonl lines
-- More rows (3-4x)
-
-**Recommendation**: **Option A** - Multiple embedding columns
-
----
-
-## Updated Schema Design
-
-### Transcripts Table (Final)
-
-```sql
-CREATE TABLE transcripts (
-    id VARCHAR PRIMARY KEY,
-    user_id VARCHAR NOT NULL,
-    session_id VARCHAR NOT NULL,
-    project_slug VARCHAR,
-    sequence INTEGER NOT NULL,
-    
-    -- Original Amplifier fields
-    role VARCHAR NOT NULL,
-    content JSON NOT NULL,  -- Original content (preserved as-is)
-    turn INTEGER,
-    ts TIMESTAMP,
-    
-    -- VECTOR COLUMNS (multiple embeddings per message)
-    user_query_vector FLOAT[3072],           -- For role=user content
-    assistant_response_vector FLOAT[3072],   -- For role=assistant text blocks
-    assistant_thinking_vector FLOAT[3072],   -- For role=assistant thinking blocks
-    tool_output_vector FLOAT[3072],          -- For role=tool content
-    
-    -- Vector metadata
-    embedding_model VARCHAR,
-    vector_metadata JSON,  -- {user_query: bool, assistant_response: bool, assistant_thinking: bool, tool_output: bool}
-    
-    -- Sync metadata
-    synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    
-    -- Indexes
-    INDEX idx_session (user_id, session_id, sequence),
-    INDEX idx_user_query_vector USING HNSW (user_query_vector),
-    INDEX idx_assistant_response_vector USING HNSW (assistant_response_vector),
-    INDEX idx_assistant_thinking_vector USING HNSW (assistant_thinking_vector),
-    INDEX idx_tool_output_vector USING HNSW (tool_output_vector)
-)
-```
-
-### Events Table (No Embeddings)
-
-```sql
-CREATE TABLE events (
-    id VARCHAR PRIMARY KEY,
-    user_id VARCHAR NOT NULL,
-    session_id VARCHAR NOT NULL,
-    sequence INTEGER NOT NULL,
-    
     -- Event fields
     event VARCHAR NOT NULL,
     ts TIMESTAMP NOT NULL,
     lvl VARCHAR,
     turn INTEGER,
     data JSON,
-    
+
     -- Extracted fields for fast structured search
-    tool_name VARCHAR,      -- FROM data.tool
-    error_type VARCHAR,     -- FROM data.error_type  
-    model_used VARCHAR,     -- FROM data.model
-    
+    tool_name VARCHAR,
+    error_type VARCHAR,
+    model_used VARCHAR,
+
     -- Size tracking
     data_truncated BOOLEAN,
     data_size_bytes INTEGER,
-    synced_at TIMESTAMP,
-    
-    -- Indexes for structured search (NO vector indexes)
-    INDEX idx_event_type (user_id, event, ts),
-    INDEX idx_tool_name (user_id, tool_name, ts),
-    INDEX idx_level (user_id, lvl, ts)
+    synced_at TIMESTAMP
 )
+
+-- Indexes for structured search (NO vector indexes)
+CREATE INDEX idx_event_type ON events(user_id, event, ts);
+CREATE INDEX idx_tool_name ON events(user_id, tool_name, ts);
+CREATE INDEX idx_level ON events(user_id, lvl, ts);
 ```
 
-**Note**: Events use **structured search only** - no embedding columns needed.
+### Why NO Embeddings for Events?
 
----
-
-## Extraction Functions
-
-### For User Messages
-
-```python
-def extract_user_content(message: dict) -> dict[str, str]:
-    """Extract content from user message."""
-    return {
-        "user_query": message.get("content", "")
-    }
-```
-
-**Produces**: Single `user_query` text for embedding
-
-### For Assistant Messages
-
-```python
-def extract_assistant_content(message: dict) -> dict[str, str]:
-    """Extract content from assistant message with content array."""
-    content = message.get("content", [])
-    
-    result = {
-        "assistant_response": "",
-        "assistant_thinking": ""
-    }
-    
-    if isinstance(content, str):
-        result["assistant_response"] = content
-        return result
-    
-    if isinstance(content, list):
-        thinking_parts = []
-        text_parts = []
-        
-        for block in content:
-            if block.get("type") == "thinking":
-                thinking_parts.append(block.get("thinking", ""))
-            elif block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-            # Skip tool_call blocks
-        
-        result["assistant_thinking"] = "\n\n".join(thinking_parts)
-        result["assistant_response"] = "\n\n".join(text_parts)
-    
-    return result
-```
-
-**Produces**: Two separate texts - `assistant_response` and `assistant_thinking`
-
-### For Tool Messages
-
-```python
-def extract_tool_content(message: dict) -> dict[str, str]:
-    """Extract content from tool message."""
-    content = message.get("content", "")
-    
-    # Limit very large tool outputs
-    if isinstance(content, str):
-        if len(content) > 10000:
-            content = content[:10000] + "... (truncated)"
-    else:
-        content = str(content)[:10000]
-    
-    return {
-        "tool_output": content
-    }
-```
-
-**Produces**: Single `tool_output` text (truncated if huge)
+1. **Events are telemetry** - Structured data optimized for filtering
+2. **High volume** - Thousands of events per session
+3. **Not conversational** - Event types are categorical, not semantic
+4. **Storage cost** - Would multiply embedding storage requirements
+5. **Search patterns** - Users search by event type, tool, level (structured)
 
 ---
 
@@ -462,273 +282,66 @@ def extract_tool_content(message: dict) -> dict[str, str]:
 def extract_all_embeddable_content(message: dict) -> dict[str, str]:
     """
     Extract all embeddable content from a transcript message.
-    
+
     Returns dict with keys:
         - user_query: str | None
         - assistant_response: str | None
         - assistant_thinking: str | None
         - tool_output: str | None
-    
+
     Only the relevant key(s) for the message role will be populated.
     """
-    role = message.get("role")
-    
-    if role == "user":
-        return {
-            "user_query": message.get("content", ""),
-            "assistant_response": None,
-            "assistant_thinking": None,
-            "tool_output": None
-        }
-    
-    elif role == "assistant":
-        extracted = extract_assistant_content(message)
-        return {
-            "user_query": None,
-            "assistant_response": extracted.get("assistant_response") or None,
-            "assistant_thinking": extracted.get("assistant_thinking") or None,
-            "tool_output": None
-        }
-    
-    elif role == "tool":
-        extracted = extract_tool_content(message)
-        return {
-            "user_query": None,
-            "assistant_response": None,
-            "assistant_thinking": None,
-            "tool_output": extracted.get("tool_output") or None
-        }
-    
-    else:
-        # Unknown role - no embeddings
-        return {
-            "user_query": None,
-            "assistant_response": None,
-            "assistant_thinking": None,
-            "tool_output": None
-        }
 ```
 
----
-
-## Embedding Generation During Sync
-
-### Updated sync_transcript_lines Logic
-
-```python
-async def sync_transcript_lines(
-    self,
-    user_id: str,
-    host_id: str,
-    project_slug: str,
-    session_id: str,
-    lines: list[dict],
-    start_sequence: int = 0,
-    embeddings: dict[str, list[list[float]]] | None = None,  # Changed!
-) -> int:
-    """
-    Sync transcript lines with multi-vector embeddings.
-    
-    Args:
-        embeddings: Optional pre-computed embeddings as dict:
-            {
-                "user_query": [[0.1, ...], [0.2, ...], ...],
-                "assistant_response": [[0.3, ...], ...],
-                "assistant_thinking": [[0.4, ...], ...],
-                "tool_output": [[0.5, ...], ...]
-            }
-            Each list matches length of lines (use None for non-applicable)
-    """
-    if not lines:
-        return 0
-    
-    # Generate embeddings if not provided
-    if embeddings is None and self.embedding_provider:
-        embeddings = await self._generate_embeddings_for_lines(lines)
-    
-    # Store each line with its relevant embeddings
-    for i, line in enumerate(lines):
-        sequence = start_sequence + i
-        role = line.get("role")
-        
-        # Determine which embeddings to store
-        user_query_vec = embeddings.get("user_query", [None]*len(lines))[i]
-        assistant_response_vec = embeddings.get("assistant_response", [None]*len(lines))[i]
-        assistant_thinking_vec = embeddings.get("assistant_thinking", [None]*len(lines))[i]
-        tool_output_vec = embeddings.get("tool_output", [None]*len(lines))[i]
-        
-        # Insert/update with all vectors
-        await self._store_transcript(
-            sequence=sequence,
-            line=line,
-            user_query_vector=user_query_vec,
-            assistant_response_vector=assistant_response_vec,
-            assistant_thinking_vector=assistant_thinking_vec,
-            tool_output_vector=tool_output_vec
-        )
-```
-
-### Batch Embedding Generation
-
-```python
-async def _generate_embeddings_for_lines(
-    self, lines: list[dict]
-) -> dict[str, list[list[float] | None]]:
-    """
-    Generate all embeddings for a batch of transcript lines.
-    
-    Returns dict with one list per embedding type, where each list
-    has one entry per input line (None if not applicable).
-    """
-    # Extract all embeddable content
-    user_queries = []
-    assistant_responses = []
-    assistant_thinkings = []
-    tool_outputs = []
-    
-    for line in lines:
-        extracted = extract_all_embeddable_content(line)
-        user_queries.append(extracted["user_query"])
-        assistant_responses.append(extracted["assistant_response"])
-        assistant_thinkings.append(extracted["assistant_thinking"])
-        tool_outputs.append(extracted["tool_output"])
-    
-    # Generate embeddings for each type (only non-None values)
-    user_query_embeddings = await self._embed_non_none(user_queries)
-    assistant_response_embeddings = await self._embed_non_none(assistant_responses)
-    assistant_thinking_embeddings = await self._embed_non_none(assistant_thinkings)
-    tool_output_embeddings = await self._embed_non_none(tool_outputs)
-    
-    return {
-        "user_query": user_query_embeddings,
-        "assistant_response": assistant_response_embeddings,
-        "assistant_thinking": assistant_thinking_embeddings,
-        "tool_output": tool_output_embeddings,
-    }
-
-async def _embed_non_none(self, texts: list[str | None]) -> list[list[float] | None]:
-    """Generate embeddings only for non-None texts."""
-    # Collect non-None texts with their indices
-    texts_to_embed = [(i, text) for i, text in enumerate(texts) if text]
-    
-    if not texts_to_embed:
-        return [None] * len(texts)
-    
-    # Generate embeddings (single batch call!)
-    just_texts = [text for _, text in texts_to_embed]
-    embeddings = await self.embedding_provider.embed_batch(just_texts)
-    
-    # Map back to original positions
-    result = [None] * len(texts)
-    for (original_idx, _), embedding in zip(texts_to_embed, embeddings):
-        result[original_idx] = embedding
-    
-    return result
-```
-
-**Efficiency**: Still uses batch operations! Single API call per content type.
-
----
-
-## Search Query Examples
-
-### Search Only User Questions
-
-```python
-results = await storage.search_transcripts(
-    user_id="user-123",
-    options=TranscriptSearchOptions(
-        query="how do I implement vector search?",
-        search_type="semantic",
-        search_in_user=True,           # Only user messages
-        search_in_assistant=False,
-        search_in_thinking=False
-    )
-)
-
-# SQL generated:
-# SELECT * WHERE role = 'user' 
-#   AND user_query_vector IS NOT NULL
-#   AND array_cosine_similarity(user_query_vector, @query) > threshold
-```
-
-### Search Only Assistant Reasoning
-
-```python
-results = await storage.search_transcripts(
-    user_id="user-123",
-    options=TranscriptSearchOptions(
-        query="why did it choose DuckDB",
-        search_type="semantic",
-        search_in_user=False,
-        search_in_assistant=False,
-        search_in_thinking=True  # Only thinking blocks!
-    )
-)
-
-# SQL generated:
-# SELECT * WHERE role = 'assistant'
-#   AND assistant_thinking_vector IS NOT NULL
-#   AND array_cosine_similarity(assistant_thinking_vector, @query) > threshold
-```
-
-### Hybrid Search Across Everything
-
-```python
-results = await storage.search_transcripts(
-    user_id="user-123",
-    options=TranscriptSearchOptions(
-        query="vector database comparison",
-        search_type="hybrid",
-        search_in_user=True,
-        search_in_assistant=True,
-        search_in_thinking=True
-    )
-)
-
-# Searches ALL vector columns:
-# user_query_vector, assistant_response_vector, assistant_thinking_vector, tool_output_vector
-# Merges results, applies MMR re-ranking
-```
+After extraction, each non-None text is:
+1. Counted for tokens via tiktoken (`cl100k_base` encoding)
+2. If > 8192 tokens: chunked into ~1024-token segments with 128-token overlap
+3. Each chunk embedded and stored as a `transcript_vectors` row
 
 ---
 
 ## Storage Overhead Analysis
 
-### Per Message Storage
+### Per Vector Record
 
-| Message Type | Original Data | Vectors | Total Storage |
-|--------------|---------------|---------|---------------|
-| **User** | ~500 bytes | 1 vector (12 KB) | ~12.5 KB |
-| **Assistant (simple)** | ~500 bytes | 1 vector (12 KB) | ~12.5 KB |
-| **Assistant (with thinking)** | ~2 KB | 2 vectors (24 KB) | ~26 KB |
-| **Tool** | ~5 KB | 1 vector (12 KB) | ~17 KB |
+| Component | Size |
+|-----------|------|
+| Vector (3072-d, float32) | ~12 KB |
+| Source text | Variable (avg ~500 bytes for short, up to ~4 KB for chunks) |
+| Metadata fields | ~200 bytes |
 
-**Average**: ~15-20 KB per message (vs ~500 bytes without embeddings)
+### Per Message (Typical)
 
-**For 1000-message session**:
-- Without embeddings: ~500 KB
-- With embeddings: ~15-20 MB
+| Message Type | Vector Records | Total Vector Storage |
+|--------------|---------------|---------------------|
+| **User** | 1 record | ~12.5 KB |
+| **Assistant (simple)** | 1 record (response only) | ~12.5 KB |
+| **Assistant (with thinking)** | 2 records | ~25 KB |
+| **Assistant (long thinking, 16k tokens)** | 2 records (response) + ~2 records (chunked thinking) | ~50 KB |
+| **Tool** | 1 record | ~12.5 KB |
 
-**Cost consideration**: Embeddings are 30-40x the storage size!
+**For 1000-message session** (typical mix):
+- Vector storage: ~15-20 MB
+- Transcript storage (no vectors): ~500 KB
 
 **Mitigation**:
-- Use quantized indexes (Cosmos: 128 bytes vs 12 KB)
-- Don't embed tool outputs >10KB
+- Externalized table means transcripts stay small for fast content queries
+- Use quantized indexes (Cosmos: 128 bytes per vector)
+- Don't embed tool outputs > 10000 chars
 - Use DuckDB for local (no cloud storage costs)
 
 ---
 
 ## Summary
 
-### Vector Columns Defined
+### Content Types
 
-| Column Name | Contains | From Role | From Field |
+| Content Type | Contains | From Role | From Field |
 |-------------|----------|-----------|------------|
-| `user_query_vector` | User questions/input | user | `content` (string) |
-| `assistant_response_vector` | Assistant's visible responses | assistant | `content[].text` blocks |
-| `assistant_thinking_vector` | Assistant's reasoning | assistant | `content[].thinking` blocks |
-| `tool_output_vector` | Tool execution results | tool | `content` (string, truncated) |
+| `user_query` | User questions/input | user | `content` (string) |
+| `assistant_response` | Assistant's visible responses | assistant | `content[].text` blocks |
+| `assistant_thinking` | Assistant's reasoning | assistant | `content[].thinking` blocks |
+| `tool_output` | Tool execution results | tool | `content` (string, truncated to 10000 chars) |
 
 ### Events Search Strategy
 
@@ -746,14 +359,18 @@ results = await storage.search_transcripts(
 
 All items completed:
 
-- ✅ Schema updated in all three backends (DuckDB, SQLite, Cosmos)
-- ✅ Extraction functions implemented (`content_extraction.py`)
-- ✅ Embedding generation produces multiple vectors per message
-- ✅ Search queries use appropriate vector columns
-- ✅ Tests added with real assistant message structure (18+ tests)
-- ✅ Documentation updated
+- Schema updated in all three backends (DuckDB, SQLite, Cosmos)
+- Externalized `transcript_vectors` table/document type implemented
+- Single HNSW index (DuckDB) / single quantizedFlat index (Cosmos)
+- Chunking pipeline for texts > 8192 tokens
+- Token counting via tiktoken
+- Extraction functions implemented (`content_extraction.py`)
+- Schema versioning via `schema_meta` table
+- Auto-migration from inline vectors to externalized vectors
+- Search queries use `content_type` filtering on transcript_vectors
+- Full-text search covers both `transcripts.content` and `transcript_vectors.source_text`
 
 **See also**:
-- `EMBEDDING_STRATEGY.md` - What content gets embedded
+- `EMBEDDING_STRATEGY.md` - What content gets embedded and chunking details
 - `MULTI_VECTOR_IMPLEMENTATION.md` - Complete implementation details
 - `HYBRID_SEARCH_GUIDE.md` - User guide for search features

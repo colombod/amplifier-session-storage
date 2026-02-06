@@ -10,6 +10,7 @@ from .base import (
     MessageContext,
     SearchFilters,
     SearchResult,
+    SessionSyncStats,
     StorageBackend,
     TranscriptMessage,
     TranscriptSearchOptions,
@@ -26,6 +27,7 @@ __all__ = [
     # Result types
     "SearchResult",
     "TranscriptMessage",
+    "SessionSyncStats",
     # Context types
     "TurnContext",
     "MessageContext",

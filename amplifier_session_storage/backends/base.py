@@ -158,6 +158,21 @@ class MessageContext:
         return (min(all_seqs), max(all_seqs)) if all_seqs else (0, 0)
 
 
+@dataclass
+class SessionSyncStats:
+    """Lightweight sync statistics for consistency checking.
+
+    Used by the sync daemon to detect partial data loss without
+    loading all documents. Counts and timestamp ranges are sufficient
+    for consistency verification.
+    """
+
+    event_count: int
+    transcript_count: int
+    event_ts_range: tuple[str | None, str | None]  # (earliest, latest)
+    transcript_ts_range: tuple[str | None, str | None]  # (earliest, latest)
+
+
 class StorageBackend(ABC):
     """
     Abstract base for all storage backends.
@@ -516,6 +531,20 @@ class StorageBackend(ABC):
             - tools_used: dict[str, int]
         """
         pass
+
+    @abstractmethod
+    async def get_session_sync_stats(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> SessionSyncStats:
+        """Get lightweight sync statistics for a session.
+
+        Returns counts and timestamp ranges for events and transcripts
+        using aggregate queries. Much cheaper than loading all documents.
+        """
+        ...
 
     # =========================================================================
     # Discovery APIs

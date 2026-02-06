@@ -32,6 +32,7 @@ from .base import (
     MessageContext,
     SearchFilters,
     SearchResult,
+    SessionSyncStats,
     StorageBackend,
     TranscriptMessage,
     TranscriptSearchOptions,
@@ -1968,6 +1969,67 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
             }
 
         return await asyncio.to_thread(_get_stats)
+
+    async def get_session_sync_stats(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> SessionSyncStats:
+        """Get lightweight sync statistics using aggregate queries."""
+
+        def _query() -> SessionSyncStats:
+            if self.conn is None:
+                raise StorageIOError(
+                    "get_session_sync_stats", cause=RuntimeError("Not initialized")
+                )
+
+            results = self.conn.execute(
+                """
+                SELECT
+                    'event' as type,
+                    COUNT(*) as count,
+                    MIN(ts) as earliest,
+                    MAX(ts) as latest
+                FROM events
+                WHERE user_id = ? AND session_id = ?
+                UNION ALL
+                SELECT
+                    'transcript' as type,
+                    COUNT(*) as count,
+                    MIN(ts) as earliest,
+                    MAX(ts) as latest
+                FROM transcripts
+                WHERE user_id = ? AND session_id = ?
+                """,
+                [user_id, session_id, user_id, session_id],
+            ).fetchall()
+
+            event_count = transcript_count = 0
+            event_earliest = event_latest = None
+            transcript_earliest = transcript_latest = None
+
+            for row in results:
+                doc_type, count, earliest, latest = row
+                earliest_str = str(earliest) if earliest else None
+                latest_str = str(latest) if latest else None
+                if doc_type == "event":
+                    event_count = count
+                    event_earliest = earliest_str
+                    event_latest = latest_str
+                elif doc_type == "transcript":
+                    transcript_count = count
+                    transcript_earliest = earliest_str
+                    transcript_latest = latest_str
+
+            return SessionSyncStats(
+                event_count=event_count,
+                transcript_count=transcript_count,
+                event_ts_range=(event_earliest, event_latest),
+                transcript_ts_range=(transcript_earliest, transcript_latest),
+            )
+
+        return await asyncio.to_thread(_query)
 
     # =========================================================================
     # Discovery APIs

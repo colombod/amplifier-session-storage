@@ -720,6 +720,135 @@ class TestSQLiteHybridSearch:
         assert results[0].source == "full_text"
 
 
+class TestSQLiteSyncStats:
+    """Tests for get_session_sync_stats."""
+
+    @pytest.mark.asyncio
+    async def test_empty_session(self, sqlite_storage_no_embeddings):
+        """Stats for a session with no data returns zeros and None ranges."""
+        stats = await sqlite_storage_no_embeddings.get_session_sync_stats(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="nonexistent-session",
+        )
+
+        assert stats.event_count == 0
+        assert stats.transcript_count == 0
+        assert stats.event_ts_range == (None, None)
+        assert stats.transcript_ts_range == (None, None)
+
+    @pytest.mark.asyncio
+    async def test_with_data(self, sqlite_storage_no_embeddings):
+        """Stats return correct counts and timestamp ranges."""
+        storage = sqlite_storage_no_embeddings
+
+        # Sync events
+        events = [
+            {"event": "session.start", "ts": "2024-01-15T10:00:00Z", "lvl": "info"},
+            {"event": "llm.request", "ts": "2024-01-15T10:00:05Z", "lvl": "debug"},
+            {"event": "session.end", "ts": "2024-01-15T10:00:10Z", "lvl": "info"},
+        ]
+        await storage.sync_event_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="session-1",
+            lines=events,
+        )
+
+        # Sync transcripts
+        transcripts = [
+            {"role": "user", "content": "Hello", "turn": 1, "ts": "2024-01-15T10:00:01Z"},
+            {"role": "assistant", "content": "Hi!", "turn": 1, "ts": "2024-01-15T10:00:02Z"},
+        ]
+        await storage.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="session-1",
+            lines=transcripts,
+        )
+
+        stats = await storage.get_session_sync_stats(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="session-1",
+        )
+
+        assert stats.event_count == 3
+        assert stats.transcript_count == 2
+        assert stats.event_ts_range == ("2024-01-15T10:00:00Z", "2024-01-15T10:00:10Z")
+        assert stats.transcript_ts_range == ("2024-01-15T10:00:01Z", "2024-01-15T10:00:02Z")
+
+    @pytest.mark.asyncio
+    async def test_session_isolation(self, sqlite_storage_no_embeddings):
+        """Stats only include data for the queried session."""
+        storage = sqlite_storage_no_embeddings
+
+        # Session 1: 2 events, 1 transcript
+        await storage.sync_event_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="session-1",
+            lines=[
+                {"event": "a", "ts": "2024-01-15T10:00:00Z", "lvl": "info"},
+                {"event": "b", "ts": "2024-01-15T10:00:01Z", "lvl": "info"},
+            ],
+        )
+        await storage.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="session-1",
+            lines=[{"role": "user", "content": "Hello", "turn": 1, "ts": "2024-01-15T10:00:00Z"}],
+        )
+
+        # Session 2: 5 events, 3 transcripts
+        await storage.sync_event_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="session-2",
+            lines=[
+                {"event": "c", "ts": "2024-01-16T10:00:00Z", "lvl": "info"},
+                {"event": "d", "ts": "2024-01-16T10:00:01Z", "lvl": "info"},
+                {"event": "e", "ts": "2024-01-16T10:00:02Z", "lvl": "info"},
+                {"event": "f", "ts": "2024-01-16T10:00:03Z", "lvl": "info"},
+                {"event": "g", "ts": "2024-01-16T10:00:04Z", "lvl": "info"},
+            ],
+        )
+        await storage.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="session-2",
+            lines=[
+                {"role": "user", "content": "A", "turn": 1, "ts": "2024-01-16T10:00:00Z"},
+                {"role": "assistant", "content": "B", "turn": 1, "ts": "2024-01-16T10:00:01Z"},
+                {"role": "user", "content": "C", "turn": 2, "ts": "2024-01-16T10:00:02Z"},
+            ],
+        )
+
+        # Query session-1 only
+        stats1 = await storage.get_session_sync_stats(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="session-1",
+        )
+        assert stats1.event_count == 2
+        assert stats1.transcript_count == 1
+
+        # Query session-2 only
+        stats2 = await storage.get_session_sync_stats(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="session-2",
+        )
+        assert stats2.event_count == 5
+        assert stats2.transcript_count == 3
+
+
 class TestSQLiteContextManager:
     """Tests for async context manager."""
 

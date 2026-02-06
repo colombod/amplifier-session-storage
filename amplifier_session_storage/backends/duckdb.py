@@ -18,14 +18,9 @@ from typing import Any
 import duckdb
 import numpy as np
 
-from ..content_extraction import (
-    EMBED_TOKEN_LIMIT,
-    count_embeddable_content_types,
-    count_tokens,
-    extract_all_embeddable_content,
-    truncate_to_tokens,
-)
+from ..content_extraction import count_embeddable_content_types
 from ..embeddings import EmbeddingProvider
+from ..embeddings.mixin import EmbeddingMixin
 from ..exceptions import StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
 from .base import (
@@ -146,7 +141,7 @@ class DuckDBConfig:
         )
 
 
-class DuckDBBackend(StorageBackend):
+class DuckDBBackend(EmbeddingMixin, StorageBackend):
     """
     DuckDB storage backend with vector similarity search.
 
@@ -211,97 +206,6 @@ class DuckDBBackend(StorageBackend):
         vec_str = "[" + ", ".join(str(float(x)) for x in vector) + "]"
         dimension = len(vector)
         return f"{vec_str}::FLOAT[{dimension}]"
-
-    async def _embed_non_none(self, texts: list[str | None]) -> list[list[float] | None]:
-        """
-        Generate embeddings only for non-None texts.
-
-        Applies token-limit truncation as a safety net to prevent embedding API
-        failures when text exceeds the model's context window (8192 tokens for
-        text-embedding-3-large).
-
-        Args:
-            texts: List of text strings (some may be None)
-
-        Returns:
-            List of embeddings with None preserved at same indices
-        """
-        if not self.embedding_provider:
-            return [None] * len(texts)
-
-        # Find non-None texts and their positions
-        texts_to_embed: list[tuple[int, str]] = [
-            (i, text) for i, text in enumerate(texts) if text is not None
-        ]
-
-        if not texts_to_embed:
-            return [None] * len(texts)
-
-        # Extract texts with safety truncation for token limits
-        just_texts: list[str] = []
-        for _, text in texts_to_embed:
-            token_count = count_tokens(text)
-            if token_count > EMBED_TOKEN_LIMIT:
-                logger.warning(
-                    f"Text exceeds embedding token limit "
-                    f"({token_count} > {EMBED_TOKEN_LIMIT} tokens), "
-                    f"truncating for embedding. "
-                    f"First 100 chars: {text[:100]!r}"
-                )
-                text = truncate_to_tokens(text, EMBED_TOKEN_LIMIT)
-            just_texts.append(text)
-
-        # Generate embeddings
-        embeddings = await self.embedding_provider.embed_batch(just_texts)
-
-        # Place embeddings back at original indices
-        result: list[list[float] | None] = [None] * len(texts)
-        for (original_idx, _), embedding in zip(texts_to_embed, embeddings, strict=True):
-            result[original_idx] = embedding
-
-        return result
-
-    async def _generate_multi_vector_embeddings(
-        self, lines: list[dict[str, Any]]
-    ) -> dict[str, list[list[float] | None]]:
-        """
-        Generate embeddings for all content types in a batch.
-
-        Extracts all embeddable content from messages and generates
-        embeddings for each content type separately.
-
-        Args:
-            lines: Transcript lines from Amplifier
-
-        Returns:
-            Dict with keys: user_query, assistant_response, assistant_thinking, tool_output
-            Each value is a list of embeddings (or None) matching the input lines
-        """
-        if not self.embedding_provider:
-            none_list: list[list[float] | None] = [None] * len(lines)
-            return {
-                "user_query": none_list,
-                "assistant_response": none_list,
-                "assistant_thinking": none_list,
-                "tool_output": none_list,
-            }
-
-        # Extract all content types
-        all_content = [extract_all_embeddable_content(line) for line in lines]
-
-        # Separate by content type
-        user_queries = [c["user_query"] for c in all_content]
-        assistant_responses = [c["assistant_response"] for c in all_content]
-        assistant_thinkings = [c["assistant_thinking"] for c in all_content]
-        tool_outputs = [c["tool_output"] for c in all_content]
-
-        # Generate embeddings for each type
-        return {
-            "user_query": await self._embed_non_none(user_queries),
-            "assistant_response": await self._embed_non_none(assistant_responses),
-            "assistant_thinking": await self._embed_non_none(assistant_thinkings),
-            "tool_output": await self._embed_non_none(tool_outputs),
-        }
 
     async def initialize(self) -> None:
         """Initialize DuckDB connection and schema."""

@@ -19,14 +19,9 @@ from azure.cosmos.aio import ContainerProxy, CosmosClient, DatabaseProxy
 from azure.cosmos.exceptions import CosmosHttpResponseError, CosmosResourceNotFoundError
 from azure.identity.aio import DefaultAzureCredential
 
-from ..content_extraction import (
-    EMBED_TOKEN_LIMIT,
-    count_embeddable_content_types,
-    count_tokens,
-    extract_all_embeddable_content,
-    truncate_to_tokens,
-)
+from ..content_extraction import count_embeddable_content_types
 from ..embeddings import EmbeddingProvider
+from ..embeddings.mixin import EmbeddingMixin
 from ..exceptions import AuthenticationError, StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
 from .base import (
@@ -235,7 +230,7 @@ class CosmosConfig:
         )
 
 
-class CosmosBackend(StorageBackend):
+class CosmosBackend(EmbeddingMixin, StorageBackend):
     """
     Cosmos DB storage backend with hybrid search support.
 
@@ -723,79 +718,6 @@ class CosmosBackend(StorageBackend):
             return deleted_count > 0
         except CosmosResourceNotFoundError:
             return False
-
-    # =========================================================================
-    # Embedding Helper Methods
-    # =========================================================================
-
-    async def _embed_non_none(self, texts: list[str | None]) -> list[list[float] | None]:
-        """Generate embeddings only for non-None texts.
-
-        Applies token-limit truncation as a safety net to prevent embedding API
-        failures when text exceeds the model's context window.
-        """
-        if not self.embedding_provider:
-            return [None] * len(texts)
-
-        # Collect non-None texts with their indices
-        texts_to_embed: list[tuple[int, str]] = []
-        for i, text in enumerate(texts):
-            if text is not None:
-                texts_to_embed.append((i, text))
-
-        if not texts_to_embed:
-            return [None] * len(texts)
-
-        # Extract texts with safety truncation for token limits
-        non_none_texts: list[str] = []
-        for _, text in texts_to_embed:
-            token_count = count_tokens(text)
-            if token_count > EMBED_TOKEN_LIMIT:
-                logger.warning(
-                    f"Text exceeds embedding token limit "
-                    f"({token_count} > {EMBED_TOKEN_LIMIT} tokens), "
-                    f"truncating for embedding. "
-                    f"First 100 chars: {text[:100]!r}"
-                )
-                text = truncate_to_tokens(text, EMBED_TOKEN_LIMIT)
-            non_none_texts.append(text)
-
-        embeddings_batch = await self.embedding_provider.embed_batch(non_none_texts)
-
-        # Build result list with None for skipped texts
-        results: list[list[float] | None] = [None] * len(texts)
-        for (idx, _), embedding in zip(texts_to_embed, embeddings_batch, strict=True):
-            results[idx] = embedding
-
-        return results
-
-    async def _generate_multi_vector_embeddings(
-        self, lines: list[dict[str, Any]]
-    ) -> dict[str, list[list[float] | None]]:
-        """Generate embeddings for all content types in a batch."""
-        if not self.embedding_provider:
-            return {}
-
-        # Extract all embeddable content types
-        user_queries: list[str | None] = []
-        assistant_responses: list[str | None] = []
-        assistant_thinking: list[str | None] = []
-        tool_outputs: list[str | None] = []
-
-        for line in lines:
-            extracted = extract_all_embeddable_content(line)
-            user_queries.append(extracted["user_query"])
-            assistant_responses.append(extracted["assistant_response"])
-            assistant_thinking.append(extracted["assistant_thinking"])
-            tool_outputs.append(extracted["tool_output"])
-
-        # Generate embeddings for each content type (only for non-None values)
-        return {
-            "user_query": await self._embed_non_none(user_queries),
-            "assistant_response": await self._embed_non_none(assistant_responses),
-            "assistant_thinking": await self._embed_non_none(assistant_thinking),
-            "tool_output": await self._embed_non_none(tool_outputs),
-        }
 
     # =========================================================================
     # Transcript Operations

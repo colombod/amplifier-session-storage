@@ -18,7 +18,13 @@ from typing import Any
 import duckdb
 import numpy as np
 
-from ..content_extraction import count_embeddable_content_types, extract_all_embeddable_content
+from ..content_extraction import (
+    EMBED_TOKEN_LIMIT,
+    count_embeddable_content_types,
+    count_tokens,
+    extract_all_embeddable_content,
+    truncate_to_tokens,
+)
 from ..embeddings import EmbeddingProvider
 from ..exceptions import StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
@@ -210,6 +216,10 @@ class DuckDBBackend(StorageBackend):
         """
         Generate embeddings only for non-None texts.
 
+        Applies token-limit truncation as a safety net to prevent embedding API
+        failures when text exceeds the model's context window (8192 tokens for
+        text-embedding-3-large).
+
         Args:
             texts: List of text strings (some may be None)
 
@@ -227,8 +237,19 @@ class DuckDBBackend(StorageBackend):
         if not texts_to_embed:
             return [None] * len(texts)
 
-        # Extract just the text strings
-        just_texts = [text for _, text in texts_to_embed]
+        # Extract texts with safety truncation for token limits
+        just_texts: list[str] = []
+        for _, text in texts_to_embed:
+            token_count = count_tokens(text)
+            if token_count > EMBED_TOKEN_LIMIT:
+                logger.warning(
+                    f"Text exceeds embedding token limit "
+                    f"({token_count} > {EMBED_TOKEN_LIMIT} tokens), "
+                    f"truncating for embedding. "
+                    f"First 100 chars: {text[:100]!r}"
+                )
+                text = truncate_to_tokens(text, EMBED_TOKEN_LIMIT)
+            just_texts.append(text)
 
         # Generate embeddings
         embeddings = await self.embedding_provider.embed_batch(just_texts)

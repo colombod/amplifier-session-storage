@@ -14,7 +14,57 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import tiktoken
+
 logger = logging.getLogger(__name__)
+
+# Embedding model token limit (text-embedding-3-large uses cl100k_base encoding)
+EMBED_TOKEN_LIMIT = 8192
+_TIKTOKEN_ENCODING = "cl100k_base"
+
+# Lazy-initialized encoder (avoid import-time cost)
+_encoder: tiktoken.Encoding | None = None
+
+
+def _get_encoder() -> tiktoken.Encoding:
+    """Get or create the tiktoken encoder (lazy singleton)."""
+    global _encoder
+    if _encoder is None:
+        _encoder = tiktoken.get_encoding(_TIKTOKEN_ENCODING)
+    return _encoder
+
+
+def count_tokens(text: str) -> int:
+    """Count tokens in text using the embedding model's tokenizer.
+
+    Uses cl100k_base encoding (text-embedding-3-large, GPT-4, GPT-3.5-turbo).
+
+    Args:
+        text: The text to count tokens for.
+
+    Returns:
+        Number of tokens.
+    """
+    return len(_get_encoder().encode(text))
+
+
+def truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """Truncate text to fit within a token limit.
+
+    Decodes back to a valid string after truncating the token sequence.
+
+    Args:
+        text: The text to truncate.
+        max_tokens: Maximum number of tokens allowed.
+
+    Returns:
+        The truncated text (or original if already within limit).
+    """
+    encoder = _get_encoder()
+    tokens = encoder.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    return encoder.decode(tokens[:max_tokens])
 
 
 def extract_all_embeddable_content(message: dict[str, Any]) -> dict[str, str | None]:

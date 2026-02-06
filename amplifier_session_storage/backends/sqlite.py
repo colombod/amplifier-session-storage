@@ -17,7 +17,13 @@ from typing import Any
 import aiosqlite
 import numpy as np
 
-from ..content_extraction import count_embeddable_content_types, extract_all_embeddable_content
+from ..content_extraction import (
+    EMBED_TOKEN_LIMIT,
+    count_embeddable_content_types,
+    count_tokens,
+    extract_all_embeddable_content,
+    truncate_to_tokens,
+)
 from ..embeddings import EmbeddingProvider
 from ..exceptions import StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
@@ -472,7 +478,11 @@ class SQLiteBackend(StorageBackend):
     # =========================================================================
 
     async def _embed_non_none(self, texts: list[str | None]) -> list[list[float] | None]:
-        """Generate embeddings only for non-None texts."""
+        """Generate embeddings only for non-None texts.
+
+        Applies token-limit truncation as a safety net to prevent embedding API
+        failures when text exceeds the model's context window.
+        """
         if not self.embedding_provider:
             return [None] * len(texts)
 
@@ -485,8 +495,20 @@ class SQLiteBackend(StorageBackend):
         if not texts_to_embed:
             return [None] * len(texts)
 
-        # Generate embeddings for non-None texts
-        non_none_texts = [text for _, text in texts_to_embed]
+        # Extract texts with safety truncation for token limits
+        non_none_texts: list[str] = []
+        for _, text in texts_to_embed:
+            token_count = count_tokens(text)
+            if token_count > EMBED_TOKEN_LIMIT:
+                logger.warning(
+                    f"Text exceeds embedding token limit "
+                    f"({token_count} > {EMBED_TOKEN_LIMIT} tokens), "
+                    f"truncating for embedding. "
+                    f"First 100 chars: {text[:100]!r}"
+                )
+                text = truncate_to_tokens(text, EMBED_TOKEN_LIMIT)
+            non_none_texts.append(text)
+
         embeddings_batch = await self.embedding_provider.embed_batch(non_none_texts)
 
         # Build result list with None for skipped texts

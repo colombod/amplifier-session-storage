@@ -19,7 +19,13 @@ from azure.cosmos.aio import ContainerProxy, CosmosClient, DatabaseProxy
 from azure.cosmos.exceptions import CosmosHttpResponseError, CosmosResourceNotFoundError
 from azure.identity.aio import DefaultAzureCredential
 
-from ..content_extraction import count_embeddable_content_types, extract_all_embeddable_content
+from ..content_extraction import (
+    EMBED_TOKEN_LIMIT,
+    count_embeddable_content_types,
+    count_tokens,
+    extract_all_embeddable_content,
+    truncate_to_tokens,
+)
 from ..embeddings import EmbeddingProvider
 from ..exceptions import AuthenticationError, StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
@@ -723,7 +729,11 @@ class CosmosBackend(StorageBackend):
     # =========================================================================
 
     async def _embed_non_none(self, texts: list[str | None]) -> list[list[float] | None]:
-        """Generate embeddings only for non-None texts."""
+        """Generate embeddings only for non-None texts.
+
+        Applies token-limit truncation as a safety net to prevent embedding API
+        failures when text exceeds the model's context window.
+        """
         if not self.embedding_provider:
             return [None] * len(texts)
 
@@ -736,8 +746,20 @@ class CosmosBackend(StorageBackend):
         if not texts_to_embed:
             return [None] * len(texts)
 
-        # Generate embeddings for non-None texts
-        non_none_texts = [text for _, text in texts_to_embed]
+        # Extract texts with safety truncation for token limits
+        non_none_texts: list[str] = []
+        for _, text in texts_to_embed:
+            token_count = count_tokens(text)
+            if token_count > EMBED_TOKEN_LIMIT:
+                logger.warning(
+                    f"Text exceeds embedding token limit "
+                    f"({token_count} > {EMBED_TOKEN_LIMIT} tokens), "
+                    f"truncating for embedding. "
+                    f"First 100 chars: {text[:100]!r}"
+                )
+                text = truncate_to_tokens(text, EMBED_TOKEN_LIMIT)
+            non_none_texts.append(text)
+
         embeddings_batch = await self.embedding_provider.embed_batch(non_none_texts)
 
         # Build result list with None for skipped texts
@@ -864,6 +886,44 @@ class CosmosBackend(StorageBackend):
 
                 if self.embedding_provider:
                     doc["embedding_model"] = self.embedding_provider.model_name
+
+            # Safety check: validate document size before upsert (Cosmos 2MB limit)
+            doc_json = json.dumps(doc)
+            doc_size = len(doc_json.encode("utf-8"))
+            COSMOS_TRANSCRIPT_SIZE_LIMIT = 1_800_000  # 1.8MB safety margin below 2MB
+
+            if doc_size > COSMOS_TRANSCRIPT_SIZE_LIMIT:
+                logger.warning(
+                    f"Transcript document {doc_id} exceeds Cosmos size limit "
+                    f"({doc_size:,} bytes > {COSMOS_TRANSCRIPT_SIZE_LIMIT:,}). "
+                    f"Stripping vectors to reduce size."
+                )
+                # Strip vector fields to reduce size
+                for vec_field in (
+                    "user_query_vector",
+                    "assistant_response_vector",
+                    "assistant_thinking_vector",
+                    "tool_output_vector",
+                ):
+                    doc.pop(vec_field, None)
+
+                # Re-check after stripping vectors
+                doc_json = json.dumps(doc)
+                doc_size = len(doc_json.encode("utf-8"))
+
+                if doc_size > COSMOS_TRANSCRIPT_SIZE_LIMIT:
+                    logger.warning(
+                        f"Transcript document {doc_id} still too large after "
+                        f"stripping vectors ({doc_size:,} bytes). "
+                        f"Truncating content field."
+                    )
+                    # Preserve metadata, truncate content
+                    original_content = doc.get("content")
+                    doc["content"] = "[Content truncated - original size exceeded Cosmos limit]"
+                    doc["content_truncated"] = True
+                    doc["original_content_size"] = (
+                        len(json.dumps(original_content).encode("utf-8")) if original_content else 0
+                    )
 
             await container.upsert_item(body=doc)
             synced += 1

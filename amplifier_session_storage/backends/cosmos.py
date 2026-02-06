@@ -11,7 +11,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from azure.cosmos import PartitionKey
@@ -1500,7 +1500,7 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         # Filter by type discriminator for single-container architecture
         min_query = "SELECT VALUE MIN(c.turn) FROM c WHERE c.type = @type AND c.user_id = @user_id AND c.session_id = @session_id"
         max_query = "SELECT VALUE MAX(c.turn) FROM c WHERE c.type = @type AND c.user_id = @user_id AND c.session_id = @session_id"
-        range_params = [
+        range_params: list[dict[str, object]] = [
             {"name": "@type", "value": DOC_TYPE_TRANSCRIPT},
             {"name": "@user_id", "value": user_id},
             {"name": "@session_id", "value": session_id},
@@ -1511,12 +1511,12 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
 
         async for item in container.query_items(query=min_query, parameters=range_params):
             if item is not None:
-                first_turn = item
+                first_turn = cast(int, item)
             break
 
         async for item in container.query_items(query=max_query, parameters=range_params):
             if item is not None:
-                last_turn = item
+                last_turn = cast(int, item)
             break
 
         # Partition messages into previous, current, following
@@ -1763,7 +1763,7 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         """
         container = self._get_container(CONTAINER_NAME)
         query = "SELECT c.event FROM c WHERE c.type = @t"
-        params: list[dict[str, str]] = [{"name": "@t", "value": DOC_TYPE_EVENT}]
+        params: list[dict[str, object]] = [{"name": "@t", "value": DOC_TYPE_EVENT}]
         if user_id:
             query += " AND c.user_id = @uid"
             params.append({"name": "@uid", "value": user_id})
@@ -2081,7 +2081,7 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         users: list[str] = []
         async for user_id in container.query_items(query=query, parameters=params):
             if user_id:
-                users.append(user_id)
+                users.append(str(user_id))
 
         return sorted(users)
 
@@ -2120,7 +2120,7 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         projects: list[str] = []
         async for project in container.query_items(query=query, parameters=params):
             if project:
-                projects.append(project)
+                projects.append(str(project))
 
         return sorted(projects)
 
@@ -2251,10 +2251,10 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         """
         first_sequence = 0
         # params[:3] includes @doc_type, @session_id, and optionally @user_id
-        range_params = params[:3] if user_id else params[:2]
+        range_params: list[dict[str, object]] = params[:3] if user_id else params[:2]
         async for item in container.query_items(query=range_query, parameters=range_params):
             if item is not None:
-                first_sequence = item
+                first_sequence = cast(int, item)
             break
 
         range_query = f"""
@@ -2264,7 +2264,7 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         last_sequence = sequence
         async for item in container.query_items(query=range_query, parameters=range_params):
             if item is not None:
-                last_sequence = item
+                last_sequence = cast(int, item)
             break
 
         return MessageContext(

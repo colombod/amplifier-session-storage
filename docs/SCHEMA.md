@@ -133,18 +133,17 @@ The transcripts table stores conversation messages. It contains **no vector colu
 |-------|------|----------|---------|-------------|
 | `id` | string | Yes | - | `{session_id}_msg_{sequence}` |
 | `user_id` | string | Yes | - | User identifier |
-| `session_id` | string | Yes | - | Parent session ID |
+| `host_id` | string | Yes | - | Host machine identifier |
 | `project_slug` | string | Yes | - | Project grouping (denormalized for queries) |
+| `session_id` | string | Yes | - | Parent session ID |
 | `sequence` | integer | Yes | - | 0-based message order |
-| `turn` | integer | No | `null` | Conversation turn number (can be null for system messages) |
 | `role` | enum | Yes | - | Message role: `user`, `assistant`, `tool`, `system` |
-| `content` | string/object | Yes | - | Message content (string or structured) |
-| `text_content` | string | No | `null` | Combined readable text for display/search |
-| `timestamp` | ISO 8601 datetime | Yes | - | When message was created |
-| `tool_calls` | object[] | No | `null` | Tool calls made (assistant messages only) |
-| `tool_call_id` | string | No | `null` | Tool call this responds to (tool messages only) |
-| `thinking` | string | No | `null` | Assistant thinking/reasoning (if captured) |
+| `content` | JSON | Yes | - | Message content (string or structured JSON, see Content Structure below) |
+| `turn` | integer | No | `null` | Conversation turn number (can be null for system messages) |
+| `ts` | ISO 8601 datetime | Yes | - | When message was created |
 | `synced_at` | ISO 8601 datetime | Yes | - | When record was last synced |
+
+> **Note:** Fields such as `text_content`, `tool_calls`, `tool_call_id`, and `thinking` are logical fields stored within the JSON `content` column, not discrete DuckDB columns. See the Content Structure section below for how they appear inside `content`.
 
 ### Content Structure
 
@@ -231,7 +230,7 @@ Vector embeddings are stored in a dedicated table, separate from transcript mess
 | `span_end` | integer | Yes | - | Character offset end in original text |
 | `token_count` | integer | Yes | - | Tokens in this chunk (tiktoken cl100k_base) |
 | `source_text` | string | Yes | - | The text that was embedded |
-| `vector` | float[] | Yes | - | Embedding vector (dimensions vary by model) |
+| `vector` | float[] | No (nullable during embedding generation) | `null` | Embedding vector (dimensions vary by model) |
 | `embedding_model` | string | No | `null` | Embedding model used |
 | `created_at` | ISO 8601 datetime | Yes | now | When record was created |
 

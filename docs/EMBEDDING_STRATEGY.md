@@ -1,25 +1,27 @@
 # Embedding Strategy and Field Mapping
 
-> **Version**: 1.0.0  
-> **Last Updated**: 2025-02-05  
+> **Version**: 2.0.0  
+> **Last Updated**: 2025-02-06  
 > **Status**: Implemented and Tested
 
-This document describes what content gets embedded and how for semantic search capabilities.
+This document describes what content gets embedded, how it is chunked and stored, and how the externalized vector architecture enables semantic search.
 
 ---
 
 ## Overview
 
-The library uses **multi-vector embeddings** - 4 separate vectors per transcript message:
+The library uses **multi-vector embeddings** with an **externalized vector table**. Vectors are not stored inline on transcript rows. Instead, a dedicated `transcript_vectors` table (DuckDB/SQLite) or `transcript_vector` document type (Cosmos DB) holds all vector data separately from conversation content.
 
-| Vector Column | Source | Use Case |
-|---------------|--------|----------|
-| `user_query_vector` | User message content | "When did I ask about X?" |
-| `assistant_response_vector` | Assistant text blocks | "What did the AI tell me about X?" |
-| `assistant_thinking_vector` | Assistant thinking blocks | "How did the AI reason about X?" |
-| `tool_output_vector` | Tool result content | "What files/outputs contained X?" |
+Four content types are extracted and embedded independently:
 
-This enables **targeted semantic search** - search only in reasoning, only in responses, or across all content types.
+| Content Type | Source | Use Case |
+|-------------|--------|----------|
+| `user_query` | User message content | "When did I ask about X?" |
+| `assistant_response` | Assistant text blocks | "What did the AI tell me about X?" |
+| `assistant_thinking` | Assistant thinking blocks | "How did the AI reason about X?" |
+| `tool_output` | Tool result content | "What files/outputs contained X?" |
+
+Each content type is stored as one or more vector records in `transcript_vectors`, with a `parent_id` linking back to the source transcript row. Long texts are chunked, producing multiple vector records per content type.
 
 ---
 
@@ -29,24 +31,45 @@ This enables **targeted semantic search** - search only in reasoning, only in re
 
 ```
 ~/.amplifier/projects/<project-slug>/sessions/<session-id>/
-├── metadata.json       # Session metadata (not embedded)
-├── transcript.jsonl    # Conversation messages (embedded)
-└── events.jsonl        # System events (not embedded)
++-- metadata.json       # Session metadata (not embedded)
++-- transcript.jsonl    # Conversation messages (embedded)
++-- events.jsonl        # System events (not embedded)
 ```
 
 ### What Gets Embedded
 
 | Source | Embedded | Notes |
 |--------|----------|-------|
-| `transcript.jsonl` | ✅ Yes | Multi-vector per message |
-| `metadata.json` | ❌ No | Structured metadata, use filters |
-| `events.jsonl` | ❌ No | Telemetry data, use structured search |
+| `transcript.jsonl` | Yes | Multi-vector per message, stored in transcript_vectors |
+| `metadata.json` | No | Structured metadata, use filters |
+| `events.jsonl` | No | Telemetry data, use structured search |
 
 ---
 
 ## Content Extraction
 
 Content extraction is handled by `amplifier_session_storage/content_extraction.py`.
+
+### Token Counting
+
+All token operations use tiktoken with the `cl100k_base` encoding (compatible with text-embedding-3-large and GPT-4 family models). A lazy singleton encoder avoids repeated initialization cost:
+
+```python
+import tiktoken
+
+EMBED_TOKEN_LIMIT = 8192
+_TIKTOKEN_ENCODING = "cl100k_base"
+
+def count_tokens(text: str) -> int:
+    return len(_get_encoder().encode(text))
+
+def truncate_to_tokens(text: str, max_tokens: int) -> str:
+    encoder = _get_encoder()
+    tokens = encoder.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    return encoder.decode(tokens[:max_tokens])
+```
 
 ### User Messages
 
@@ -55,7 +78,7 @@ Content extraction is handled by `amplifier_session_storage/content_extraction.p
 {"role": "user", "content": "How do I use vector search?"}
 ```
 
-**Extraction**: Direct string → `user_query_vector`
+**Extraction**: Direct string -> `user_query` content type
 
 ### Assistant Messages
 
@@ -72,9 +95,9 @@ Content extraction is handled by `amplifier_session_storage/content_extraction.p
 ```
 
 **Extraction**:
-- All `thinking` blocks → joined → `assistant_thinking_vector`
-- All `text` blocks → joined → `assistant_response_vector`
-- Tool calls → **NOT embedded** (metadata, not semantic content)
+- All `thinking` blocks -> joined -> `assistant_thinking` content type
+- All `text` blocks -> joined -> `assistant_response` content type
+- Tool calls -> **NOT embedded** (metadata, not semantic content)
 
 ### Tool Messages
 
@@ -83,7 +106,7 @@ Content extraction is handled by `amplifier_session_storage/content_extraction.p
 {"role": "tool", "content": "{file contents or tool result}"}
 ```
 
-**Extraction**: Content (truncated to 1000 chars) → `tool_output_vector`
+**Extraction**: Content (truncated to 10000 chars via `MAX_TOOL_OUTPUT_LENGTH`) -> `tool_output` content type
 
 ### Extraction Function
 
@@ -102,6 +125,53 @@ result = extract_all_embeddable_content(message)
 
 ---
 
+## Semantic Chunking
+
+Texts exceeding 8192 tokens (`EMBED_TOKEN_LIMIT`) are split into smaller chunks for embedding. This is handled by `amplifier_session_storage/chunking.py`.
+
+### Chunking Parameters
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `CHUNK_TARGET_TOKENS` | 1024 | Target tokens per chunk |
+| `CHUNK_OVERLAP_TOKENS` | 128 | Overlap between adjacent chunks |
+| `CHUNK_MIN_TOKENS` | 64 | Minimum chunk size (runts appended to previous) |
+| `EMBED_TOKEN_LIMIT` | 8192 | Threshold above which chunking activates |
+
+### Content-Aware Splitting
+
+Different content types use different splitting strategies:
+
+| Content Type | Strategy | Logic |
+|-------------|----------|-------|
+| `assistant_thinking` | Markdown-aware | Preserves code blocks as atomic segments, splits on paragraph boundaries (`\n\n`), then sentence-splits oversized paragraphs |
+| `assistant_response` | Markdown-aware | Same as thinking |
+| `tool_output` | Line-aware | Splits on newlines |
+| `user_query` | Sentence-aware | Splits on `.!?` + whitespace |
+
+### Chunk Data Structure
+
+```python
+@dataclass
+class ChunkResult:
+    text: str           # The chunk text
+    span_start: int     # Character offset start in original text
+    span_end: int       # Character offset end in original text
+    chunk_index: int    # 0-based position
+    total_chunks: int   # Total chunks produced
+    token_count: int    # Tokens in this chunk
+```
+
+### Short Text Handling
+
+Texts at or below the 8192-token limit produce a single `ChunkResult` spanning the full text. No splitting occurs.
+
+### Chunk Merging
+
+After splitting, small segments are merged up to the target token count. Each chunk except the first includes a 128-token overlap tail from the previous chunk. Trailing chunks smaller than 64 tokens are appended to the previous chunk rather than creating a runt.
+
+---
+
 ## Embedding Generation
 
 ### Automatic During Ingestion
@@ -116,14 +186,13 @@ await storage.sync_transcript_lines(
     project_slug="my-project",
     session_id="sess_abc",
     lines=transcript_lines
-    # embeddings parameter optional - auto-generated if not provided
 )
 # Output: Generated embeddings: 5 user, 5 responses, 3 thinking, 2 tool
 ```
 
 ### Batch Efficiency
 
-The implementation batches all non-None texts into a single API call:
+The implementation batches all non-None texts into a single API call per content type:
 
 ```python
 # 10 messages with mixed content:
@@ -131,20 +200,23 @@ The implementation batches all non-None texts into a single API call:
 # - 10 assistant responses
 # - 8 assistant thinking blocks
 # - 3 tool outputs
-# = 31 texts → 1-2 API calls (batched!)
+# = 31 texts -> 1-2 API calls (batched!)
 ```
 
-### Vector Metadata
+Chunked texts (e.g., a 16k-token thinking block split into 2 chunks) produce additional embedding calls, but these are still batched efficiently.
 
-Each message stores metadata about which vectors exist:
+### Externalized Storage
 
-```json
-{
-  "has_user_query": true,
-  "has_assistant_response": true,
-  "has_assistant_thinking": true,
-  "has_tool_output": false
-}
+Each embedding is stored as a separate record in `transcript_vectors`:
+
+```python
+# Vector record ID format:
+# {session_id}_msg_{sequence}_{content_type}_{chunk_index}
+
+# For a chunked assistant_thinking block (3 chunks):
+# sess_abc_msg_5_assistant_thinking_0
+# sess_abc_msg_5_assistant_thinking_1
+# sess_abc_msg_5_assistant_thinking_2
 ```
 
 ---
@@ -194,35 +266,39 @@ options = TranscriptSearchOptions(
 )
 ```
 
+The `search_in_*` flags control both semantic and full-text search. For semantic search, they filter by `content_type` in `transcript_vectors`. For full-text search, they also search `source_text` in `transcript_vectors` filtered by the same `content_type` values.
+
 ---
 
 ## Backend Implementation
 
 ### DuckDB
 
-- **Storage**: Native `FLOAT[3072]` arrays
-- **Indexes**: 4 HNSW indexes for O(log n) search
-- **Search**: `array_cosine_similarity()` with `GREATEST()` for multi-vector
+- **Transcript Storage**: `transcripts` table contains no vector columns
+- **Vector Storage**: `transcript_vectors` table with native `FLOAT[3072]` vector column
+- **Index**: Single HNSW index (`idx_vectors_hnsw`) on the `vector` column
+- **Search**: `array_cosine_similarity()` on `vectors_with_context` view (JOIN of transcript_vectors + transcripts), over-fetch 3x, Python-side dedup by `parent_id`
 
 ```sql
--- 4 vector columns with HNSW indexes
-CREATE INDEX idx_user_query_vector ON transcripts USING HNSW (user_query_vector);
-CREATE INDEX idx_assistant_response_vector ON transcripts USING HNSW (assistant_response_vector);
-CREATE INDEX idx_assistant_thinking_vector ON transcripts USING HNSW (assistant_thinking_vector);
-CREATE INDEX idx_tool_output_vector ON transcripts USING HNSW (tool_output_vector);
+-- Single HNSW index on the externalized vector column
+CREATE INDEX idx_vectors_hnsw
+ON transcript_vectors USING HNSW (vector)
+WITH (metric = 'cosine');
 ```
+
+**HNSW limitation**: DuckDB's HNSW index does not support pre-filtered queries. A `WHERE user_id = ?` clause causes fallback to sequential scan. This is acceptable because DuckDB databases are single-user (one `.db` file per user), so the filter is effectively a no-op against the full dataset.
 
 ### SQLite
 
-- **Storage**: JSON TEXT serialization
-- **Indexes**: None (brute-force numpy)
-- **Search**: Cosine similarity via numpy, max across all vectors
+- **Vector Storage**: `transcript_vectors` table with `vector_json TEXT` (JSON serialized)
+- **Indexes**: None (brute-force numpy cosine similarity)
+- **Search**: Loads vectors, computes cosine similarity via numpy, dedup by `parent_id`
 
 ### Cosmos DB
 
-- **Storage**: JSON arrays in document fields
-- **Indexes**: 4 quantizedFlat vector indexes
-- **Search**: `VectorDistance()` with `LEAST()` for multi-vector
+- **Vector Storage**: `transcript_vector` documents in the `transcript_messages` container
+- **Index**: Single `quantizedFlat` vector index on `/vector` path
+- **Search**: `VectorDistance(c.vector, @queryVector)`, Python-side dedup by `parent_id`
 
 ---
 
@@ -302,19 +378,24 @@ results = await storage.vector_search(
 
 ### Search Performance
 
-| Backend | Index Type | Complexity | 10k Messages |
-|---------|------------|------------|--------------|
-| DuckDB | HNSW | O(log n) | ~15 comparisons/column |
-| SQLite | Numpy | O(n) | ~40k vector comparisons |
-| Cosmos | quantizedFlat | O(n) optimized | ~50-100ms |
+| Backend | Index Type | Complexity | Notes |
+|---------|------------|------------|-------|
+| DuckDB | HNSW (single index) | O(log n) | Sequential scan with WHERE filter (acceptable, single-user DB) |
+| SQLite | Numpy | O(n) | Brute-force over all vector records |
+| Cosmos | quantizedFlat (single index) | O(n) optimized | ~50-100ms typical |
 
 ### Storage Overhead
 
-| Component | Size per Message |
-|-----------|------------------|
-| Text content | ~500 bytes avg |
-| 4 vectors (3072-d each) | ~48 KB (float32) |
-| Vector metadata | ~100 bytes |
+| Component | Size |
+|-----------|------|
+| 1 vector (3072-d, float32) | ~12 KB |
+| Metadata per vector record | ~200 bytes |
+| Source text per record | Variable |
+
+Typical per-message overhead:
+- User message (1 content type, 1 chunk): ~12.5 KB in vector records
+- Assistant with thinking (2 content types, 1 chunk each): ~25 KB in vector records
+- Long thinking block (16k tokens, 2 chunks): ~37 KB in vector records
 
 ---
 
@@ -343,37 +424,15 @@ OPENAI_EMBEDDING_CACHE_SIZE=1000  # Default 1000 entries
 
 ---
 
-## Testing
-
-### Test Coverage
-
-| Area | Tests | Status |
-|------|-------|--------|
-| Content extraction | 18 tests | ✅ Passing |
-| Multi-vector generation | 12 tests | ✅ Passing |
-| Vector search | 15 tests | ✅ Passing |
-| Hybrid search | 8 tests | ✅ Passing |
-
-### Verified Against Real Data
-
-Tested against real Amplifier sessions from `~/.amplifier/projects/`:
-- ✅ User messages extracted correctly
-- ✅ Thinking blocks extracted (found 33+ in real sessions)
-- ✅ Response blocks extracted
-- ✅ Tool outputs handled (found 38+ in real sessions)
-- ✅ Complex multi-block messages parsed correctly
-
----
-
 ## Summary
 
-| What | Where | Embedded As |
+| What | Where | Content Type |
 |------|-------|-------------|
-| User questions | `role=user`, `content` | `user_query_vector` |
-| AI responses | `role=assistant`, `content[].text` | `assistant_response_vector` |
-| AI reasoning | `role=assistant`, `content[].thinking` | `assistant_thinking_vector` |
-| Tool outputs | `role=tool`, `content` | `tool_output_vector` |
+| User questions | `role=user`, `content` | `user_query` |
+| AI responses | `role=assistant`, `content[].text` | `assistant_response` |
+| AI reasoning | `role=assistant`, `content[].thinking` | `assistant_thinking` |
+| Tool outputs | `role=tool`, `content` | `tool_output` |
 | Session metadata | `metadata.json` | Not embedded (use filters) |
 | Events | `events.jsonl` | Not embedded (use structured search) |
 
-**Multi-vector search enables precise semantic queries** - find not just "messages about X" but specifically "user questions about X" or "AI reasoning about X" or "tool outputs containing X".
+All vectors stored externally in `transcript_vectors` table / `transcript_vector` documents, with chunking support for long texts and a single HNSW/quantizedFlat index per backend.

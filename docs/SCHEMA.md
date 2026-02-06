@@ -1,7 +1,7 @@
 # Amplifier Session Storage - Data Schema Reference
 
-> **Version**: 1.0.0  
-> **Last Updated**: 2025-02-05  
+> **Version**: 2.0.0  
+> **Last Updated**: 2025-02-06  
 > **Status**: Authoritative Source of Truth
 
 This document defines the canonical schema for all data entities in amplifier-session-storage. All backend implementations (Cosmos DB, DuckDB, SQLite) MUST conform to this schema.
@@ -13,10 +13,11 @@ This document defines the canonical schema for all data entities in amplifier-se
 1. [Overview](#overview)
 2. [Sessions](#sessions)
 3. [Transcript Messages](#transcript-messages)
-4. [Events](#events)
-5. [Embeddings](#embeddings)
-6. [Backend-Specific Notes](#backend-specific-notes)
-7. [Schema Evolution](#schema-evolution)
+4. [Transcript Vectors](#transcript-vectors)
+5. [Events](#events)
+6. [Schema Meta](#schema-meta)
+7. [Backend-Specific Notes](#backend-specific-notes)
+8. [Schema Evolution](#schema-evolution)
 
 ---
 
@@ -25,22 +26,24 @@ This document defines the canonical schema for all data entities in amplifier-se
 ### Data Model
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         USER                                     │
-│  (identified by user_id from Azure CLI or identity provider)    │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   ┌─────────────┐      ┌──────────────────┐     ┌────────────┐ │
-│   │   SESSION   │──────│ TRANSCRIPT_MSG   │     │   EVENT    │ │
-│   │  metadata   │ 1:N  │   messages       │     │  logs      │ │
-│   └─────────────┘      └──────────────────┘     └────────────┘ │
-│         │                      │                      │         │
-│         │              ┌───────┴───────┐              │         │
-│         │              │  EMBEDDING    │              │         │
-│         │              │  vectors      │              │         │
-│         │              └───────────────┘              │         │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
++------------------------------------------------------------------+
+|                         USER                                     |
+|  (identified by user_id from Azure CLI or identity provider)     |
++------------------------------------------------------------------+
+|                                                                  |
+|   +-------------+      +------------------+     +------------+   |
+|   |   SESSION   |------|  TRANSCRIPT_MSG  |     |   EVENT    |   |
+|   |  metadata   | 1:N  |   messages       |     |  logs      |   |
+|   +-------------+      +------------------+     +------------+   |
+|                                |                      |          |
+|                         +------+------+               |          |
+|                         |             |               |          |
+|                   +-----+-----+ +----+----+          |          |
+|                   | TRANSCRIPT| | EVENT   |          |          |
+|                   |  VECTORS  | | CHUNKS  |          |          |
+|                   +-----------+ +---------+          |          |
+|                                                                  |
++------------------------------------------------------------------+
 ```
 
 ### Key Concepts
@@ -50,6 +53,8 @@ This document defines the canonical schema for all data entities in amplifier-se
 - **project_slug**: Logical grouping of sessions (maps to local project directories).
 - **sequence**: 0-based order of messages in a transcript.
 - **turn**: Conversation turn number (user message + assistant response = 1 turn).
+- **parent_id**: Links a transcript vector record back to its source transcript message.
+- **content_type**: Discriminates vector records by source: `user_query`, `assistant_response`, `assistant_thinking`, `tool_output`.
 
 ---
 
@@ -120,21 +125,26 @@ This document defines the canonical schema for all data entities in amplifier-se
 
 ## Transcript Messages
 
+The transcripts table stores conversation messages. It contains **no vector columns** -- all embeddings are stored in the separate transcript vectors table.
+
 ### Schema Definition
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
+| `id` | string | Yes | - | `{session_id}_msg_{sequence}` |
 | `user_id` | string | Yes | - | User identifier |
 | `session_id` | string | Yes | - | Parent session ID |
+| `project_slug` | string | Yes | - | Project grouping (denormalized for queries) |
 | `sequence` | integer | Yes | - | 0-based message order |
 | `turn` | integer | No | `null` | Conversation turn number (can be null for system messages) |
 | `role` | enum | Yes | - | Message role: `user`, `assistant`, `tool`, `system` |
 | `content` | string/object | Yes | - | Message content (string or structured) |
+| `text_content` | string | No | `null` | Combined readable text for display/search |
 | `timestamp` | ISO 8601 datetime | Yes | - | When message was created |
 | `tool_calls` | object[] | No | `null` | Tool calls made (assistant messages only) |
 | `tool_call_id` | string | No | `null` | Tool call this responds to (tool messages only) |
 | `thinking` | string | No | `null` | Assistant thinking/reasoning (if captured) |
-| `project_slug` | string | Yes | - | Project grouping (denormalized for queries) |
+| `synced_at` | ISO 8601 datetime | Yes | - | When record was last synced |
 
 ### Content Structure
 
@@ -182,24 +192,6 @@ This document defines the canonical schema for all data entities in amplifier-se
 }
 ```
 
-### Example (Full Message)
-
-```json
-{
-  "user_id": "user@example.com",
-  "session_id": "abc123-def456-789012",
-  "sequence": 5,
-  "turn": 3,
-  "role": "assistant",
-  "content": "I found the issue in your JWT validation logic...",
-  "timestamp": "2025-02-05T10:35:42.123Z",
-  "thinking": "Looking at the auth.py file, I can see that...",
-  "tool_calls": null,
-  "tool_call_id": null,
-  "project_slug": "amplifier-core"
-}
-```
-
 ### Turn Numbering
 
 - Turn starts at `1` with the first user message
@@ -216,6 +208,92 @@ This document defines the canonical schema for all data entities in amplifier-se
 | Turn | `user_id`, `session_id`, `turn` | Get messages by turn |
 | Role | `user_id`, `session_id`, `role` | Filter by role |
 | Full-text | `content` | Text search |
+
+---
+
+## Transcript Vectors
+
+Vector embeddings are stored in a dedicated table, separate from transcript messages. Each record holds one vector for one content type (optionally one chunk of a longer text), linking back to its parent transcript message via `parent_id`.
+
+### Schema Definition
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `id` | string | Yes | - | `{parent_id}_{content_type}_{chunk_index}` |
+| `parent_id` | string | Yes | - | References transcript message ID |
+| `user_id` | string | Yes | - | User identifier |
+| `session_id` | string | Yes | - | Parent session ID |
+| `project_slug` | string | No | `null` | Project grouping |
+| `content_type` | enum | Yes | - | `user_query`, `assistant_response`, `assistant_thinking`, `tool_output` |
+| `chunk_index` | integer | Yes | `0` | 0-based chunk position |
+| `total_chunks` | integer | Yes | `1` | Total chunks for this content type |
+| `span_start` | integer | Yes | `0` | Character offset start in original text |
+| `span_end` | integer | Yes | - | Character offset end in original text |
+| `token_count` | integer | Yes | - | Tokens in this chunk (tiktoken cl100k_base) |
+| `source_text` | string | Yes | - | The text that was embedded |
+| `vector` | float[] | Yes | - | Embedding vector (dimensions vary by model) |
+| `embedding_model` | string | No | `null` | Embedding model used |
+| `created_at` | ISO 8601 datetime | Yes | now | When record was created |
+
+### Content Types
+
+| Content Type | Source | Typical Use |
+|-------------|--------|-------------|
+| `user_query` | User message content | Find similar questions |
+| `assistant_response` | Assistant text blocks | Find similar answers |
+| `assistant_thinking` | Assistant thinking blocks | Find similar reasoning |
+| `tool_output` | Tool output content (truncated to 10000 chars) | Find similar tool results |
+
+### Chunking
+
+Texts exceeding 8192 tokens are split into chunks:
+- Target chunk size: 1024 tokens
+- Overlap between chunks: 128 tokens
+- Minimum chunk size: 64 tokens (smaller segments merged with previous)
+- Content-aware splitting: markdown-aware for assistant, line-aware for tool, sentence-aware for user
+- Token counting: tiktoken `cl100k_base` encoding
+
+A single content extraction may produce multiple vector records when chunking activates. All chunks share the same `parent_id` and `content_type`, differentiated by `chunk_index`.
+
+### Example
+
+```json
+{
+  "id": "sess_abc_msg_5_assistant_thinking_0",
+  "parent_id": "sess_abc_msg_5",
+  "user_id": "user@example.com",
+  "session_id": "sess_abc",
+  "project_slug": "amplifier-core",
+  "content_type": "assistant_thinking",
+  "chunk_index": 0,
+  "total_chunks": 2,
+  "span_start": 0,
+  "span_end": 4096,
+  "token_count": 1024,
+  "source_text": "The user wants to understand the vector architecture...",
+  "vector": [0.123, -0.456, 0.789, "..."],
+  "embedding_model": "text-embedding-3-large",
+  "created_at": "2025-02-06T10:30:00.000Z"
+}
+```
+
+### Supported Embedding Models
+
+| Model | Provider | Dimensions | Notes |
+|-------|----------|------------|-------|
+| `text-embedding-3-large` | OpenAI/Azure | 3072 | Recommended |
+| `text-embedding-3-small` | OpenAI/Azure | 1536 | Faster, smaller |
+| `text-embedding-ada-002` | OpenAI/Azure | 1536 | Legacy |
+
+### Indexes
+
+| Index | Fields | Purpose |
+|-------|--------|---------|
+| Primary | `id` | Unique vector record lookup |
+| HNSW | `vector` | Cosine similarity search (DuckDB only, single index) |
+| Parent | `parent_id` | Join to transcript message |
+| Session | `user_id`, `session_id` | Filter vectors by session |
+| User | `user_id` | Filter vectors by user |
 
 ---
 
@@ -289,34 +367,6 @@ Events with `data` > 400KB are chunked:
 | `total_chunks` | integer | Total number of chunks |
 | `chunk_data` | string | JSON-encoded chunk content |
 
-### Example
-
-```json
-{
-  "event_id": "evt_abc123def456",
-  "user_id": "user@example.com",
-  "session_id": "abc123-def456-789012",
-  "event_type": "llm:response",
-  "ts": "2025-02-05T10:35:42.123Z",
-  "turn": 3,
-  "level": "INFO",
-  "data": null,
-  "summary": {
-    "model": "claude-sonnet-4-20250514",
-    "duration_ms": 2341,
-    "has_tool_calls": true,
-    "usage": {
-      "input_tokens": 1500,
-      "output_tokens": 800
-    }
-  },
-  "is_chunked": true,
-  "chunk_count": 3,
-  "data_size_bytes": 1250000,
-  "project_slug": "amplifier-core"
-}
-```
-
 ### Indexes
 
 | Index | Fields | Purpose |
@@ -327,50 +377,42 @@ Events with `data` > 400KB are chunked:
 
 ---
 
-## Embeddings
+## Schema Meta
+
+A simple key-value table that tracks schema version and metadata for migration support.
 
 ### Schema Definition
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `user_id` | string | Yes | User identifier |
-| `session_id` | string | Yes | Parent session ID |
-| `sequence` | integer | Yes | Message sequence number |
-| `source` | enum | Yes | Content source: `user`, `assistant`, `thinking`, `tool` |
-| `embedding` | float[] | Yes | Vector embedding (dimensions vary by model) |
-| `model` | string | Yes | Embedding model used |
-| `dimensions` | integer | Yes | Vector dimensions (e.g., 3072) |
+| `key` | string | Yes | Metadata key (primary key) |
+| `value` | string | Yes | Metadata value |
 
-### Embedding Sources
+### Current Keys
 
-| Source | Description | Typical Use |
-|--------|-------------|-------------|
-| `user` | User message content | Find similar questions |
-| `assistant` | Assistant response content | Find similar answers |
-| `thinking` | Assistant thinking blocks | Find similar reasoning |
-| `tool` | Tool output content | Find similar tool results |
+| Key | Value | Description |
+|-----|-------|-------------|
+| `version` | `"2"` | Schema version. `1` = inline vectors on transcripts. `2` = externalized vectors in transcript_vectors. |
 
-### Example
+### DDL
 
-```json
-{
-  "user_id": "user@example.com",
-  "session_id": "abc123-def456-789012",
-  "sequence": 5,
-  "source": "assistant",
-  "embedding": [0.123, -0.456, 0.789, ...],
-  "model": "text-embedding-3-large",
-  "dimensions": 3072
-}
+**DuckDB**:
+```sql
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key VARCHAR PRIMARY KEY,
+    value VARCHAR
+)
 ```
 
-### Supported Embedding Models
+**SQLite**:
+```sql
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+```
 
-| Model | Provider | Dimensions | Notes |
-|-------|----------|------------|-------|
-| `text-embedding-3-large` | OpenAI/Azure | 3072 | Recommended |
-| `text-embedding-3-small` | OpenAI/Azure | 1536 | Faster, smaller |
-| `text-embedding-ada-002` | OpenAI/Azure | 1536 | Legacy |
+On backend initialization, the version is checked. If version < 2, auto-migration moves inline vectors from `transcripts` to `transcript_vectors` and sets version to 2. See `MULTI_VECTOR_IMPLEMENTATION.md` for migration details.
 
 ---
 
@@ -382,19 +424,20 @@ Events with `data` > 400KB are chunked:
 | Container | Partition Key | Purpose |
 |-----------|---------------|---------|
 | `sessions` | `/user_id` | Session metadata |
-| `transcript_messages` | `/user_id_session_id` | Messages + embeddings |
+| `transcript_messages` | `/user_id_session_id` | Messages (type=transcript_message) + vectors (type=transcript_vector) |
 | `events` | `/user_id_session_id` | Event metadata |
 | `event_chunks` | `/user_id_session_id` | Large event chunks |
 
 **Additional Fields:**
 - `id`: Required by Cosmos (same as primary identifier)
-- `_type`: Document type discriminator
-- `user_id_session_id`: Composite partition key for co-location
+- `type`: Document type discriminator (`transcript_message` or `transcript_vector`)
+- `partition_key`: Composite partition key for co-location (`{user_id}_{session_id}`)
 
 **Vector Search:**
+- Single vector index on `/vector` path (quantizedFlat)
 - Enabled via `AMPLIFIER_COSMOS_ENABLE_VECTOR=true`
-- Uses flat vector index (no HNSW)
 - Configured for 3072 dimensions
+- 1.8MB safety limit on transcript documents (defense-in-depth below Cosmos 2MB hard limit)
 
 ### DuckDB
 
@@ -402,23 +445,27 @@ Events with `data` > 400KB are chunked:
 | Table | Primary Key |
 |-------|-------------|
 | `sessions` | `user_id, session_id` |
-| `transcript_messages` | `user_id, session_id, sequence` |
+| `transcripts` | `id` (format: `{session_id}_msg_{sequence}`) |
+| `transcript_vectors` | `id` (format: `{parent_id}_{content_type}_{chunk_index}`) |
 | `events` | `user_id, session_id, event_id` |
-| `embeddings` | `user_id, session_id, sequence, source` |
+| `schema_meta` | `key` |
 
 **Vector Search:**
-- Native ARRAY type for embeddings
-- Cosine similarity via custom function
-- Full-text search via built-in FTS
+- Native `FLOAT[N]` array type for vectors in `transcript_vectors`
+- Single HNSW index (`idx_vectors_hnsw`) with cosine metric
+- `vectors_with_context` view (JOIN of transcript_vectors + transcripts)
+- HNSW persistence enabled for disk-based databases
+- HNSW limitation: WHERE filters cause sequential scan fallback (acceptable for single-user DBs)
+- Full-text search via LIKE on transcripts.content and transcript_vectors.source_text
 
 ### SQLite
 
 **Tables:** Same as DuckDB
 
 **Vector Search:**
-- Embeddings stored as JSON arrays
-- Vector operations via Python
-- Full-text search via FTS5
+- Vectors stored as JSON arrays in `vector_json TEXT` column
+- Vector operations via Python numpy (brute-force cosine similarity)
+- Full-text search via LIKE on transcripts.content and transcript_vectors.source_text
 
 ---
 
@@ -428,7 +475,8 @@ Events with `data` > 400KB are chunked:
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 1.0.0 | 2025-02-05 | Initial schema definition |
+| 1.0.0 | 2025-02-05 | Initial schema definition with inline vector columns on transcripts |
+| 2.0.0 | 2025-02-06 | Externalized vectors to transcript_vectors table. Added schema_meta table. Added chunking support. Removed vector columns from transcripts. |
 
 ### Migration Guidelines
 
@@ -436,11 +484,22 @@ Events with `data` > 400KB are chunked:
 2. **Type changes**: Requires data migration script
 3. **Required field additions**: Must provide default or migrate existing data
 4. **Field removal**: Deprecate first, remove in next major version
+5. **Schema version bump**: Update `schema_meta.version`, add auto-migration logic
+
+### Auto-Migration (v1 -> v2)
+
+On initialization, backends check `schema_meta.version`. If version < 2:
+1. Create `transcript_vectors` table if not exists
+2. Move inline vectors from `transcripts` to `transcript_vectors`
+3. Drop old vector columns and indexes from `transcripts`
+4. Set version to 2
+
+Migration is idempotent and safe to run multiple times.
 
 ### Compatibility Promise
 
 - Minor version bumps: Backward compatible
-- Major version bumps: May require migration
+- Major version bumps: May require migration (auto-migration provided where possible)
 - All changes documented in this file
 
 ---
@@ -456,13 +515,17 @@ Events with `data` > 400KB are chunked:
 5. **visibility**: Must be one of: `private`, `team`, `org`, `public`
 6. **sequence**: Must be >= 0
 7. **turn**: Must be >= 1 (when not null)
+8. **content_type**: Must be one of: `user_query`, `assistant_response`, `assistant_thinking`, `tool_output`
+9. **chunk_index**: Must be >= 0 and < total_chunks
+10. **token_count**: Must be > 0
 
 ### Data Integrity
 
 - Session must exist before adding messages/events
 - Message sequences must be contiguous (no gaps)
 - Chunk counts must match actual chunks
-- Embeddings must have correct dimensions for model
+- Vector dimensions must match embedding model
+- `parent_id` in transcript_vectors must reference a valid transcript message
 
 ---
 
@@ -473,6 +536,8 @@ For programmatic access to this schema, see:
 - `amplifier_session_storage/backends/cosmos.py` - Cosmos implementation
 - `amplifier_session_storage/backends/duckdb.py` - DuckDB implementation
 - `amplifier_session_storage/backends/sqlite.py` - SQLite implementation
+- `amplifier_session_storage/content_extraction.py` - Content extraction and token counting
+- `amplifier_session_storage/chunking.py` - Semantic chunking pipeline
 
 ---
 

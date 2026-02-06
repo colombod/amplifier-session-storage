@@ -1,4 +1,4 @@
-# Schema Mapping: Disk ↔ Cosmos DB
+# Schema Mapping: Disk <-> Cosmos DB
 
 This document defines the authoritative mapping between on-disk session storage (compatible with amplifier-app-cli and session-analyst) and Cosmos DB storage.
 
@@ -79,12 +79,12 @@ This document defines the authoritative mapping between on-disk session storage 
 
 ### Migration Notes
 
-**Disk → Cosmos:**
+**Disk -> Cosmos:**
 - `user_id` derived from `IdentityContext.get_user_id()`
 - `project_slug` derived from directory path (`~/.amplifier/projects/{slug}/sessions/`)
 - `visibility` defaults to `private`
 
-**Cosmos → Disk:**
+**Cosmos -> Disk:**
 - `user_id`, `visibility`, `org_id`, `team_ids`, `shared_at` are NOT written to disk
 - These are cloud-only features for multi-tenant sharing
 
@@ -102,6 +102,8 @@ Each line is a JSON object:
 ```
 
 ### Cosmos DB: `transcript_messages` Container
+
+Transcript messages are stored as `transcript_message` documents. These documents contain **no vector data** -- vectors are stored separately as `transcript_vector` documents (see next section).
 
 | Field | Type | Partition | Required | Notes |
 |-------|------|-----------|----------|-------|
@@ -129,6 +131,89 @@ Each line is a JSON object:
 | - | `sequence` | **Derived** (line number in JSONL) |
 | - | `turn` | **Derived** (from message grouping) |
 | - | `tool_call_id` | Same if present |
+
+---
+
+## Transcript Vectors
+
+Vectors are stored separately from transcript messages in a dedicated structure. Each vector record links back to a parent transcript message via `parent_id`.
+
+### DuckDB/SQLite: `transcript_vectors` Table
+
+See `MULTI_VECTOR_IMPLEMENTATION.md` for full DDL.
+
+### Cosmos DB: `transcript_vector` Documents
+
+Vector documents are stored in the same `transcript_messages` container, discriminated by the `type` field.
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `id` | string | Yes | `{parent_id}_{content_type}_{chunk_index}` |
+| `type` | string | Yes | Always `"transcript_vector"` |
+| `partition_key` | string | Yes | `{user_id}_{session_id}` (same partition as parent message) |
+| `user_id` | string | Yes | User identifier |
+| `host_id` | string | Yes | Host machine identifier |
+| `project_slug` | string | No | Project grouping |
+| `session_id` | string | Yes | Parent session |
+| `parent_id` | string | Yes | References `transcript_message.id` (e.g., `sess_abc_msg_5`) |
+| `content_type` | string | Yes | One of: `user_query`, `assistant_response`, `assistant_thinking`, `tool_output` |
+| `chunk_index` | int | Yes | 0-based chunk position |
+| `total_chunks` | int | Yes | Total chunks for this content type |
+| `span_start` | int | Yes | Character offset start in original text |
+| `span_end` | int | Yes | Character offset end in original text |
+| `token_count` | int | Yes | Tokens in this chunk (tiktoken cl100k_base) |
+| `source_text` | string | Yes | The actual text that was embedded |
+| `vector` | float[] | Yes | Embedding vector (3072 dimensions) |
+| `embedding_model` | string | No | Model used (e.g., `text-embedding-3-large`) |
+
+### Example Cosmos DB `transcript_vector` Document
+
+```json
+{
+  "id": "sess_abc_msg_5_assistant_thinking_0",
+  "type": "transcript_vector",
+  "partition_key": "user-123_sess_abc",
+  "user_id": "user-123",
+  "host_id": "laptop-01",
+  "project_slug": "my-project",
+  "session_id": "sess_abc",
+  "parent_id": "sess_abc_msg_5",
+  "content_type": "assistant_thinking",
+  "chunk_index": 0,
+  "total_chunks": 2,
+  "span_start": 0,
+  "span_end": 4096,
+  "token_count": 1024,
+  "source_text": "The user wants to understand the vector search architecture...",
+  "vector": [0.1, 0.2, "..., 3072 floats"],
+  "embedding_model": "text-embedding-3-large"
+}
+```
+
+### Cosmos DB Vector Index Policy
+
+The container uses a single vector index on the `/vector` path:
+
+```json
+{
+  "vectorIndexes": [
+    {
+      "path": "/vector",
+      "type": "quantizedFlat",
+      "quantizationByteSize": 128,
+      "vectorDataType": "float32",
+      "dimensions": 3072
+    }
+  ]
+}
+```
+
+### Indexing Policy
+
+Scalar fields needed for queries are included. Large fields are excluded to control index size:
+
+- **Included**: `/parent_id/?`, `/content_type/?`, `/user_id/?`, `/session_id/?`
+- **Excluded**: `/content/*`, `/source_text/*`, `/vector/*`, `/*` (catch-all)
 
 ---
 
@@ -202,13 +287,17 @@ The `summary` field contains ONLY safe fields that can be returned in queries:
 | Container | Partition Key | Purpose |
 |-----------|---------------|---------|
 | `sessions` | `/user_id` | Session metadata |
-| `transcript_messages` | `/user_id_session_id` | Conversation messages |
+| `transcript_messages` | `/user_id_session_id` | Conversation messages + transcript vectors |
 | `events` | `/user_id_session_id` | Event metadata + small events |
 | `event_chunks` | `/user_id_session_id` | Large event chunks |
 | `shared_sessions` | `/visibility` | Shared session index |
 | `organizations` | `/org_id` | Organization data |
 | `teams` | `/org_id` | Team data |
 | `user_memberships` | `/user_id` | User membership data |
+
+The `transcript_messages` container holds two document types, discriminated by the `type` field:
+- `type: "transcript_message"` -- conversation messages (no vectors)
+- `type: "transcript_vector"` -- vector embeddings with metadata
 
 ---
 
@@ -233,18 +322,18 @@ SELECT * FROM c WHERE c.session_id = @session_id
 
 ## Sync Considerations
 
-### Local → Cloud Sync
-1. Read `metadata.json` → Create `SessionMetadata`
+### Local -> Cloud Sync
+1. Read `metadata.json` -> Create `SessionMetadata`
 2. Add `user_id` from `IdentityContext`
 3. Add `project_slug` from path
 4. Set `visibility` to `private` (default)
 5. Upload to Cosmos
 
-### Cloud → Local Sync
+### Cloud -> Local Sync
 1. Read `SessionMetadata` from Cosmos
 2. Write `metadata.json` (excluding cloud-only fields)
-3. Download transcript messages → Write `transcript.jsonl`
-4. Download events → Write `events.jsonl`
+3. Download transcript messages -> Write `transcript.jsonl`
+4. Download events -> Write `events.jsonl`
 
 ### Conflict Resolution
 - `updated` timestamp used for last-writer-wins
@@ -256,8 +345,9 @@ SELECT * FROM c WHERE c.session_id = @session_id
 
 ## Testing Requirements
 
-1. **Round-trip tests**: Write to disk → Read to Cosmos → Write to disk → Compare
+1. **Round-trip tests**: Write to disk -> Read to Cosmos -> Write to disk -> Compare
 2. **Field parity tests**: All common fields map correctly
 3. **Chunking tests**: Large events chunk and reassemble correctly
 4. **Isolation tests**: User A cannot access User B's data
 5. **Projection tests**: Query results never contain full event data
+6. **Vector separation tests**: Transcript messages contain no vector fields; vector documents contain no message content

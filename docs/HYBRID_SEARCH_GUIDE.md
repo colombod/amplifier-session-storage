@@ -6,21 +6,30 @@ This guide explains how to use hybrid search capabilities in amplifier-session-s
 
 Hybrid search combines three powerful techniques:
 
-1. **Full-Text Search** - Keyword matching in transcript content
-2. **Semantic Search** - Embedding-based similarity (understands meaning)
+1. **Full-Text Search** - Keyword matching in transcript content and vector source_text
+2. **Semantic Search** - Embedding-based similarity via externalized transcript_vectors
 3. **MMR Re-Ranking** - Maximum Marginal Relevance for diversity
 
 ```
 User Query
-    ↓
-[Full-Text Search] → Candidates
-    +
-[Semantic Search]  → Candidates
-    ↓
-Merge & Deduplicate
-    ↓
-[MMR Re-Ranking] → Diverse + Relevant Results
+    |
+    v
+[Embed Query] ---------> query_vector (computed ONCE)
+    |                          |
+    v                          v
+[Full-Text Search]     [Semantic Search]
+  (transcripts.content    (transcript_vectors.vector
+   + transcript_vectors    cosine similarity)
+   .source_text)
+    |                          |
+    v                          v
+       Merge & Deduplicate
+              |
+              v
+       [MMR Re-Ranking] --> Diverse + Relevant Results
 ```
+
+The query is embedded exactly once. The resulting vector is reused for semantic search and MMR re-ranking, avoiding redundant API calls.
 
 ---
 
@@ -33,7 +42,7 @@ from amplifier_session_storage.backends import TranscriptSearchOptions
 # Initialize with embeddings
 embeddings = AzureOpenAIEmbeddings.from_env()
 async with CosmosBackend.create(embedding_provider=embeddings) as storage:
-    
+
     # Hybrid search with MMR
     results = await storage.search_transcripts(
         user_id="user-123",
@@ -47,7 +56,7 @@ async with CosmosBackend.create(embedding_provider=embeddings) as storage:
         ),
         limit=10
     )
-    
+
     for result in results:
         print(f"Session: {result.session_id}")
         print(f"Content: {result.content[:100]}...")
@@ -72,10 +81,14 @@ options = TranscriptSearchOptions(
 ```
 
 **How it works:**
-- Uses SQL `CONTAINS` (Cosmos) or `LIKE` (DuckDB/SQLite)
+- Searches `transcripts.content` using SQL `CONTAINS` (Cosmos) or `LIKE` (DuckDB/SQLite)
+- Also searches `transcript_vectors.source_text`, filtered by `content_type`
+- Results from both sources are merged and deduplicated by `(session_id, sequence)`
 - Fast and precise for known keywords
 - Case-insensitive matching
 - No embedding API costs
+
+The `search_in_user`, `search_in_assistant`, and `search_in_thinking` flags control which `content_type` values are searched in `transcript_vectors.source_text`. This allows full-text keyword search to be scoped to specific content types, just like semantic search.
 
 ### Semantic Search
 
@@ -89,8 +102,10 @@ options = TranscriptSearchOptions(
 ```
 
 **How it works:**
-- Converts query to embedding vector
-- Finds similar embeddings in database
+- Converts query to embedding vector (single API call)
+- Searches `transcript_vectors` by cosine similarity
+- Filters by `content_type` based on `search_in_*` flags
+- Over-fetches 3x and deduplicates by `parent_id`
 - Understands meaning, not just keywords
 - Query "database" matches "storage", "persistence", etc.
 
@@ -107,10 +122,12 @@ options = TranscriptSearchOptions(
 ```
 
 **How it works:**
-1. Gets candidates from both full-text AND semantic search
-2. Merges and deduplicates results
-3. Applies MMR re-ranking for relevance + diversity
-4. Returns top-k results
+1. Embeds query **once** into a vector
+2. Gets candidates from full-text search (transcripts + source_text)
+3. Gets candidates from semantic search (reuses pre-computed vector)
+4. Merges and deduplicates results
+5. Applies MMR re-ranking for relevance + diversity
+6. Returns top-k results
 
 ---
 
@@ -182,9 +199,33 @@ options = TranscriptSearchOptions(
 
 **Example**: Finding diverse examples of a pattern
 
+### MMR Matched Vector Retrieval
+
+During MMR re-ranking, each candidate needs its embedding vector to compute diversity. The library fetches the matched vector from `transcript_vectors` using the `content_type` from the search result:
+
+```python
+# When a search result needs its vector for MMR:
+ct = result.metadata.get("content_type")
+embedding = await self._get_embedding(
+    user_id, result.session_id, result.sequence, ct
+)
+```
+
+When `content_type` is available, the fetch is precise (`WHERE parent_id = ? AND content_type = ?`). When not available, the first vector for that parent is returned.
+
 ---
 
 ## Searching Different Content Types
+
+The `search_in_*` flags control both semantic and full-text search. They map to `content_type` values in `transcript_vectors`:
+
+| Flag | Content Type | Searched |
+|------|-------------|----------|
+| `search_in_user=True` | `user_query` | User messages |
+| `search_in_assistant=True` | `assistant_response` | Assistant text responses |
+| `search_in_thinking=True` | `assistant_thinking` | Assistant reasoning blocks |
+
+Tool output (`tool_output`) is included by default when any flag is true.
 
 ### Search User Messages Only
 
@@ -366,6 +407,28 @@ stats = await storage.get_session_statistics(
 
 ## Performance Optimization
 
+### Single Query Embedding
+
+Hybrid search embeds the query exactly once. The pre-computed vector is passed to `_semantic_search_with_vector()`, avoiding the double-embed that would occur if full-text and semantic paths each embedded independently:
+
+```python
+# Internal implementation:
+async def _hybrid_search_transcripts(self, user_id, options, limit):
+    # Compute query embedding ONCE
+    query_vector = await self.embedding_provider.embed_text(options.query)
+    query_np = np.array(query_vector)
+
+    # Full-text results (no embedding needed)
+    text_results = await self._full_text_search_transcripts(...)
+
+    # Semantic results REUSE pre-computed vector
+    semantic_results = await self._semantic_search_with_vector(
+        user_id, options, candidate_limit, query_vector  # passed in
+    )
+
+    # Merge, deduplicate, MMR re-rank with query_np
+```
+
 ### Embedding Cache
 
 The embedding cache reduces API calls:
@@ -394,25 +457,25 @@ print(f"Utilization: {stats['utilization']:.1%}")
 Always use batch operations for multiple embeddings:
 
 ```python
-# ❌ Bad: Individual calls
+# Bad: Individual calls
 embeddings_list = []
 for text in texts:
     emb = await embeddings.embed_text(text)  # N API calls
     embeddings_list.append(emb)
 
-# ✅ Good: Batch call
+# Good: Batch call
 embeddings_list = await embeddings.embed_batch(texts)  # 1 API call
 ```
 
 ### Index Optimization
 
-Ensure Cosmos DB containers have proper indexes:
+Ensure Cosmos DB containers have the single-path vector index:
 
 ```bash
 # Check container indexing policy in Azure Portal
 # Look for "vectorIndexes" section with:
-# - path: "/embedding"
-# - type: "quantizedFlat" (or "diskANN" for >100k docs)
+# - path: "/vector"
+# - type: "quantizedFlat" (or "diskANN" for >100k records)
 # - dimensions: 3072
 ```
 
@@ -425,7 +488,7 @@ Ensure Cosmos DB containers have proper indexes:
 Azure OpenAI charges per token for embedding generation:
 
 | Model | Dimensions | Cost per 1M tokens |
-|-------|------------|--------------------|
+|-------|------------|-------------------|
 | text-embedding-3-small | 1536 | ~$0.02 |
 | text-embedding-3-large | 3072 | ~$0.13 |
 
@@ -438,15 +501,15 @@ Azure OpenAI charges per token for embedding generation:
 
 ### Storage Costs
 
-Vector embeddings increase storage size:
+Vector embeddings increase storage size, but externalization keeps transcript queries fast:
 
-| Component | Size per Message |
-|-----------|------------------|
-| Text content | ~500 bytes avg |
-| Embedding (3072-d) | ~12 KB (float32) |
+| Component | Size per Vector Record |
+|-----------|----------------------|
+| Vector (3072-d, float32) | ~12 KB |
+| Source text + metadata | ~500-4000 bytes |
 
 **Cosmos DB optimization:**
-- Use `quantizedFlat` index (128 bytes compressed)
+- Single quantizedFlat index (128 bytes compressed per vector)
 - Consider pruning old sessions
 - Use DuckDB for local development (no cloud costs)
 
@@ -466,7 +529,7 @@ await storage.sync_transcript_lines(...)  # Works without embeddings
 # Level 2: Add embeddings later
 embeddings = AzureOpenAIEmbeddings.from_env()
 storage = await CosmosBackend.create(embedding_provider=embeddings)
-# Now ingestion generates embeddings automatically
+# Now ingestion generates embeddings automatically in transcript_vectors
 
 # Level 3: Backfill old data
 await storage.upsert_embeddings(...)  # Add embeddings to existing data
@@ -491,32 +554,15 @@ test_storage = await SQLiteBackend.create()
 
 ---
 
-## Migration Checklist
-
-- [ ] Backup existing data (if needed)
-- [ ] Configure Azure OpenAI environment variables
-- [ ] Enable Cosmos DB vector search feature
-- [ ] Upgrade library to v0.2.0
-- [ ] Test with small dataset first
-- [ ] Verify vector search works (`supports_vector_search()`)
-- [ ] Monitor embedding cache hit rate
-- [ ] Tune MMR lambda for your use case
-- [ ] Clear old containers or backfill embeddings
-- [ ] Update ingestion pipeline to generate embeddings
-- [ ] Test search quality with real queries
-- [ ] Monitor API costs and adjust cache size
-
----
-
 ## FAQ
 
-**Q: Can I use v0.2.0 without embeddings?**  
-A: Yes! Full-text search works without an embedding provider. Semantic/hybrid search will gracefully degrade to full-text.
+**Q: Can I use the library without embeddings?**  
+A: Yes. Full-text search works without an embedding provider. Semantic/hybrid search will gracefully degrade to full-text.
 
 **Q: How do I know if vector search is working?**  
 A: Call `await storage.supports_vector_search()` - returns `True` if both embedding provider and vector indexes are available.
 
-**Q: What if my Cosmos DB account doesn't support vector search?**  
+**Q: What if my Cosmos DB account does not support vector search?**  
 A: You can still use full-text search, or use DuckDB/SQLite backends which have built-in vector support.
 
 **Q: Should I use DuckDB or SQLite for local development?**  
@@ -526,4 +572,7 @@ A: DuckDB is recommended - better performance, native vector support, analytical
 A: Check cache stats with `embeddings.get_cache_stats()` - high cache utilization = lower API costs.
 
 **Q: Can I switch backends without data loss?**  
-A: The storage abstraction uses the same interface, but each backend stores data independently. You'll need to re-ingest data when switching.
+A: The storage abstraction uses the same interface, but each backend stores data independently. You will need to re-ingest data when switching.
+
+**Q: How does chunking affect search results?**  
+A: Chunked texts produce multiple vector records, but search results are deduplicated by parent transcript message. You always get one result per message, with the score from the best-matching chunk.

@@ -1065,7 +1065,33 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         options: TranscriptSearchOptions,
         limit: int,
     ) -> list[SearchResult]:
-        """Full-text search using CONTAINS."""
+        """Full-text search across transcripts and vector source texts."""
+        # Search transcript content
+        transcript_results = await self._full_text_search_transcript_content(
+            user_id, options, limit
+        )
+
+        # Also search transcript_vectors source_text (BUG 1+5)
+        vector_text_results = await self._full_text_search_vector_sources(user_id, options, limit)
+
+        # Merge and deduplicate by (session_id, sequence)
+        seen: set[tuple[str, int]] = set()
+        combined: list[SearchResult] = []
+        for r in transcript_results + vector_text_results:
+            key = (r.session_id, r.sequence)
+            if key not in seen:
+                seen.add(key)
+                combined.append(r)
+
+        return combined[:limit]
+
+    async def _full_text_search_transcript_content(
+        self,
+        user_id: str,
+        options: TranscriptSearchOptions,
+        limit: int,
+    ) -> list[SearchResult]:
+        """Full-text search on transcript document content using CONTAINS."""
         container = self._get_container(CONTAINER_NAME)
 
         # Build query with explicit projection (excludes vectors, reduces RU cost)
@@ -1135,6 +1161,137 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
 
         return results
 
+    async def _full_text_search_vector_sources(
+        self,
+        user_id: str,
+        options: TranscriptSearchOptions,
+        limit: int,
+    ) -> list[SearchResult]:
+        """Search source_text in transcript_vector documents for span-level full-text matching.
+
+        This catches extracted thinking blocks, tool outputs, and chunked content
+        that wouldn't be found by searching transcript document content alone.
+        """
+        container = self._get_container(CONTAINER_NAME)
+
+        # Build content_type filter from search_in_* flags
+        content_types: list[str] = []
+        if options.search_in_user:
+            content_types.append("user_query")
+        if options.search_in_assistant:
+            content_types.append("assistant_response")
+        if options.search_in_thinking:
+            content_types.append("assistant_thinking")
+        if options.search_in_tool:
+            content_types.append("tool_output")
+
+        if not content_types:
+            return []
+
+        # Build query for vector documents
+        if user_id:
+            query_parts = [
+                "SELECT c.parent_id, c.session_id, c.project_slug, c.source_text,"
+                " c.content_type, c.span_start, c.span_end"
+                " FROM c WHERE c.type = @type AND c.user_id = @user_id"
+            ]
+            params: list[dict[str, object]] = [
+                {"name": "@type", "value": DOC_TYPE_VECTOR},
+                {"name": "@user_id", "value": user_id},
+            ]
+        else:
+            query_parts = [
+                "SELECT c.parent_id, c.session_id, c.project_slug, c.source_text,"
+                " c.content_type, c.span_start, c.span_end"
+                " FROM c WHERE c.type = @type"
+            ]
+            params: list[dict[str, object]] = [
+                {"name": "@type", "value": DOC_TYPE_VECTOR},
+            ]
+
+        # Source text search
+        query_parts.append("AND CONTAINS(c.source_text, @query)")
+        params.append({"name": "@query", "value": options.query})
+
+        # Content type filter
+        query_parts.append("AND ARRAY_CONTAINS(@contentTypes, c.content_type)")
+        params.append({"name": "@contentTypes", "value": content_types})
+
+        # Apply filters
+        if options.filters:
+            if options.filters.project_slug:
+                query_parts.append("AND c.project_slug = @project")
+                params.append({"name": "@project", "value": options.filters.project_slug})
+
+        query = " ".join(query_parts)
+
+        # Collect matches, dedup by parent_id
+        best_by_parent: dict[str, dict[str, Any]] = {}
+        async for item in container.query_items(
+            query=query, parameters=params, max_item_count=limit * 3
+        ):
+            parent_id = item["parent_id"]
+            if parent_id not in best_by_parent:
+                best_by_parent[parent_id] = item
+            if len(best_by_parent) >= limit:
+                break
+
+        if not best_by_parent:
+            return []
+
+        # Fetch parent transcript documents for content and metadata
+        results: list[SearchResult] = []
+        for match in list(best_by_parent.values())[:limit]:
+            parent_id = match["parent_id"]
+            session_id = match["session_id"]
+            project_slug = match.get("project_slug", "")
+
+            # Try to find the parent transcript for full content
+            parent_query = (
+                f"SELECT {TRANSCRIPT_PROJECTION} FROM c WHERE c.type = @type AND c.id = @parentId"
+            )
+            parent_params: list[dict[str, object]] = [
+                {"name": "@type", "value": DOC_TYPE_TRANSCRIPT},
+                {"name": "@parentId", "value": parent_id},
+            ]
+
+            parent_doc: dict[str, Any] | None = None
+            async for item in container.query_items(
+                query=parent_query, parameters=parent_params, max_item_count=1
+            ):
+                parent_doc = item
+                break
+
+            if parent_doc:
+                # Apply date filters on parent
+                if options.filters:
+                    ts = parent_doc.get("ts")
+                    if ts:
+                        if options.filters.start_date and ts < options.filters.start_date:
+                            continue
+                        if options.filters.end_date and ts > options.filters.end_date:
+                            continue
+
+                metadata = _strip_vectors(parent_doc)
+                metadata["content_type"] = match.get("content_type")
+                metadata["matched_text"] = match.get("source_text", "")
+                metadata["span_start"] = match.get("span_start")
+                metadata["span_end"] = match.get("span_end")
+
+                results.append(
+                    SearchResult(
+                        session_id=parent_doc.get("session_id", session_id),
+                        project_slug=parent_doc.get("project_slug", project_slug),
+                        sequence=parent_doc.get("sequence", 0),
+                        content=_extract_display_content(parent_doc.get("content")),
+                        metadata=metadata,
+                        score=1.0,
+                        source="full_text",
+                    )
+                )
+
+        return results
+
     async def _semantic_search_transcripts(
         self,
         user_id: str,
@@ -1145,9 +1302,17 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         if not self.embedding_provider:
             raise ValueError("Embedding provider required for semantic search")
 
-        # Generate query embedding
         query_vector = await self.embedding_provider.embed_text(options.query)
+        return await self._semantic_search_with_vector(user_id, options, limit, query_vector)
 
+    async def _semantic_search_with_vector(
+        self,
+        user_id: str,
+        options: TranscriptSearchOptions,
+        limit: int,
+        query_vector: list[float],
+    ) -> list[SearchResult]:
+        """Semantic search with pre-computed query vector (avoids double embedding)."""
         # Translate search_in_* flags to content_types
         content_types: list[str] | None = []
         if options.search_in_user:
@@ -1184,12 +1349,16 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         # Get more candidates for MMR re-ranking
         candidate_limit = limit * 3
 
+        # Compute query embedding ONCE
+        query_vector = await self.embedding_provider.embed_text(options.query)
+        query_np = np.array(query_vector)
+
         # Get full-text results
         text_results = await self._full_text_search_transcripts(user_id, options, candidate_limit)
 
-        # Get semantic results
-        semantic_results = await self._semantic_search_transcripts(
-            user_id, options, candidate_limit
+        # Get semantic results (reuses pre-computed vector)
+        semantic_results = await self._semantic_search_with_vector(
+            user_id, options, candidate_limit, query_vector
         )
 
         # Merge and deduplicate
@@ -1205,17 +1374,17 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
             return combined[:limit]
 
         # Apply MMR re-ranking for diversity
-        query_vector = await self.embedding_provider.embed_text(options.query)
-        query_np = np.array(query_vector)
-
         # Fetch embeddings from vector documents for MMR
         vectors = []
         for result in combined:
             if "embedding" in result.metadata and result.metadata["embedding"]:
                 vectors.append(np.array(result.metadata["embedding"]))
             else:
-                # Fetch embedding from vector documents
-                embedding = await self._get_embedding(user_id, result.session_id, result.sequence)
+                # Fetch embedding from vector documents, using content_type for precision
+                ct = result.metadata.get("content_type")
+                embedding = await self._get_embedding(
+                    user_id, result.session_id, result.sequence, ct
+                )
                 if embedding:
                     vectors.append(np.array(embedding))
                 else:
@@ -1233,11 +1402,11 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         return [combined[idx] for idx, _ in mmr_results]
 
     async def _get_embedding(
-        self, user_id: str, session_id: str, sequence: int
+        self, user_id: str, session_id: str, sequence: int, content_type: str | None = None
     ) -> list[float] | None:
-        """Fetch first available embedding for a transcript message.
+        """Fetch embedding for a transcript message, optionally by content_type.
 
-        Queries vector documents by parent_id, returns first vector found.
+        Queries vector documents by parent_id, optionally filtered by content_type.
         """
         container = self._get_container(CONTAINER_NAME)
         parent_id = f"{session_id}_msg_{sequence}"
@@ -1251,6 +1420,10 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
             {"name": "@type", "value": DOC_TYPE_VECTOR},
             {"name": "@parentId", "value": parent_id},
         ]
+
+        if content_type:
+            query += " AND c.content_type = @contentType"
+            params.append({"name": "@contentType", "value": content_type})
 
         async for item in container.query_items(query=query, parameters=params, max_item_count=1):
             vec = item.get("vector")

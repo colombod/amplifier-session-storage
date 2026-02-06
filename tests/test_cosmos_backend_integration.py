@@ -144,9 +144,40 @@ class TestCosmosIntegration:
 
         assert len(retrieved) == 2
 
-        # Check if embeddings were stored
-        if "embedding" in retrieved[0]:
-            assert len(retrieved[0]["embedding"]) == 3072
+        # Verify externalized vector documents were created
+        container = cosmos_storage._get_container("session_data")
+        pk = cosmos_storage.make_partition_key("test-user", "test-project", test_session_id)
+
+        # Query for vector documents
+        vector_docs = []
+        async for doc in container.query_items(
+            query="SELECT * FROM c WHERE c.partition_key = @pk AND c.type = 'transcript_vector'",
+            parameters=[{"name": "@pk", "value": pk}],
+        ):
+            vector_docs.append(doc)
+
+        assert len(vector_docs) > 0, "No transcript_vector documents created"
+        for vd in vector_docs:
+            assert vd["type"] == "transcript_vector"
+            assert "parentId" in vd or "parent_id" in vd
+            assert "contentType" in vd or "content_type" in vd
+            assert "vector" in vd
+            assert isinstance(vd["vector"], list)
+            assert len(vd["vector"]) == 3072
+
+        # Verify transcript docs don't have old inline vectors
+        transcript_docs = []
+        async for doc in container.query_items(
+            query="SELECT * FROM c WHERE c.partition_key = @pk AND c.type = 'transcript'",
+            parameters=[{"name": "@pk", "value": pk}],
+        ):
+            transcript_docs.append(doc)
+
+        for td in transcript_docs:
+            assert "user_query_vector" not in td, "Old inline vector found on transcript"
+            assert "assistant_response_vector" not in td
+            assert "assistant_thinking_vector" not in td
+            assert "tool_output_vector" not in td
 
     @pytest.mark.asyncio
     async def test_full_text_search(self, cosmos_storage):
@@ -289,8 +320,10 @@ class TestCosmosVectorSearch:
             limit=10,
         )
 
-        # Should work or gracefully degrade
+        # Should return actual results
         assert isinstance(results, list)
+        assert len(results) > 0, "Vector search returned no results"
+        assert results[0].score > 0, "Result has no score"
 
     @pytest.mark.asyncio
     async def test_hybrid_search_if_enabled(self, cosmos_storage):
@@ -325,3 +358,4 @@ class TestCosmosVectorSearch:
         )
 
         assert isinstance(results, list)
+        assert len(results) > 0, "Hybrid search returned no results"

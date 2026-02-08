@@ -527,21 +527,23 @@ class StorageReader(_StorageLifecycle):
         min_turn_count: int | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """Get active sessions with rich filtering options.
+        """Get sessions with activity in the specified date range.
 
-        Convenience method for common queries like "sessions from last week"
-        or "active sessions in this project".
+        Detects sessions by finding transcripts/events with timestamps in the date range,
+        NOT by session creation date. This returns sessions that were actually active
+        in the specified period.
 
         Args:
             user_id: Filter by user (empty = all users)
             project_slug: Filter by project
-            start_date: Sessions created >= this date (ISO format)
-            end_date: Sessions created <= this date (ISO format)
-            min_turn_count: Filter sessions with at least N turns (activity filter)
+            start_date: Find sessions with activity >= this date (ISO format)
+            end_date: Find sessions with activity <= this date (ISO format)
+            min_turn_count: Filter sessions with at least N turns (optional)
             limit: Maximum results to return
 
         Returns:
-            List of session metadata dicts with full session info, ordered by created DESC
+            List of session metadata dicts for sessions with activity in date range,
+            ordered by most recent activity DESC
         """
         pass
 

@@ -283,9 +283,17 @@ async def get_active_sessions(
     """
 ```
 
+**Implementation:**
+
+Detects sessions by querying transcripts for `ts` (timestamp) in the date range, then fetches session metadata for those session_ids. This means:
+
+- ✅ Returns sessions with **actual activity** in the period (transcript messages)
+- ❌ Does NOT return dormant sessions created in the period with no recent activity
+- Orders results by most recent activity (`updated` field)
+
 **Use cases:**
-- "Show me sessions from last week": `get_active_sessions(start_date="2024-01-20T00:00:00Z")`
+- "Show me sessions active last week": `get_active_sessions(start_date="2024-01-20T00:00:00Z")`
 - "Active sessions in this project": `get_active_sessions(project_slug="myproject")`
-- "Sessions with > 10 turns": `get_active_sessions(min_turn_count=10)`
-- "Recent high-activity sessions": `get_active_sessions(start_date="2024-01-25T00:00:00Z", min_turn_count=20)`
+- "Sessions with > 10 turns and recent activity": `get_active_sessions(min_turn_count=10, start_date="2024-01-25T00:00:00Z")`
+- "All activity today": `get_active_sessions(start_date="2024-01-28T00:00:00Z")`
 

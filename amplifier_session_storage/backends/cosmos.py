@@ -771,7 +771,13 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         for i, line in enumerate(lines):
             sequence = start_sequence + i
             doc_id = f"{session_id}_msg_{sequence}"
-            ts = line.get("ts") or line.get("timestamp")
+            # Extract timestamp from either location (backward compat)
+            # Priority: metadata.timestamp (new) > top-level ts/timestamp (old)
+            ts = None
+            if "metadata" in line and isinstance(line["metadata"], dict):
+                ts = line["metadata"].get("timestamp")
+            if not ts:
+                ts = line.get("ts") or line.get("timestamp")
 
             doc: dict[str, Any] = {
                 **line,
@@ -2224,65 +2230,107 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         min_turn_count: int | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """Get active sessions with rich filtering options.
+        """Get sessions with activity in the specified date range.
 
-        Convenience method for common queries like "sessions from last week"
-        or "active sessions in this project".
+        Detects sessions by finding transcripts/events with timestamps in the date range,
+        NOT by session creation date. This returns sessions that were actually active
+        in the specified period.
 
         Args:
             user_id: Filter by user (empty = all users)
             project_slug: Filter by project
-            start_date: Sessions created >= this date (ISO format)
-            end_date: Sessions created <= this date (ISO format)
-            min_turn_count: Filter sessions with at least N turns (activity filter)
+            start_date: Find sessions with activity >= this date (ISO format)
+            end_date: Find sessions with activity <= this date (ISO format)
+            min_turn_count: Filter sessions with at least N turns (optional)
             limit: Maximum results to return
 
         Returns:
-            List of session metadata dicts with full session info, ordered by created DESC
+            List of session metadata dicts for sessions with activity in date range,
+            ordered by most recent activity DESC
         """
         container = self._get_container(CONTAINER_NAME)
 
-        where_parts: list[str] = ["c.type = @doc_type"]
-        params: list[dict[str, object]] = [{"name": "@doc_type", "value": DOC_TYPE_SESSION}]
+        # Step 1: Find session_ids with transcript activity in date range
+        # Query transcripts (type='transcript') for activity, get distinct session_ids
+        activity_where: list[str] = ["c.type = @transcript_type"]
+        activity_params: list[dict[str, object]] = [
+            {"name": "@transcript_type", "value": DOC_TYPE_TRANSCRIPT}
+        ]
 
         if user_id:
-            where_parts.append("c.user_id = @user_id")
-            params.append({"name": "@user_id", "value": user_id})
+            activity_where.append("c.user_id = @user_id")
+            activity_params.append({"name": "@user_id", "value": user_id})
 
         if project_slug:
-            where_parts.append("c.project_slug = @project")
-            params.append({"name": "@project", "value": project_slug})
+            activity_where.append("c.project_slug = @project")
+            activity_params.append({"name": "@project", "value": project_slug})
 
         if start_date:
-            where_parts.append("c.created >= @start_date")
-            params.append({"name": "@start_date", "value": start_date})
+            activity_where.append("c.ts >= @start_date")
+            activity_params.append({"name": "@start_date", "value": start_date})
 
         if end_date:
-            where_parts.append("c.created <= @end_date")
-            params.append({"name": "@end_date", "value": end_date})
+            activity_where.append("c.ts <= @end_date")
+            activity_params.append({"name": "@end_date", "value": end_date})
 
-        if min_turn_count is not None:
-            where_parts.append("c.turn_count >= @min_turns")
-            params.append({"name": "@min_turns", "value": min_turn_count})
+        activity_clause = " AND ".join(activity_where)
 
-        where_clause = " AND ".join(where_parts)
-
-        # Use full SESSION_PROJECTION for richer results
-        query = f"""
-            SELECT {SESSION_PROJECTION} FROM c
-            WHERE {where_clause}
-            ORDER BY c.created DESC
+        # Get distinct session_ids with activity
+        activity_query = f"""
+            SELECT DISTINCT VALUE c.session_id
+            FROM c
+            WHERE {activity_clause}
         """
 
+        active_session_ids: list[str] = []
+        async for session_id in container.query_items(
+            query=activity_query, parameters=activity_params
+        ):
+            if session_id:
+                active_session_ids.append(str(session_id))
+
+        if not active_session_ids:
+            return []
+
+        # Step 2: Fetch session metadata for those session_ids
+        # Note: Cosmos DB doesn't support IN with large arrays efficiently
+        # For now, fetch individually (can optimize with batching if needed)
         sessions: list[dict[str, Any]] = []
-        count = 0
-        async for item in container.query_items(query=query, parameters=params):
-            sessions.append(item)
-            count += 1
-            if count >= limit:
+
+        for session_id in active_session_ids[:limit]:  # Pre-limit to avoid excessive queries
+            session_where: list[str] = [
+                "c.type = @session_type",
+                "c.session_id = @session_id",
+            ]
+            session_params: list[dict[str, object]] = [
+                {"name": "@session_type", "value": DOC_TYPE_SESSION},
+                {"name": "@session_id", "value": session_id},
+            ]
+
+            if user_id:
+                session_where.append("c.user_id = @user_id")
+                session_params.append({"name": "@user_id", "value": user_id})
+
+            if min_turn_count is not None:
+                session_where.append("c.turn_count >= @min_turns")
+                session_params.append({"name": "@min_turns", "value": min_turn_count})
+
+            session_clause = " AND ".join(session_where)
+
+            query = f"SELECT {SESSION_PROJECTION} FROM c WHERE {session_clause}"
+
+            async for item in container.query_items(query=query, parameters=session_params):
+                sessions.append(item)
+                if len(sessions) >= limit:
+                    break
+
+            if len(sessions) >= limit:
                 break
 
-        return sessions
+        # Sort by updated DESC (most recent activity first)
+        sessions.sort(key=lambda s: s.get("updated", s.get("created", "")), reverse=True)
+
+        return sessions[:limit]
 
     # =========================================================================
     # Sequence-Based Navigation

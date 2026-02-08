@@ -2161,49 +2161,74 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
         min_turn_count: int | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """Get active sessions with rich filtering options."""
+        """Get sessions with activity in the specified date range.
 
+        Detects sessions by finding transcripts with timestamps in the date range,
+        NOT by session creation date.
+        """
         def _get_active() -> list[dict[str, Any]]:
-            where_parts: list[str] = ["type = ?"]
-            params: list[Any] = ["session"]
+            # Step 1: Find session_ids with transcript activity
+            activity_where: list[str] = ["type = ?"]
+            activity_params: list[Any] = ["transcript"]
 
             if user_id:
-                where_parts.append("user_id = ?")
-                params.append(user_id)
+                activity_where.append("user_id = ?")
+                activity_params.append(user_id)
 
             if project_slug:
-                where_parts.append("project_slug = ?")
-                params.append(project_slug)
+                activity_where.append("project_slug = ?")
+                activity_params.append(project_slug)
 
             if start_date:
-                where_parts.append("created >= ?")
-                params.append(start_date)
+                activity_where.append("ts >= ?")
+                activity_params.append(start_date)
 
             if end_date:
-                where_parts.append("created <= ?")
-                params.append(end_date)
+                activity_where.append("ts <= ?")
+                activity_params.append(end_date)
+
+            activity_clause = " AND ".join(activity_where)
+
+            # Get distinct session_ids
+            activity_query = f"""
+                SELECT DISTINCT session_id
+                FROM transcripts
+                WHERE {activity_clause}
+            """
+
+            cursor = self._conn.execute(activity_query, activity_params)
+            active_session_ids = [row[0] for row in cursor.fetchall()]
+
+            if not active_session_ids:
+                return []
+
+            # Step 2: Fetch session metadata
+            placeholders = ",".join("?" * len(active_session_ids))
+            session_where: list[str] = [f"session_id IN ({placeholders})"]
+            session_params: list[Any] = active_session_ids
 
             if min_turn_count is not None:
-                where_parts.append("turn_count >= ?")
-                params.append(min_turn_count)
+                session_where.append("turn_count >= ?")
+                session_params.append(min_turn_count)
 
-            where_clause = " AND ".join(where_parts)
+            session_clause = " AND ".join(session_where)
 
             query = f"""
                 SELECT session_id, user_id, project_slug, bundle, created,
                        updated, turn_count, metadata
                 FROM sessions
-                WHERE {where_clause}
-                ORDER BY created DESC
+                WHERE {session_clause}
+                ORDER BY updated DESC
                 LIMIT {limit}
             """
 
-            cursor = self._conn.execute(query, params)
+            cursor = self._conn.execute(query, session_params)
             rows = cursor.fetchall()
 
             return [dict(row) for row in rows]
 
         return await asyncio.to_thread(_get_active)
+
 
     # =========================================================================
     # Sequence-Based Navigation

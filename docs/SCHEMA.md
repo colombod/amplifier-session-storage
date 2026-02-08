@@ -140,8 +140,11 @@ The transcripts table stores conversation messages. It contains **no vector colu
 | `role` | enum | Yes | - | Message role: `user`, `assistant`, `tool`, `system` |
 | `content` | JSON | Yes | - | Message content (string or structured JSON, see Content Structure below) |
 | `turn` | integer | No | `null` | Conversation turn number (can be null for system messages) |
-| `ts` | ISO 8601 datetime | Yes | - | When message was created |
+| `ts` | ISO 8601 datetime | Yes | - | When message was created (normalized from metadata.timestamp or top-level timestamp) |
+| `metadata` | JSON object | No | `null` | Dynamic metadata dict containing timestamp and other module-added fields |
 | `synced_at` | ISO 8601 datetime | Yes | - | When record was last synced |
+
+> **Note:** The `metadata` field is intentionally dynamic and can contain various fields added by different Amplifier modules (e.g., `timestamp`, `source`, `confidence`, `redaction_applied`). The `ts` field is normalized at write time for efficient querying.
 
 > **Note:** Fields such as `text_content`, `tool_calls`, `tool_call_id`, and `thinking` are logical fields stored within the JSON `content` column, not discrete DuckDB columns. See the Content Structure section below for how they appear inside `content`.
 

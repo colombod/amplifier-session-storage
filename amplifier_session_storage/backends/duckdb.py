@@ -2152,6 +2152,59 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
 
         return await asyncio.to_thread(_list_sessions)
 
+    async def get_active_sessions(
+        self,
+        user_id: str = "",
+        project_slug: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        min_turn_count: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Get active sessions with rich filtering options."""
+
+        def _get_active() -> list[dict[str, Any]]:
+            where_parts: list[str] = ["type = ?"]
+            params: list[Any] = ["session"]
+
+            if user_id:
+                where_parts.append("user_id = ?")
+                params.append(user_id)
+
+            if project_slug:
+                where_parts.append("project_slug = ?")
+                params.append(project_slug)
+
+            if start_date:
+                where_parts.append("created >= ?")
+                params.append(start_date)
+
+            if end_date:
+                where_parts.append("created <= ?")
+                params.append(end_date)
+
+            if min_turn_count is not None:
+                where_parts.append("turn_count >= ?")
+                params.append(min_turn_count)
+
+            where_clause = " AND ".join(where_parts)
+
+            query = f"""
+                SELECT session_id, user_id, project_slug, bundle, created,
+                       updated, turn_count, metadata
+                FROM sessions
+                WHERE {where_clause}
+                ORDER BY created DESC
+                LIMIT {limit}
+            """
+
+            cursor = self._conn.execute(query, params)
+            rows = cursor.fetchall()
+
+            return [dict(row) for row in rows]
+
+        return await asyncio.to_thread(_get_active)
+
     # =========================================================================
     # Sequence-Based Navigation
     # =========================================================================

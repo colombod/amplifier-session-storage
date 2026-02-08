@@ -87,7 +87,7 @@ SESSION_PROJECTION = """
 # With externalized vectors, transcript documents no longer contain vector data at all
 TRANSCRIPT_PROJECTION = """
     c.id, c.type, c.partition_key, c.user_id, c.host_id, c.project_slug, c.session_id, c.sequence,
-    c.role, c.content, c.turn, c.ts, c.synced_at
+    c.role, c.content, c.turn, c.ts, c.metadata, c.synced_at
 """
 
 # Event fields (no vectors)
@@ -2214,6 +2214,75 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
 
         # Apply offset and limit
         return sessions[offset : offset + limit]
+
+    async def get_active_sessions(
+        self,
+        user_id: str = "",
+        project_slug: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        min_turn_count: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Get active sessions with rich filtering options.
+
+        Convenience method for common queries like "sessions from last week"
+        or "active sessions in this project".
+
+        Args:
+            user_id: Filter by user (empty = all users)
+            project_slug: Filter by project
+            start_date: Sessions created >= this date (ISO format)
+            end_date: Sessions created <= this date (ISO format)
+            min_turn_count: Filter sessions with at least N turns (activity filter)
+            limit: Maximum results to return
+
+        Returns:
+            List of session metadata dicts with full session info, ordered by created DESC
+        """
+        container = self._get_container(CONTAINER_NAME)
+
+        where_parts: list[str] = ["c.type = @doc_type"]
+        params: list[dict[str, object]] = [{"name": "@doc_type", "value": DOC_TYPE_SESSION}]
+
+        if user_id:
+            where_parts.append("c.user_id = @user_id")
+            params.append({"name": "@user_id", "value": user_id})
+
+        if project_slug:
+            where_parts.append("c.project_slug = @project")
+            params.append({"name": "@project", "value": project_slug})
+
+        if start_date:
+            where_parts.append("c.created >= @start_date")
+            params.append({"name": "@start_date", "value": start_date})
+
+        if end_date:
+            where_parts.append("c.created <= @end_date")
+            params.append({"name": "@end_date", "value": end_date})
+
+        if min_turn_count is not None:
+            where_parts.append("c.turn_count >= @min_turns")
+            params.append({"name": "@min_turns", "value": min_turn_count})
+
+        where_clause = " AND ".join(where_parts)
+
+        # Use full SESSION_PROJECTION for richer results
+        query = f"""
+            SELECT {SESSION_PROJECTION} FROM c
+            WHERE {where_clause}
+            ORDER BY c.created DESC
+        """
+
+        sessions: list[dict[str, Any]] = []
+        count = 0
+        async for item in container.query_items(query=query, parameters=params):
+            sessions.append(item)
+            count += 1
+            if count >= limit:
+                break
+
+        return sessions
 
     # =========================================================================
     # Sequence-Based Navigation

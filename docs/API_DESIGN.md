@@ -250,3 +250,42 @@ Each backend (Cosmos, DuckDB, SQLite) needs tests for:
 4. **Integration Tests**
    - `test_end_to_end_discovery_workflow`
    - `test_team_wide_search_workflow`
+
+### 1.4. get_active_sessions()
+
+**New convenience method for common session queries with date filtering.**
+
+```python
+async def get_active_sessions(
+    self,
+    user_id: str = "",
+    project_slug: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    min_turn_count: int | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Get active sessions with rich filtering options.
+    
+    Convenience method for common queries like "sessions from last week"
+    or "active sessions in this project".
+    
+    Args:
+        user_id: Filter by user (empty = all users)
+        project_slug: Filter by project
+        start_date: Sessions created >= this date (ISO format)
+        end_date: Sessions created <= this date (ISO format)
+        min_turn_count: Filter sessions with at least N turns (activity filter)
+        limit: Maximum results to return
+        
+    Returns:
+        List of session metadata dicts with full session info, ordered by created DESC
+    """
+```
+
+**Use cases:**
+- "Show me sessions from last week": `get_active_sessions(start_date="2024-01-20T00:00:00Z")`
+- "Active sessions in this project": `get_active_sessions(project_slug="myproject")`
+- "Sessions with > 10 turns": `get_active_sessions(min_turn_count=10)`
+- "Recent high-activity sessions": `get_active_sessions(start_date="2024-01-25T00:00:00Z", min_turn_count=20)`
+

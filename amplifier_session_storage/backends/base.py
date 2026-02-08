@@ -518,6 +518,34 @@ class StorageReader(_StorageLifecycle):
         pass
 
     @abstractmethod
+    async def get_active_sessions(
+        self,
+        user_id: str = "",
+        project_slug: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        min_turn_count: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Get active sessions with rich filtering options.
+
+        Convenience method for common queries like "sessions from last week"
+        or "active sessions in this project".
+
+        Args:
+            user_id: Filter by user (empty = all users)
+            project_slug: Filter by project
+            start_date: Sessions created >= this date (ISO format)
+            end_date: Sessions created <= this date (ISO format)
+            min_turn_count: Filter sessions with at least N turns (activity filter)
+            limit: Maximum results to return
+
+        Returns:
+            List of session metadata dicts with full session info, ordered by created DESC
+        """
+        pass
+
+    @abstractmethod
     async def get_session_statistics(
         self,
         user_id: str,

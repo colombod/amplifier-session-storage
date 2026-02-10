@@ -772,8 +772,19 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
                 )
             except Exception as exc:
                 logger.error(
-                    f"Vector generation failed for session {session_id} "
-                    f"({len(lines)} messages) — transcripts stored without vectors: {exc}"
+                    "EMBEDDING_FAILURE: Vector generation failed for "
+                    "user=%s project=%s session=%s (%d messages). "
+                    "%d transcripts were stored successfully but will lack "
+                    "vector embeddings — semantic/hybrid search will not cover "
+                    "these messages. error_type=%s error=%s",
+                    user_id,
+                    project_slug,
+                    session_id,
+                    len(lines),
+                    stored,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=True,
                 )
         elif embeddings is not None:
             # Pre-computed embeddings (from sync daemon) - store as single-chunk vectors

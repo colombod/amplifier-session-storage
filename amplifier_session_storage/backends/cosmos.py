@@ -2056,43 +2056,49 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         project_slug: str,
         session_id: str,
     ) -> SessionSyncStats:
-        """Get lightweight sync statistics using a single aggregate query."""
+        """Get lightweight sync statistics using single-aggregate queries.
+
+        Cosmos DB cross-partition queries don't support GROUP BY with multiple
+        aggregates (NonValueAggregate, MultipleAggregates, GroupBy errors).
+        We use separate SELECT VALUE queries per type — each is a cheap
+        single-partition read against the partition_key filter.
+        """
         container = self._get_container(CONTAINER_NAME)
         partition_key = self.make_partition_key(user_id, project_slug, session_id)
+        pk_param = [{"name": "@pk", "value": partition_key}]
 
-        # Single query - aggregate both types
-        query = """
-            SELECT
-                c.type,
-                COUNT(1) as count,
-                MIN(c.ts) as earliest_ts,
-                MAX(c.ts) as latest_ts
-            FROM c
-            WHERE c.partition_key = @pk
-              AND c.type IN ('event', 'transcript')
-            GROUP BY c.type
-        """
+        async def _single_value(query: str) -> Any:
+            """Execute a SELECT VALUE query and return the single result."""
+            async for item in container.query_items(query=query, parameters=pk_param):
+                return item
+            return None
 
-        event_count = transcript_count = 0
-        event_earliest = event_latest = None
-        transcript_earliest = transcript_latest = None
+        # Separate single-aggregate queries per type (safe for Cosmos DB)
+        event_count = (
+            await _single_value(
+                "SELECT VALUE COUNT(1) FROM c WHERE c.partition_key = @pk AND c.type = 'event'"
+            )
+            or 0
+        )
+        event_earliest = await _single_value(
+            "SELECT VALUE MIN(c.ts) FROM c WHERE c.partition_key = @pk AND c.type = 'event'"
+        )
+        event_latest = await _single_value(
+            "SELECT VALUE MAX(c.ts) FROM c WHERE c.partition_key = @pk AND c.type = 'event'"
+        )
 
-        async for row in container.query_items(
-            query=query,
-            parameters=[{"name": "@pk", "value": partition_key}],
-        ):
-            doc_type = row.get("type")
-            count = row.get("count", 0)
-            earliest = row.get("earliest_ts")
-            latest = row.get("latest_ts")
-            if doc_type == "event":
-                event_count = count
-                event_earliest = earliest
-                event_latest = latest
-            elif doc_type == "transcript":
-                transcript_count = count
-                transcript_earliest = earliest
-                transcript_latest = latest
+        transcript_count = (
+            await _single_value(
+                "SELECT VALUE COUNT(1) FROM c WHERE c.partition_key = @pk AND c.type = 'transcript'"
+            )
+            or 0
+        )
+        transcript_earliest = await _single_value(
+            "SELECT VALUE MIN(c.ts) FROM c WHERE c.partition_key = @pk AND c.type = 'transcript'"
+        )
+        transcript_latest = await _single_value(
+            "SELECT VALUE MAX(c.ts) FROM c WHERE c.partition_key = @pk AND c.type = 'transcript'"
+        )
 
         return SessionSyncStats(
             event_count=event_count,

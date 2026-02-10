@@ -267,6 +267,97 @@ class TestCosmosIntegration:
         assert isinstance(stats["total_sessions"], int)
 
     @pytest.mark.asyncio
+    async def test_session_sync_stats(self, cosmos_storage):
+        """Sync stats aggregation works without GROUP BY (regression test).
+
+        Validates that get_session_sync_stats uses Cosmos-compatible queries
+        (separate single-aggregate queries instead of GROUP BY with multiple
+        aggregates, which Cosmos DB cross-partition queries don't support).
+        """
+        test_session_id = f"test-syncstats-{datetime.now(UTC).timestamp()}"
+        test_user = "test-user"
+        test_project = "test-project"
+
+        # Seed transcripts (include ts — real sync data always has timestamps)
+        lines = [
+            {
+                "role": "user",
+                "content": "First message",
+                "turn": 0,
+                "ts": datetime.now(UTC).isoformat(),
+            },
+            {
+                "role": "assistant",
+                "content": "First reply",
+                "turn": 0,
+                "ts": datetime.now(UTC).isoformat(),
+            },
+            {
+                "role": "user",
+                "content": "Second message",
+                "turn": 1,
+                "ts": datetime.now(UTC).isoformat(),
+            },
+        ]
+        synced_transcripts = await cosmos_storage.sync_transcript_lines(
+            user_id=test_user,
+            host_id="test-host",
+            project_slug=test_project,
+            session_id=test_session_id,
+            lines=lines,
+        )
+        assert synced_transcripts == 3
+
+        # Seed events
+        events = [
+            {"event": "session.start", "ts": datetime.now(UTC).isoformat(), "lvl": "info"},
+            {"event": "llm.request", "ts": datetime.now(UTC).isoformat(), "lvl": "debug"},
+        ]
+        synced_events = await cosmos_storage.sync_event_lines(
+            user_id=test_user,
+            host_id="test-host",
+            project_slug=test_project,
+            session_id=test_session_id,
+            lines=events,
+        )
+        assert synced_events == 2
+
+        # Call the method that previously used unsupported GROUP BY
+        stats = await cosmos_storage.get_session_sync_stats(
+            user_id=test_user,
+            project_slug=test_project,
+            session_id=test_session_id,
+        )
+
+        # Verify counts
+        assert stats.event_count == 2, f"Expected 2 events, got {stats.event_count}"
+        assert stats.transcript_count == 3, f"Expected 3 transcripts, got {stats.transcript_count}"
+
+        # Verify timestamp ranges are populated
+        assert stats.event_ts_range[0] is not None, "event earliest_ts should not be None"
+        assert stats.event_ts_range[1] is not None, "event latest_ts should not be None"
+        assert stats.transcript_ts_range[0] is not None, "transcript earliest_ts should not be None"
+        assert stats.transcript_ts_range[1] is not None, "transcript latest_ts should not be None"
+
+        # earliest <= latest
+        assert stats.event_ts_range[0] <= stats.event_ts_range[1]
+        assert stats.transcript_ts_range[0] <= stats.transcript_ts_range[1]
+
+    @pytest.mark.asyncio
+    async def test_session_sync_stats_empty_session(self, cosmos_storage):
+        """Sync stats returns zeros for a session with no data."""
+        stats = await cosmos_storage.get_session_sync_stats(
+            user_id="test-user",
+            project_slug="test-project",
+            session_id=f"nonexistent-{datetime.now(UTC).timestamp()}",
+        )
+
+        assert stats.event_count == 0
+        assert stats.transcript_count == 0
+        assert stats.event_ts_range == (None, None)
+        assert stats.transcript_ts_range == (None, None)
+
+    @pytest.mark.asyncio
     async def test_cleanup_test_data(self, cosmos_storage):
         """Cleanup can delete test sessions."""
         # Get all test sessions

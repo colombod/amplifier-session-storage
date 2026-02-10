@@ -1,7 +1,7 @@
 # Amplifier Session Storage - Data Schema Reference
 
-> **Version**: 2.0.0  
-> **Last Updated**: 2025-02-06  
+> **Version**: 3.0.0  
+> **Last Updated**: 2026-02-10  
 > **Status**: Authoritative Source of Truth
 
 This document defines the canonical schema for all data entities in amplifier-session-storage. All backend implementations (Cosmos DB, DuckDB, SQLite) MUST conform to this schema.
@@ -142,6 +142,7 @@ The transcripts table stores conversation messages. It contains **no vector colu
 | `turn` | integer | No | `null` | Conversation turn number (can be null for system messages) |
 | `ts` | ISO 8601 datetime | Yes | - | When message was created (normalized from metadata.timestamp or top-level timestamp) |
 | `metadata` | JSON object | No | `null` | Dynamic metadata dict containing timestamp and other module-added fields |
+| `has_vectors` | boolean | Yes | `false` | Tracks whether vector embeddings exist for this transcript. Set to false on creation, flipped to true when vectors are stored. Used by backfill_embeddings() to find transcripts missing vectors. |
 | `synced_at` | ISO 8601 datetime | Yes | - | When record was last synced |
 
 > **Note:** The `metadata` field is intentionally dynamic and can contain various fields added by different Amplifier modules (e.g., `timestamp`, `source`, `confidence`, `redaction_applied`). The `ts` field is normalized at write time for efficient querying.
@@ -394,7 +395,7 @@ A simple key-value table that tracks schema version and metadata for migration s
 
 | Key | Value | Description |
 |-----|-------|-------------|
-| `version` | `"2"` | Schema version. `1` = inline vectors on transcripts. `2` = externalized vectors in transcript_vectors. |
+| `version` | `"3"` | Schema version. `1` = inline vectors on transcripts. `2` = externalized vectors in transcript_vectors. `3` = added `has_vectors` tracking column to transcripts. |
 
 ### DDL
 
@@ -414,7 +415,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 )
 ```
 
-On backend initialization, the version is checked. If version < 2, auto-migration moves inline vectors from `transcripts` to `transcript_vectors` and sets version to 2. See `MULTI_VECTOR_IMPLEMENTATION.md` for migration details.
+On backend initialization, the version is checked. If version < 2, auto-migration moves inline vectors from `transcripts` to `transcript_vectors` and sets version to 2. If version < 3, auto-migration adds the `has_vectors` column to `transcripts` (DuckDB: `BOOLEAN DEFAULT FALSE`, SQLite: `INTEGER DEFAULT 0`) and sets version to 3. Cosmos DB is schema-less so the field is simply added to documents on write. See `MULTI_VECTOR_IMPLEMENTATION.md` for migration details.
 
 ---
 
@@ -479,6 +480,7 @@ On backend initialization, the version is checked. If version < 2, auto-migratio
 |---------|------|---------|
 | 1.0.0 | 2025-02-05 | Initial schema definition with inline vector columns on transcripts |
 | 2.0.0 | 2025-02-06 | Externalized vectors to transcript_vectors table. Added schema_meta table. Added chunking support. Removed vector columns from transcripts. |
+| 3.0.0 | 2026-02-10 | Added `has_vectors` column to transcripts table (DuckDB: `BOOLEAN DEFAULT FALSE`, SQLite: `INTEGER DEFAULT 0`). Cosmos DB: schema-less, field added to documents on write. Used by `backfill_embeddings()` to find transcripts missing vectors. |
 
 ### Migration Guidelines
 
@@ -488,15 +490,22 @@ On backend initialization, the version is checked. If version < 2, auto-migratio
 4. **Field removal**: Deprecate first, remove in next major version
 5. **Schema version bump**: Update `schema_meta.version`, add auto-migration logic
 
-### Auto-Migration (v1 -> v2)
+### Auto-Migration (v1 -> v2 -> v3)
 
-On initialization, backends check `schema_meta.version`. If version < 2:
+On initialization, backends check `schema_meta.version`:
+
+**v1 -> v2:**
 1. Create `transcript_vectors` table if not exists
 2. Move inline vectors from `transcripts` to `transcript_vectors`
 3. Drop old vector columns and indexes from `transcripts`
 4. Set version to 2
 
-Migration is idempotent and safe to run multiple times.
+**v2 -> v3:**
+1. Add `has_vectors` column to `transcripts` (DuckDB: `BOOLEAN DEFAULT FALSE`, SQLite: `INTEGER DEFAULT 0`)
+2. Cosmos DB: schema-less, field added to documents on write (not present on pre-v0.3.0 documents)
+3. Set version to 3
+
+All migrations are idempotent and safe to run multiple times.
 
 ### Compatibility Promise
 

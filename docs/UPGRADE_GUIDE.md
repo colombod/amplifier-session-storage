@@ -326,6 +326,46 @@ After upgrading:
 
 ---
 
+## Upgrading from v0.2.0 to v0.3.0
+
+### What Changed
+
+1. **`has_vectors` flag on transcript documents** -- A new boolean field `has_vectors` tracks whether vector embeddings exist for each transcript. Set to `false` on creation, flipped to `true` when vectors are stored.
+   - DuckDB: `has_vectors BOOLEAN DEFAULT FALSE` column added via schema migration v3
+   - SQLite: `has_vectors INTEGER DEFAULT 0` column added via schema migration v3
+   - Cosmos DB: Schema-less; new documents get the field automatically. Queries use `NOT IS_DEFINED(c.has_vectors) OR c.has_vectors = false` for backward compatibility.
+
+2. **Schema migration v3** -- DuckDB and SQLite automatically run `ALTER TABLE transcripts ADD COLUMN has_vectors` during `initialize()`. No manual action needed.
+
+3. **Embedding resilience** -- All embedding API calls now have:
+   - Retry with exponential backoff (up to 5 retries, 1s-60s, respects Retry-After headers)
+   - Circuit breaker (5 consecutive retryable failures = 60s cooldown)
+   - Batch splitting (groups of 16 texts, per-batch error isolation)
+   - Graceful degradation: transcript sync succeeds even if embeddings fail
+
+4. **New methods: `backfill_embeddings()` and `rebuild_vectors()`** -- Replaces the manual backfill pattern from v0.2.0:
+   ```python
+   # Old (v0.2.0) -- manual, fragile
+   embeddings = await provider.embed_batch(texts)
+   await storage.upsert_embeddings(user_id, project, session, embeddings)
+
+   # New (v0.3.0) -- handles chunking, retry, progress
+   result = await storage.backfill_embeddings(user_id, project, session)
+   ```
+
+5. **`get_session_sync_stats()` fix** -- The Cosmos DB implementation was using `GROUP BY` with multiple aggregates, which the Python SDK does not support. Fixed to use 6 separate single-aggregate queries.
+
+6. **Structured error logging** -- Embedding failures are now logged with `EMBEDDING_FAILURE` prefix, full identity chain (user, project, session), and clear success/failure breakdown.
+
+### Migration Steps
+
+1. **Update dependency**: Bump `amplifier-session-storage` to `>=0.3.0`
+2. **Restart services**: Schema migration v3 runs automatically on `initialize()`
+3. **Backfill existing sessions** (optional): If you have sessions without vectors, use `backfill_embeddings()` instead of the manual approach from v0.2.0
+4. **No breaking changes**: All existing APIs are backward compatible
+
+---
+
 ## Support
 
 For issues or questions:

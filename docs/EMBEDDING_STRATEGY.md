@@ -436,3 +436,58 @@ OPENAI_EMBEDDING_CACHE_SIZE=1000  # Default 1000 entries
 | Events | `events.jsonl` | Not embedded (use structured search) |
 
 All vectors stored externally in `transcript_vectors` table / `transcript_vector` documents, with chunking support for long texts and a single HNSW/quantizedFlat index per backend.
+
+---
+
+## Resilience (v0.3.0)
+
+All embedding API calls are protected by three layers of resilience, implemented in `amplifier_session_storage.embeddings.resilience` and applied by `EmbeddingMixin`:
+
+### Batch Splitting
+
+Large embedding requests are split into groups of 16 texts (`EMBED_BATCH_SIZE`). Each sub-batch is independent -- a failed batch returns `None` for those positions without affecting other batches.
+
+### Retry with Exponential Backoff
+
+Transient failures are retried automatically:
+
+| Setting | Value |
+|---------|-------|
+| Max retries | 5 |
+| Backoff base | 1.0s |
+| Backoff cap | 60.0s |
+| Backoff multiplier | 2.0x |
+| Retryable status codes | 429, 500, 502, 503, 504 |
+| Retryable exceptions | ConnectionError, TimeoutError, OSError |
+
+Respects `Retry-After` headers from the API response.
+
+### Circuit Breaker
+
+After 5 consecutive retryable failures, the circuit breaker opens and all embedding calls fail fast for 60 seconds. After the timeout, a single probe request is allowed (half-open state). If it succeeds, the circuit closes. If it fails, the circuit re-opens.
+
+Only retryable failures (429, 5xx, network errors) trip the breaker. Non-retryable errors (authentication, configuration) propagate immediately without affecting the breaker state.
+
+The circuit breaker is shared process-wide across all backends.
+
+### Graceful Degradation
+
+When embedding generation fails during `sync_transcript_lines`, transcript documents are always stored. The error is logged at ERROR level with:
+- `EMBEDDING_FAILURE` prefix for grep/alerting
+- Full identity chain: user, project, session, message count
+- Clear explanation of what succeeded vs. what failed
+- Full stack trace via `exc_info=True`
+
+---
+
+## Embedding Lifecycle Management (v0.3.0)
+
+### backfill_embeddings()
+
+Generates vectors for transcripts where `has_vectors` is `false`. Finds missing transcripts with a single query (`WHERE has_vectors = false`), then processes them in batches through the extract-chunk-embed pipeline. Safe to call repeatedly.
+
+### rebuild_vectors()
+
+Deletes ALL vectors for a session, resets `has_vectors` to `false`, then regenerates from scratch. Use for model upgrades, dimension changes, or corruption recovery.
+
+Both methods return `EmbeddingOperationResult` with `transcripts_found`, `vectors_stored`, `vectors_failed`, and `errors` (capped at 50).

@@ -131,6 +131,7 @@ Transcript messages are stored as `transcript_message` documents. These document
 | - | `sequence` | **Derived** (line number in JSONL) |
 | - | `turn` | **Derived** (from message grouping) |
 | - | `tool_call_id` | Same if present |
+| `has_vectors` | `has_vectors` | Whether vector embeddings exist for this message. Not always present in older on-disk data; not present on pre-v0.3.0 Cosmos documents. DuckDB: `BOOLEAN DEFAULT FALSE`. SQLite: `INTEGER DEFAULT 0`. |
 
 ---
 

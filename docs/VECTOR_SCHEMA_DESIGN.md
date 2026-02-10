@@ -79,6 +79,9 @@ CREATE TABLE transcripts (
     -- Extracted text for display/search
     text_content TEXT,
 
+    -- Vector tracking
+    has_vectors BOOLEAN DEFAULT FALSE,
+
     -- Sync metadata
     synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
@@ -171,6 +174,18 @@ CREATE TABLE schema_meta (
 ```
 
 On initialization, backends check the version and auto-migrate from version 1 (inline vectors) to version 2 (externalized vectors). See `MULTI_VECTOR_IMPLEMENTATION.md` for migration details.
+
+**Schema v3 migration** (v0.3.0): Adds `has_vectors BOOLEAN DEFAULT FALSE` to the `transcripts` table. This column tracks whether vector embeddings have been generated for a given transcript message. Existing rows default to `FALSE`. The migration is:
+
+```sql
+-- DuckDB
+ALTER TABLE transcripts ADD COLUMN has_vectors BOOLEAN DEFAULT FALSE;
+
+-- SQLite
+ALTER TABLE transcripts ADD COLUMN has_vectors INTEGER DEFAULT 0;
+```
+
+For Cosmos DB, no schema migration is needed -- the `has_vectors` field is simply absent on pre-v0.3.0 documents and treated as `false` by application logic.
 
 ---
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -30,6 +31,7 @@ from ..embeddings.mixin import EmbeddingMixin
 from ..exceptions import AuthenticationError, StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
 from .base import (
+    EmbeddingOperationResult,
     MessageContext,
     SearchFilters,
     SearchResult,
@@ -715,6 +717,230 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         except CosmosResourceNotFoundError:
             return False
 
+    async def backfill_embeddings(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+        *,
+        batch_size: int = 100,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> EmbeddingOperationResult:
+        """Generate embeddings for transcripts where has_vectors is False."""
+        if not self.embedding_provider:
+            return EmbeddingOperationResult(
+                transcripts_found=0,
+                vectors_stored=0,
+                vectors_failed=0,
+                errors=["No embedding provider configured"],
+            )
+
+        partition_key = self.make_partition_key(user_id, project_slug, session_id)
+        container = self._get_container(CONTAINER_NAME)
+
+        # Find transcripts missing vectors (backward-compat: also match docs without has_vectors)
+        query = (
+            f"SELECT {TRANSCRIPT_PROJECTION} FROM c "
+            "WHERE c.type = @type AND c.partition_key = @pk "
+            "AND (NOT IS_DEFINED(c.has_vectors) OR c.has_vectors = false) "
+            "ORDER BY c.sequence"
+        )
+        params: list[dict[str, object]] = [
+            {"name": "@type", "value": DOC_TYPE_TRANSCRIPT},
+            {"name": "@pk", "value": partition_key},
+        ]
+
+        # Collect all missing transcripts
+        missing: list[dict[str, Any]] = []
+        async for item in container.query_items(query=query, parameters=params):  # type: ignore
+            missing.append(item)
+
+        if not missing:
+            return EmbeddingOperationResult(transcripts_found=0, vectors_stored=0, vectors_failed=0)
+
+        total = len(missing)
+        total_stored = 0
+        total_failed = 0
+        errors: list[str] = []
+        processed = 0
+
+        # Process in batches
+        for batch_start in range(0, total, batch_size):
+            batch = missing[batch_start : batch_start + batch_size]
+
+            # Build messages for _prepare_vector_records
+            messages = []
+            for item in batch:
+                messages.append(
+                    {
+                        "parent_id": item["id"],
+                        "user_id": item.get("user_id", user_id),
+                        "session_id": item.get("session_id", session_id),
+                        "project_slug": item.get("project_slug", project_slug),
+                        "role": item.get("role", ""),
+                        "content": item.get("content"),
+                    }
+                )
+
+            try:
+                records, failed = await self._prepare_vector_records(
+                    messages,
+                    context_msg=f"backfill session={session_id}",
+                )
+
+                # Enrich records with Cosmos-specific fields
+                for record in records:
+                    record["type"] = DOC_TYPE_VECTOR
+                    record["partition_key"] = partition_key
+                    record["host_id"] = batch[0].get("host_id", "")
+
+                # Store vector records (this also flips has_vectors on parents)
+                if records:
+                    await self._store_vector_records(records)
+
+                total_stored += sum(1 for r in records if r.get("vector") is not None)
+                total_failed += failed
+
+            except Exception as exc:
+                msg = f"Batch {batch_start // batch_size + 1} failed: {exc}"
+                if len(errors) < 50:
+                    errors.append(msg)
+                logger.error("backfill_embeddings: %s", msg, exc_info=True)
+                total_failed += len(batch)
+
+            processed += len(batch)
+            if on_progress:
+                on_progress(processed, total)
+
+        return EmbeddingOperationResult(
+            transcripts_found=total,
+            vectors_stored=total_stored,
+            vectors_failed=total_failed,
+            errors=errors,
+        )
+
+    async def rebuild_vectors(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+        *,
+        batch_size: int = 100,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> EmbeddingOperationResult:
+        """Delete all vectors for a session, reset has_vectors, regenerate."""
+        if not self.embedding_provider:
+            return EmbeddingOperationResult(
+                transcripts_found=0,
+                vectors_stored=0,
+                vectors_failed=0,
+                errors=["No embedding provider configured"],
+            )
+
+        partition_key = self.make_partition_key(user_id, project_slug, session_id)
+        container = self._get_container(CONTAINER_NAME)
+
+        # Step 1: Delete all existing vector documents
+        del_query = "SELECT c.id FROM c WHERE c.type = @type AND c.partition_key = @pk"
+        del_params: list[dict[str, object]] = [
+            {"name": "@type", "value": DOC_TYPE_VECTOR},
+            {"name": "@pk", "value": partition_key},
+        ]
+        deleted = 0
+        async for doc in container.query_items(query=del_query, parameters=del_params):  # type: ignore
+            try:
+                await container.delete_item(item=doc["id"], partition_key=partition_key)
+                deleted += 1
+            except CosmosResourceNotFoundError:
+                pass
+        if deleted:
+            logger.info(
+                "rebuild_vectors: deleted %d vector docs for session %s", deleted, session_id
+            )
+
+        # Step 2: Reset has_vectors on all transcripts
+        reset_query = (
+            f"SELECT {TRANSCRIPT_PROJECTION} FROM c "
+            "WHERE c.type = @type AND c.partition_key = @pk "
+            "ORDER BY c.sequence"
+        )
+        reset_params: list[dict[str, object]] = [
+            {"name": "@type", "value": DOC_TYPE_TRANSCRIPT},
+            {"name": "@pk", "value": partition_key},
+        ]
+
+        all_transcripts: list[dict[str, Any]] = []
+        async for item in container.query_items(query=reset_query, parameters=reset_params):  # type: ignore
+            # Reset has_vectors flag
+            try:
+                full_doc = await container.read_item(item=item["id"], partition_key=partition_key)
+                full_doc["has_vectors"] = False
+                await container.upsert_item(body=full_doc)
+            except Exception:
+                logger.warning("Failed to reset has_vectors for transcript %s", item["id"])
+            all_transcripts.append(item)
+
+        if not all_transcripts:
+            return EmbeddingOperationResult(transcripts_found=0, vectors_stored=0, vectors_failed=0)
+
+        # Step 3: Regenerate vectors (same logic as backfill but for ALL transcripts)
+        total = len(all_transcripts)
+        total_stored = 0
+        total_failed = 0
+        errors: list[str] = []
+        processed = 0
+
+        for batch_start in range(0, total, batch_size):
+            batch = all_transcripts[batch_start : batch_start + batch_size]
+
+            messages = []
+            for item in batch:
+                messages.append(
+                    {
+                        "parent_id": item["id"],
+                        "user_id": item.get("user_id", user_id),
+                        "session_id": item.get("session_id", session_id),
+                        "project_slug": item.get("project_slug", project_slug),
+                        "role": item.get("role", ""),
+                        "content": item.get("content"),
+                    }
+                )
+
+            try:
+                records, failed = await self._prepare_vector_records(
+                    messages,
+                    context_msg=f"rebuild session={session_id}",
+                )
+
+                for record in records:
+                    record["type"] = DOC_TYPE_VECTOR
+                    record["partition_key"] = partition_key
+                    record["host_id"] = batch[0].get("host_id", "")
+
+                if records:
+                    await self._store_vector_records(records)
+
+                total_stored += sum(1 for r in records if r.get("vector") is not None)
+                total_failed += failed
+
+            except Exception as exc:
+                msg = f"Batch {batch_start // batch_size + 1} failed: {exc}"
+                if len(errors) < 50:
+                    errors.append(msg)
+                logger.error("rebuild_vectors: %s", msg, exc_info=True)
+                total_failed += len(batch)
+
+            processed += len(batch)
+            if on_progress:
+                on_progress(processed, total)
+
+        return EmbeddingOperationResult(
+            transcripts_found=total,
+            vectors_stored=total_stored,
+            vectors_failed=total_failed,
+            errors=errors,
+        )
+
     # =========================================================================
     # Transcript Operations
     # =========================================================================
@@ -808,6 +1034,7 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
                 "session_id": session_id,
                 "sequence": sequence,
                 "ts": ts,
+                "has_vectors": False,
                 "synced_at": datetime.now(UTC).isoformat(),
             }
 
@@ -983,6 +1210,7 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         """Store vector records as separate Cosmos documents.
 
         Uses delete-before-insert per parent_id for idempotent re-sync.
+        After storing, marks parent transcript documents with has_vectors=True.
         """
         if not records:
             return
@@ -999,9 +1227,21 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
             await self._delete_vectors_for_parent(container, parent_id, pk)
 
         # Insert new vector documents
+        stored_parent_ids: set[str] = set()
         for record in records:
             if record.get("vector") is not None:
                 await container.upsert_item(body=record)
+                stored_parent_ids.add(record["parent_id"])
+
+        # Mark parent transcripts as having vectors
+        pk = records[0]["partition_key"]  # All records share same partition
+        for pid in stored_parent_ids:
+            try:
+                doc = await container.read_item(item=pid, partition_key=pk)
+                doc["has_vectors"] = True
+                await container.upsert_item(body=doc)
+            except Exception:
+                logger.warning("Failed to set has_vectors=True for transcript %s", pid)
 
     async def _delete_vectors_for_parent(
         self, container: ContainerProxy, parent_id: str, partition_key: str

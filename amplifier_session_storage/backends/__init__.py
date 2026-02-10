@@ -6,6 +6,7 @@ Each backend implements the same interface, allowing seamless switching.
 """
 
 from .base import (
+    EmbeddingOperationResult,
     EventSearchOptions,
     MessageContext,
     SearchFilters,
@@ -35,6 +36,7 @@ __all__ = [
     "SearchResult",
     "TranscriptMessage",
     "SessionSyncStats",
+    "EmbeddingOperationResult",
     # Context types
     "TurnContext",
     "MessageContext",

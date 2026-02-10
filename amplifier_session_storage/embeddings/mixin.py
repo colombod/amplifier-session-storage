@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from ..chunking import chunk_text
 from ..content_extraction import (
     EMBED_TOKEN_LIMIT,
     count_tokens,
@@ -171,6 +172,85 @@ class EmbeddingMixin:
             )
 
         return results
+
+    async def _prepare_vector_records(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        context_msg: str = "",
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Extract content, chunk, and embed a batch of transcript messages.
+
+        Centralizes the extract->chunk->embed pipeline for reuse by
+        backfill_embeddings and rebuild_vectors. Returns backend-agnostic
+        records that each backend enriches with its own fields (type,
+        partition_key, host_id for Cosmos).
+
+        Each message dict must have:
+            - parent_id: str (e.g. "{session_id}_msg_{sequence}")
+            - user_id: str
+            - session_id: str
+            - project_slug: str
+            - role: str
+            - content: parsed content (str, list, or None)
+
+        Returns:
+            Tuple of (records, failed_count) where:
+            - records: list of vector record dicts with backend-agnostic fields
+            - failed_count: number of records where embedding failed (vector is None)
+        """
+        if not self.embedding_provider:
+            return ([], 0)
+
+        all_records: list[dict[str, Any]] = []
+        all_texts: list[str] = []
+
+        for msg in messages:
+            parent_id = msg["parent_id"]
+            content_map = extract_all_embeddable_content(msg)
+
+            for content_type, text in content_map.items():
+                if text is None:
+                    continue
+
+                chunks = chunk_text(text, content_type)
+
+                for chunk_result in chunks:
+                    record = {
+                        "id": f"{parent_id}_{content_type}_{chunk_result.chunk_index}",
+                        "parent_id": parent_id,
+                        "user_id": msg["user_id"],
+                        "session_id": msg["session_id"],
+                        "project_slug": msg["project_slug"],
+                        "content_type": content_type,
+                        "chunk_index": chunk_result.chunk_index,
+                        "total_chunks": chunk_result.total_chunks,
+                        "span_start": chunk_result.span_start,
+                        "span_end": chunk_result.span_end,
+                        "token_count": chunk_result.token_count,
+                        "source_text": chunk_result.text,
+                        "embedding_model": (
+                            self.embedding_provider.model_name if self.embedding_provider else None
+                        ),
+                    }
+                    all_records.append(record)
+                    all_texts.append(chunk_result.text)
+
+        if not all_texts:
+            return ([], 0)
+
+        # Embed all texts
+        texts_for_embed: list[str | None] = list(all_texts)
+        embeddings = await self._embed_non_none(texts_for_embed, context_msg=context_msg)
+
+        # Attach vectors to records and count failures
+        failed = 0
+        for idx, embedding in enumerate(embeddings):
+            all_records[idx]["vector"] = embedding
+            if embedding is None:
+                failed += 1
+
+        return (all_records, failed)
 
     async def _generate_multi_vector_embeddings(
         self, lines: list[dict[str, Any]], *, context_msg: str = ""

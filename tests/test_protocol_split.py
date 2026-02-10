@@ -94,6 +94,7 @@ class TestMethodDistribution:
             "list_users",
             "list_projects",
             "list_sessions",
+            "get_active_sessions",
             "get_session_statistics",
         }
         assert methods == expected
@@ -111,15 +112,15 @@ class TestMethodDistribution:
 
     def test_admin_methods(self) -> None:
         methods = self._abstract_methods(StorageAdmin)
-        assert methods == {"delete_session"}
+        assert methods == {"delete_session", "backfill_embeddings", "rebuild_vectors"}
 
     def test_storage_backend_adds_no_new_methods(self) -> None:
         methods = self._abstract_methods(StorageBackend)
         assert methods == set()
 
     def test_total_abstract_method_count(self) -> None:
-        """22 abstract methods total across the hierarchy."""
+        """25 abstract methods total across the hierarchy."""
         all_abstract = set()
         for cls in (_StorageLifecycle, StorageReader, StorageWriter, StorageAdmin):
             all_abstract |= self._abstract_methods(cls)
-        assert len(all_abstract) == 22
+        assert len(all_abstract) == 25

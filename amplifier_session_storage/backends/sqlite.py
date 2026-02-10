@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ from ..embeddings.mixin import EmbeddingMixin
 from ..exceptions import StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
 from .base import (
+    EmbeddingOperationResult,
     MessageContext,
     SearchFilters,
     SearchResult,
@@ -215,6 +217,7 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
                     content_json TEXT,
                     turn INTEGER,
                     ts TEXT,
+                    has_vectors INTEGER DEFAULT 0,
                     synced_at TEXT DEFAULT (datetime('now'))
                 )
             """)
@@ -246,6 +249,8 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
             schema_version = await self._get_schema_version()
             if schema_version < 2:
                 await self._migrate_to_externalized_vectors()
+            if schema_version < 3:
+                await self._migrate_add_has_vectors()
 
             # Create indexes
             await self.conn.execute(
@@ -467,6 +472,18 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
         await self._set_schema_version(2)
         logger.info(f"Migration complete: {migrated} vectors moved to transcript_vectors")
 
+    async def _migrate_add_has_vectors(self) -> None:
+        """Add has_vectors column to transcripts table (schema v3)."""
+        async with self.conn.execute("PRAGMA table_info(transcripts)") as cursor:
+            columns = [row[1] async for row in cursor]
+        if "has_vectors" not in columns:
+            logger.info("Adding has_vectors column to transcripts table...")
+            await self.conn.execute(
+                "ALTER TABLE transcripts ADD COLUMN has_vectors INTEGER DEFAULT 0"
+            )
+            await self.conn.commit()
+        await self._set_schema_version(3)
+
     # =========================================================================
     # Session Metadata Operations
     # =========================================================================
@@ -631,6 +648,191 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
             await self.conn.rollback()
             raise
 
+    async def backfill_embeddings(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+        *,
+        batch_size: int = 100,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> EmbeddingOperationResult:
+        """Generate embeddings for transcripts where has_vectors is False."""
+        if not self.embedding_provider:
+            return EmbeddingOperationResult(
+                transcripts_found=0,
+                vectors_stored=0,
+                vectors_failed=0,
+                errors=["No embedding provider configured"],
+            )
+
+        if self.conn is None:
+            raise StorageIOError("backfill_embeddings", cause=RuntimeError("Not initialized"))
+
+        # Find transcripts missing vectors
+        async with self.conn.execute(
+            """
+            SELECT id, user_id, session_id, project_slug, role, content_json
+            FROM transcripts
+            WHERE user_id = ? AND session_id = ?
+            AND (has_vectors = 0 OR has_vectors IS NULL)
+            ORDER BY sequence
+            """,
+            (user_id, session_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        if not rows:
+            return EmbeddingOperationResult(transcripts_found=0, vectors_stored=0, vectors_failed=0)
+
+        missing = [
+            {
+                "parent_id": row[0],
+                "user_id": row[1],
+                "session_id": row[2],
+                "project_slug": row[3],
+                "role": row[4],
+                "content": json.loads(row[5]) if row[5] else None,
+            }
+            for row in rows
+        ]
+
+        total = len(missing)
+        total_stored = 0
+        total_failed = 0
+        errors: list[str] = []
+        processed = 0
+
+        for batch_start in range(0, total, batch_size):
+            batch = missing[batch_start : batch_start + batch_size]
+
+            try:
+                records, failed = await self._prepare_vector_records(
+                    batch, context_msg=f"backfill session={session_id}"
+                )
+
+                if records:
+                    await self._store_vector_records(records)
+
+                total_stored += sum(1 for r in records if r.get("vector") is not None)
+                total_failed += failed
+
+            except Exception as exc:
+                msg = f"Batch {batch_start // batch_size + 1} failed: {exc}"
+                if len(errors) < 50:
+                    errors.append(msg)
+                logger.error("backfill_embeddings: %s", msg, exc_info=True)
+                total_failed += len(batch)
+
+            processed += len(batch)
+            if on_progress:
+                on_progress(processed, total)
+
+        return EmbeddingOperationResult(
+            transcripts_found=total,
+            vectors_stored=total_stored,
+            vectors_failed=total_failed,
+            errors=errors,
+        )
+
+    async def rebuild_vectors(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+        *,
+        batch_size: int = 100,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> EmbeddingOperationResult:
+        """Delete all vectors for a session, reset has_vectors, regenerate."""
+        if not self.embedding_provider:
+            return EmbeddingOperationResult(
+                transcripts_found=0,
+                vectors_stored=0,
+                vectors_failed=0,
+                errors=["No embedding provider configured"],
+            )
+
+        if self.conn is None:
+            raise StorageIOError("rebuild_vectors", cause=RuntimeError("Not initialized"))
+
+        # Step 1: Delete all vectors
+        await self.conn.execute(
+            "DELETE FROM transcript_vectors WHERE user_id = ? AND session_id = ?",
+            (user_id, session_id),
+        )
+        # Step 2: Reset has_vectors
+        await self.conn.execute(
+            "UPDATE transcripts SET has_vectors = 0 WHERE user_id = ? AND session_id = ?",
+            (user_id, session_id),
+        )
+        await self.conn.commit()
+
+        # Step 3: Fetch all transcripts
+        async with self.conn.execute(
+            """
+            SELECT id, user_id, session_id, project_slug, role, content_json
+            FROM transcripts
+            WHERE user_id = ? AND session_id = ?
+            ORDER BY sequence
+            """,
+            (user_id, session_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        if not rows:
+            return EmbeddingOperationResult(transcripts_found=0, vectors_stored=0, vectors_failed=0)
+
+        all_transcripts = [
+            {
+                "parent_id": row[0],
+                "user_id": row[1],
+                "session_id": row[2],
+                "project_slug": row[3],
+                "role": row[4],
+                "content": json.loads(row[5]) if row[5] else None,
+            }
+            for row in rows
+        ]
+
+        total = len(all_transcripts)
+        total_stored = 0
+        total_failed = 0
+        errors: list[str] = []
+        processed = 0
+
+        for batch_start in range(0, total, batch_size):
+            batch = all_transcripts[batch_start : batch_start + batch_size]
+
+            try:
+                records, failed = await self._prepare_vector_records(
+                    batch, context_msg=f"rebuild session={session_id}"
+                )
+
+                if records:
+                    await self._store_vector_records(records)
+
+                total_stored += sum(1 for r in records if r.get("vector") is not None)
+                total_failed += failed
+
+            except Exception as exc:
+                msg = f"Batch {batch_start // batch_size + 1} failed: {exc}"
+                if len(errors) < 50:
+                    errors.append(msg)
+                logger.error("rebuild_vectors: %s", msg, exc_info=True)
+                total_failed += len(batch)
+
+            processed += len(batch)
+            if on_progress:
+                on_progress(processed, total)
+
+        return EmbeddingOperationResult(
+            transcripts_found=total,
+            vectors_stored=total_stored,
+            vectors_failed=total_failed,
+            errors=errors,
+        )
+
     # =========================================================================
     # Transcript Operations
     # =========================================================================
@@ -716,8 +918,8 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
                 """
                 INSERT INTO transcripts (
                     id, user_id, host_id, project_slug, session_id, sequence,
-                    role, content_json, turn, ts, synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    role, content_json, turn, ts, has_vectors, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (id) DO UPDATE SET
                     content_json = excluded.content_json,
                     role = excluded.role,
@@ -736,6 +938,7 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
                     content_json,
                     line.get("turn"),
                     line.get("ts") or line.get("timestamp"),
+                    0,
                     now,
                 ),
             )
@@ -819,6 +1022,7 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
         """Store vector records in transcript_vectors table.
 
         Uses delete-before-insert for idempotent re-sync.
+        After storing, marks parent transcripts with has_vectors=1.
         """
         if not records:
             return
@@ -834,6 +1038,7 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
             )
 
         # Insert new vectors
+        stored_parent_ids: set[str] = set()
         for record in records:
             vector = record.get("vector")
             vector_json = json.dumps(vector) if vector is not None else None
@@ -868,6 +1073,15 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
                     vector_json,
                     record["embedding_model"],
                 ),
+            )
+            if vector is not None:
+                stored_parent_ids.add(record["parent_id"])
+
+        # Mark parent transcripts as having vectors
+        for pid in stored_parent_ids:
+            await self.conn.execute(
+                "UPDATE transcripts SET has_vectors = 1 WHERE id = ?",
+                (pid,),
             )
 
         await self.conn.commit()

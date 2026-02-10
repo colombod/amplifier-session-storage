@@ -13,6 +13,7 @@ The backend protocol is split into focused ABCs for granular dependency control:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Self
 
@@ -177,6 +178,31 @@ class SessionSyncStats:
     transcript_count: int
     event_ts_range: tuple[str | None, str | None]  # (earliest, latest)
     transcript_ts_range: tuple[str | None, str | None]  # (earliest, latest)
+
+
+@dataclass
+class EmbeddingOperationResult:
+    """Result of a backfill or rebuild embedding operation.
+
+    Provides enough information for callers to determine success and
+    whether a re-run is needed (vectors_failed > 0).
+    """
+
+    transcripts_found: int
+    """Total transcripts in scope.
+    For backfill: count of transcripts missing vectors.
+    For rebuild: count of all transcripts in the session."""
+
+    vectors_stored: int
+    """Number of vector documents successfully created and stored."""
+
+    vectors_failed: int
+    """Number of chunks where embedding generation returned None
+    (API failure, circuit breaker open, etc). These transcripts
+    remain without vectors and can be retried later."""
+
+    errors: list[str] = field(default_factory=list)
+    """Human-readable error messages (capped at 50)."""
 
 
 # =============================================================================
@@ -702,6 +728,61 @@ class StorageAdmin(_StorageLifecycle):
     ) -> bool:
         """Delete a session and all its data."""
         pass
+
+    @abstractmethod
+    async def backfill_embeddings(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+        *,
+        batch_size: int = 100,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> EmbeddingOperationResult:
+        """Generate embeddings for transcripts where has_vectors is False.
+
+        Finds transcripts missing vector embeddings and generates them.
+        Safe to call repeatedly — skips transcripts that already have vectors.
+
+        Args:
+            user_id: User identifier
+            project_slug: Project slug
+            session_id: Session identifier
+            batch_size: Process this many transcripts per batch (default 100)
+            on_progress: Optional callback(processed, total) for progress reporting
+
+        Returns:
+            EmbeddingOperationResult with counts and any errors
+        """
+        ...
+
+    @abstractmethod
+    async def rebuild_vectors(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+        *,
+        batch_size: int = 100,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> EmbeddingOperationResult:
+        """Delete all vectors for a session, reset has_vectors, regenerate.
+
+        Nuclear option for model upgrades, dimension changes, or corruption
+        recovery. Deletes ALL existing vectors first, then regenerates from
+        transcript data.
+
+        Args:
+            user_id: User identifier
+            project_slug: Project slug
+            session_id: Session identifier
+            batch_size: Process this many transcripts per batch (default 100)
+            on_progress: Optional callback(processed, total) for progress reporting
+
+        Returns:
+            EmbeddingOperationResult with counts and any errors
+        """
+        ...
 
 
 class StorageBackend(StorageReader, StorageWriter, StorageAdmin):

@@ -358,6 +358,153 @@ class TestCosmosIntegration:
         assert stats.transcript_ts_range == (None, None)
 
     @pytest.mark.asyncio
+    async def test_backfill_embeddings(self, cosmos_storage):
+        """Backfill generates vectors for transcripts that lack them."""
+        test_session_id = f"test-backfill-{datetime.now(UTC).timestamp()}"
+        test_user = "test-user"
+        test_project = "test-project"
+
+        # Step 1: Temporarily remove embedding provider so sync doesn't generate vectors
+        original_provider = cosmos_storage.embedding_provider
+        cosmos_storage.embedding_provider = None
+
+        lines = [
+            {
+                "role": "user",
+                "content": "Backfill test message one",
+                "turn": 0,
+                "ts": datetime.now(UTC).isoformat(),
+            },
+            {
+                "role": "assistant",
+                "content": "Backfill test reply one",
+                "turn": 0,
+                "ts": datetime.now(UTC).isoformat(),
+            },
+            {
+                "role": "user",
+                "content": "Backfill test message two",
+                "turn": 1,
+                "ts": datetime.now(UTC).isoformat(),
+            },
+        ]
+
+        synced = await cosmos_storage.sync_transcript_lines(
+            user_id=test_user,
+            host_id="test-host",
+            project_slug=test_project,
+            session_id=test_session_id,
+            lines=lines,
+        )
+        assert synced == 3
+
+        # Verify no vector documents were created
+        container = cosmos_storage._get_container("session_data")
+        pk = cosmos_storage.make_partition_key(test_user, test_project, test_session_id)
+        vector_docs_before = []
+        async for doc in container.query_items(
+            query="SELECT * FROM c WHERE c.partition_key = @pk AND c.type = 'transcript_vector'",
+            parameters=[{"name": "@pk", "value": pk}],
+        ):
+            vector_docs_before.append(doc)
+        assert len(vector_docs_before) == 0, "No vectors should exist before backfill"
+
+        # Step 2: Restore embedding provider and backfill
+        cosmos_storage.embedding_provider = original_provider
+
+        result = await cosmos_storage.backfill_embeddings(
+            user_id=test_user,
+            project_slug=test_project,
+            session_id=test_session_id,
+        )
+
+        assert result.transcripts_found == 3, f"Expected 3, got {result.transcripts_found}"
+        assert result.vectors_stored > 0, f"Expected >0, got {result.vectors_stored}"
+        assert result.vectors_failed == 0, f"Expected 0 failures, got {result.vectors_failed}"
+        assert result.errors == []
+
+        # Verify vector documents were created
+        vector_docs_after = []
+        async for doc in container.query_items(
+            query="SELECT * FROM c WHERE c.partition_key = @pk AND c.type = 'transcript_vector'",
+            parameters=[{"name": "@pk", "value": pk}],
+        ):
+            vector_docs_after.append(doc)
+        assert len(vector_docs_after) > 0, "Vectors should exist after backfill"
+
+        # Verify backfill is now a no-op (all transcripts have vectors)
+        result2 = await cosmos_storage.backfill_embeddings(
+            user_id=test_user,
+            project_slug=test_project,
+            session_id=test_session_id,
+        )
+        assert result2.transcripts_found == 0, "Second backfill should find 0 missing"
+
+    @pytest.mark.asyncio
+    async def test_rebuild_vectors(self, cosmos_storage):
+        """Rebuild deletes all vectors and regenerates them."""
+        test_session_id = f"test-rebuild-{datetime.now(UTC).timestamp()}"
+        test_user = "test-user"
+        test_project = "test-project"
+
+        # Sync transcripts WITH embeddings
+        lines = [
+            {
+                "role": "user",
+                "content": "Rebuild test message",
+                "turn": 0,
+                "ts": datetime.now(UTC).isoformat(),
+            },
+            {
+                "role": "assistant",
+                "content": "Rebuild test reply",
+                "turn": 0,
+                "ts": datetime.now(UTC).isoformat(),
+            },
+        ]
+
+        synced = await cosmos_storage.sync_transcript_lines(
+            user_id=test_user,
+            host_id="test-host",
+            project_slug=test_project,
+            session_id=test_session_id,
+            lines=lines,
+        )
+        assert synced == 2
+
+        # Verify vectors exist
+        container = cosmos_storage._get_container("session_data")
+        pk = cosmos_storage.make_partition_key(test_user, test_project, test_session_id)
+        vector_docs_before = []
+        async for doc in container.query_items(
+            query="SELECT * FROM c WHERE c.partition_key = @pk AND c.type = 'transcript_vector'",
+            parameters=[{"name": "@pk", "value": pk}],
+        ):
+            vector_docs_before.append(doc)
+        assert len(vector_docs_before) > 0, "Vectors should exist after sync"
+
+        # Rebuild
+        result = await cosmos_storage.rebuild_vectors(
+            user_id=test_user,
+            project_slug=test_project,
+            session_id=test_session_id,
+        )
+
+        assert result.transcripts_found == 2, f"Expected 2, got {result.transcripts_found}"
+        assert result.vectors_stored > 0, f"Expected >0, got {result.vectors_stored}"
+        assert result.vectors_failed == 0, f"Expected 0 failures, got {result.vectors_failed}"
+        assert result.errors == []
+
+        # Verify vectors exist after rebuild
+        vector_docs_after = []
+        async for doc in container.query_items(
+            query="SELECT * FROM c WHERE c.partition_key = @pk AND c.type = 'transcript_vector'",
+            parameters=[{"name": "@pk", "value": pk}],
+        ):
+            vector_docs_after.append(doc)
+        assert len(vector_docs_after) > 0, "Vectors should exist after rebuild"
+
+    @pytest.mark.asyncio
     async def test_cleanup_test_data(self, cosmos_storage):
         """Cleanup can delete test sessions."""
         # Get all test sessions

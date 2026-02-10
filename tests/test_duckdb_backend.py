@@ -521,3 +521,302 @@ class TestDuckDBSyncStats:
         )
         assert stats2.event_count == 5
         assert stats2.transcript_count == 3
+
+
+class TestDuckDBBackfillRebuild:
+    """Tests for backfill_embeddings, rebuild_vectors, and has_vectors lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_has_vectors_flag_set_on_sync(self, duckdb_storage):
+        """Syncing transcripts with embedding provider sets has_vectors=True."""
+        lines = [
+            {"role": "user", "content": "Hello world", "turn": 0},
+            {"role": "assistant", "content": "Hi there!", "turn": 0},
+        ]
+
+        await duckdb_storage.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="bf-session-1",
+            lines=lines,
+        )
+
+        # Query raw DB for has_vectors flag
+        rows = duckdb_storage.conn.execute(
+            "SELECT has_vectors FROM transcripts WHERE session_id = ? ORDER BY sequence",
+            ["bf-session-1"],
+        ).fetchall()
+
+        assert len(rows) == 2
+        for row in rows:
+            assert row[0] is True, "has_vectors should be True after sync with embeddings"
+
+    @pytest.mark.asyncio
+    async def test_has_vectors_flag_false_without_embeddings(self, duckdb_storage_no_embeddings):
+        """Syncing transcripts without embedding provider leaves has_vectors=False."""
+        lines = [
+            {"role": "user", "content": "Hello world", "turn": 0},
+            {"role": "assistant", "content": "Hi there!", "turn": 0},
+        ]
+
+        await duckdb_storage_no_embeddings.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="bf-session-2",
+            lines=lines,
+        )
+
+        rows = duckdb_storage_no_embeddings.conn.execute(
+            "SELECT has_vectors FROM transcripts WHERE session_id = ? ORDER BY sequence",
+            ["bf-session-2"],
+        ).fetchall()
+
+        assert len(rows) == 2
+        for row in rows:
+            assert row[0] is False, "has_vectors should be False without embeddings"
+
+    @pytest.mark.asyncio
+    async def test_backfill_fills_missing_vectors(self, embedding_provider):
+        """Backfill generates vectors for transcripts that lack them."""
+        # Step 1: Create backend WITHOUT embeddings, sync transcripts
+        config = DuckDBConfig(db_path=":memory:")
+        storage = await DuckDBBackend.create(config=config, embedding_provider=None)
+
+        lines = [
+            {"role": "user", "content": "First message", "turn": 0},
+            {"role": "assistant", "content": "First reply", "turn": 0},
+            {"role": "user", "content": "Second question", "turn": 1},
+        ]
+
+        await storage.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="bf-session-3",
+            lines=lines,
+        )
+
+        # Verify has_vectors is False
+        rows = storage.conn.execute(
+            "SELECT has_vectors FROM transcripts WHERE session_id = ?",
+            ["bf-session-3"],
+        ).fetchall()
+        assert all(r[0] is False for r in rows)
+
+        # Verify no vectors exist
+        vec_count = storage.conn.execute(
+            "SELECT COUNT(*) FROM transcript_vectors WHERE session_id = ?",
+            ["bf-session-3"],
+        ).fetchone()[0]
+        assert vec_count == 0
+
+        # Step 2: Attach embedding provider and backfill
+        storage.embedding_provider = embedding_provider
+
+        result = await storage.backfill_embeddings(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="bf-session-3",
+        )
+
+        assert result.transcripts_found == 3
+        assert result.vectors_stored > 0
+        assert result.vectors_failed == 0
+        assert result.errors == []
+
+        # Verify has_vectors is now True
+        rows = storage.conn.execute(
+            "SELECT has_vectors FROM transcripts WHERE session_id = ?",
+            ["bf-session-3"],
+        ).fetchall()
+        assert all(r[0] is True for r in rows)
+
+        # Verify vector documents exist
+        vec_count = storage.conn.execute(
+            "SELECT COUNT(*) FROM transcript_vectors WHERE session_id = ?",
+            ["bf-session-3"],
+        ).fetchone()[0]
+        assert vec_count > 0
+
+        await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_backfill_noop_when_all_have_vectors(self, duckdb_storage):
+        """Backfill is a no-op when all transcripts already have vectors."""
+        lines = [
+            {"role": "user", "content": "Already embedded", "turn": 0},
+            {"role": "assistant", "content": "Also embedded", "turn": 0},
+        ]
+
+        await duckdb_storage.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="bf-session-4",
+            lines=lines,
+        )
+
+        # All transcripts already have vectors from sync
+        result = await duckdb_storage.backfill_embeddings(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="bf-session-4",
+        )
+
+        assert result.transcripts_found == 0
+        assert result.vectors_stored == 0
+        assert result.vectors_failed == 0
+
+    @pytest.mark.asyncio
+    async def test_backfill_no_provider_returns_zero(self, duckdb_storage_no_embeddings):
+        """Backfill without embedding provider returns zeros with error message."""
+        result = await duckdb_storage_no_embeddings.backfill_embeddings(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="any-session",
+        )
+
+        assert result.transcripts_found == 0
+        assert result.vectors_stored == 0
+        assert result.vectors_failed == 0
+        assert len(result.errors) == 1
+        assert "No embedding provider" in result.errors[0]
+
+    @pytest.mark.asyncio
+    async def test_backfill_progress_callback(self, embedding_provider):
+        """Backfill invokes on_progress with correct (processed, total) values."""
+        config = DuckDBConfig(db_path=":memory:")
+        storage = await DuckDBBackend.create(config=config, embedding_provider=None)
+
+        # Sync 5 transcripts without embeddings
+        lines = [{"role": "user", "content": f"Message {i}", "turn": i} for i in range(5)]
+
+        await storage.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="bf-session-5",
+            lines=lines,
+        )
+
+        # Attach embeddings and backfill with progress
+        storage.embedding_provider = embedding_provider
+        progress_calls: list[tuple[int, int]] = []
+
+        result = await storage.backfill_embeddings(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="bf-session-5",
+            batch_size=2,  # Small batches to get multiple progress calls
+            on_progress=lambda processed, total: progress_calls.append((processed, total)),
+        )
+
+        assert result.transcripts_found == 5
+        assert len(progress_calls) > 0
+
+        # All calls should have total=5
+        assert all(t == 5 for _, t in progress_calls)
+
+        # Last call should have processed=5
+        assert progress_calls[-1][0] == 5
+
+        # processed should be monotonically increasing
+        processed_values = [p for p, _ in progress_calls]
+        assert processed_values == sorted(processed_values)
+
+        await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_rebuild_deletes_and_regenerates(self, duckdb_storage):
+        """Rebuild deletes old vectors and regenerates new ones."""
+        lines = [
+            {"role": "user", "content": "Rebuild test message", "turn": 0},
+            {"role": "assistant", "content": "Rebuild test reply", "turn": 0},
+        ]
+
+        await duckdb_storage.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="bf-session-6",
+            lines=lines,
+        )
+
+        # Verify vectors exist after initial sync
+        vec_count_before = duckdb_storage.conn.execute(
+            "SELECT COUNT(*) FROM transcript_vectors WHERE session_id = ?",
+            ["bf-session-6"],
+        ).fetchone()[0]
+        assert vec_count_before > 0
+
+        # Rebuild
+        result = await duckdb_storage.rebuild_vectors(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="bf-session-6",
+        )
+
+        assert result.transcripts_found == 2
+        assert result.vectors_stored > 0
+        assert result.vectors_failed == 0
+        assert result.errors == []
+
+        # Verify vectors still exist after rebuild
+        vec_count_after = duckdb_storage.conn.execute(
+            "SELECT COUNT(*) FROM transcript_vectors WHERE session_id = ?",
+            ["bf-session-6"],
+        ).fetchone()[0]
+        assert vec_count_after > 0
+
+        # Verify has_vectors is True after rebuild
+        rows = duckdb_storage.conn.execute(
+            "SELECT has_vectors FROM transcripts WHERE session_id = ?",
+            ["bf-session-6"],
+        ).fetchall()
+        assert all(r[0] is True for r in rows)
+
+    @pytest.mark.asyncio
+    async def test_rebuild_empty_session(self, duckdb_storage):
+        """Rebuild on empty session returns all zeros."""
+        result = await duckdb_storage.rebuild_vectors(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="nonexistent-session",
+        )
+
+        assert result.transcripts_found == 0
+        assert result.vectors_stored == 0
+        assert result.vectors_failed == 0
+
+    @pytest.mark.asyncio
+    async def test_rebuild_no_provider_returns_zero(self, duckdb_storage_no_embeddings):
+        """Rebuild without embedding provider returns zeros with error message."""
+        # Sync some data first (no vectors since no provider)
+        await duckdb_storage_no_embeddings.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="bf-session-7",
+            lines=[{"role": "user", "content": "test", "turn": 0}],
+        )
+
+        result = await duckdb_storage_no_embeddings.rebuild_vectors(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="bf-session-7",
+        )
+
+        assert result.transcripts_found == 0
+        assert result.vectors_stored == 0
+        assert result.vectors_failed == 0
+        assert len(result.errors) == 1
+        assert "No embedding provider" in result.errors[0]
+
+        # Verify no vectors were deleted (none existed)
+        vec_count = duckdb_storage_no_embeddings.conn.execute(
+            "SELECT COUNT(*) FROM transcript_vectors WHERE session_id = ?",
+            ["bf-session-7"],
+        ).fetchone()[0]
+        assert vec_count == 0

@@ -875,3 +875,222 @@ class TestSQLiteContextManager:
 
         # Should be closed after context
         assert storage._initialized is False
+
+
+class TestSQLiteBackfillRebuild:
+    """Tests for backfill_embeddings, rebuild_vectors, and has_vectors lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_has_vectors_flag_set_on_sync(self, sqlite_storage):
+        """Syncing transcripts with embedding provider sets has_vectors=1."""
+        lines = [
+            {"role": "user", "content": "Hello world", "turn": 0},
+            {"role": "assistant", "content": "Hi there!", "turn": 0},
+        ]
+
+        await sqlite_storage.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="bf-session-1",
+            lines=lines,
+        )
+
+        # Query raw DB for has_vectors flag
+        async with sqlite_storage.conn.execute(
+            "SELECT has_vectors FROM transcripts WHERE session_id = ? ORDER BY sequence",
+            ("bf-session-1",),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        assert len(rows) == 2
+        for row in rows:
+            assert row[0] == 1, "has_vectors should be 1 after sync with embeddings"
+
+    @pytest.mark.asyncio
+    async def test_has_vectors_flag_false_without_embeddings(self, sqlite_storage_no_embeddings):
+        """Syncing transcripts without embedding provider leaves has_vectors=0."""
+        lines = [
+            {"role": "user", "content": "Hello world", "turn": 0},
+            {"role": "assistant", "content": "Hi there!", "turn": 0},
+        ]
+
+        await sqlite_storage_no_embeddings.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="bf-session-2",
+            lines=lines,
+        )
+
+        async with sqlite_storage_no_embeddings.conn.execute(
+            "SELECT has_vectors FROM transcripts WHERE session_id = ? ORDER BY sequence",
+            ("bf-session-2",),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        assert len(rows) == 2
+        for row in rows:
+            assert row[0] == 0, "has_vectors should be 0 without embeddings"
+
+    @pytest.mark.asyncio
+    async def test_backfill_fills_missing_vectors(self, embedding_provider):
+        """Backfill generates vectors for transcripts that lack them."""
+        from amplifier_session_storage.backends.sqlite import SQLiteBackend, SQLiteConfig
+
+        # Step 1: Create backend WITHOUT embeddings, sync transcripts
+        config = SQLiteConfig(db_path=":memory:")
+        storage = await SQLiteBackend.create(config=config, embedding_provider=None)
+
+        lines = [
+            {"role": "user", "content": "First message", "turn": 0},
+            {"role": "assistant", "content": "First reply", "turn": 0},
+            {"role": "user", "content": "Second question", "turn": 1},
+        ]
+
+        await storage.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="bf-session-3",
+            lines=lines,
+        )
+
+        # Verify has_vectors is 0
+        async with storage.conn.execute(
+            "SELECT has_vectors FROM transcripts WHERE session_id = ?",
+            ("bf-session-3",),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        assert all(r[0] == 0 for r in rows)
+
+        # Verify no vectors exist
+        async with storage.conn.execute(
+            "SELECT COUNT(*) FROM transcript_vectors WHERE session_id = ?",
+            ("bf-session-3",),
+        ) as cursor:
+            vec_count = (await cursor.fetchone())[0]
+        assert vec_count == 0
+
+        # Step 2: Attach embedding provider and backfill
+        storage.embedding_provider = embedding_provider
+
+        result = await storage.backfill_embeddings(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="bf-session-3",
+        )
+
+        assert result.transcripts_found == 3
+        assert result.vectors_stored > 0
+        assert result.vectors_failed == 0
+        assert result.errors == []
+
+        # Verify has_vectors is now 1
+        async with storage.conn.execute(
+            "SELECT has_vectors FROM transcripts WHERE session_id = ?",
+            ("bf-session-3",),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        assert all(r[0] == 1 for r in rows)
+
+        # Verify vector documents exist
+        async with storage.conn.execute(
+            "SELECT COUNT(*) FROM transcript_vectors WHERE session_id = ?",
+            ("bf-session-3",),
+        ) as cursor:
+            vec_count = (await cursor.fetchone())[0]
+        assert vec_count > 0
+
+        await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_backfill_noop_when_all_have_vectors(self, sqlite_storage):
+        """Backfill is a no-op when all transcripts already have vectors."""
+        lines = [
+            {"role": "user", "content": "Already embedded", "turn": 0},
+            {"role": "assistant", "content": "Also embedded", "turn": 0},
+        ]
+
+        await sqlite_storage.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="bf-session-4",
+            lines=lines,
+        )
+
+        result = await sqlite_storage.backfill_embeddings(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="bf-session-4",
+        )
+
+        assert result.transcripts_found == 0
+        assert result.vectors_stored == 0
+        assert result.vectors_failed == 0
+
+    @pytest.mark.asyncio
+    async def test_rebuild_deletes_and_regenerates(self, sqlite_storage):
+        """Rebuild deletes old vectors and regenerates new ones."""
+        lines = [
+            {"role": "user", "content": "Rebuild test message", "turn": 0},
+            {"role": "assistant", "content": "Rebuild test reply", "turn": 0},
+        ]
+
+        await sqlite_storage.sync_transcript_lines(
+            user_id="user-1",
+            host_id="host-1",
+            project_slug="project-1",
+            session_id="bf-session-5",
+            lines=lines,
+        )
+
+        # Verify vectors exist after initial sync
+        async with sqlite_storage.conn.execute(
+            "SELECT COUNT(*) FROM transcript_vectors WHERE session_id = ?",
+            ("bf-session-5",),
+        ) as cursor:
+            vec_count_before = (await cursor.fetchone())[0]
+        assert vec_count_before > 0
+
+        # Rebuild
+        result = await sqlite_storage.rebuild_vectors(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="bf-session-5",
+        )
+
+        assert result.transcripts_found == 2
+        assert result.vectors_stored > 0
+        assert result.vectors_failed == 0
+        assert result.errors == []
+
+        # Verify vectors still exist after rebuild
+        async with sqlite_storage.conn.execute(
+            "SELECT COUNT(*) FROM transcript_vectors WHERE session_id = ?",
+            ("bf-session-5",),
+        ) as cursor:
+            vec_count_after = (await cursor.fetchone())[0]
+        assert vec_count_after > 0
+
+        # Verify has_vectors is 1 after rebuild
+        async with sqlite_storage.conn.execute(
+            "SELECT has_vectors FROM transcripts WHERE session_id = ?",
+            ("bf-session-5",),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        assert all(r[0] == 1 for r in rows)
+
+    @pytest.mark.asyncio
+    async def test_rebuild_empty_session(self, sqlite_storage):
+        """Rebuild on empty session returns all zeros."""
+        result = await sqlite_storage.rebuild_vectors(
+            user_id="user-1",
+            project_slug="project-1",
+            session_id="nonexistent-session",
+        )
+
+        assert result.transcripts_found == 0
+        assert result.vectors_stored == 0
+        assert result.vectors_failed == 0

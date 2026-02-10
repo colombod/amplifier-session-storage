@@ -292,8 +292,13 @@ class AzureOpenAIEmbeddings(EmbeddingProvider):
                 f"{len(texts) - len(texts_to_embed)} from cache"
             )
 
-        # Ensure all results are populated
-        assert all(r is not None for r in results), "Some embeddings failed to generate"
+        # Verify all results are populated (explicit check — assert is stripped with -O)
+        missing = [i for i, r in enumerate(results) if r is None]
+        if missing:
+            raise ValueError(
+                f"Embedding generation incomplete: {len(missing)}/{len(results)} "
+                f"results missing at indices {missing[:5]}{'...' if len(missing) > 5 else ''}"
+            )
 
         return results  # type: ignore
 

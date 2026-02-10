@@ -743,10 +743,17 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         )
 
         # Step 2: Generate and store vector documents
+        # Embedding failures must never prevent transcript storage (step 1 already committed).
         if self.embedding_provider and embeddings is None:
-            await self._generate_and_store_vectors(
-                user_id, host_id, project_slug, session_id, lines, start_sequence
-            )
+            try:
+                await self._generate_and_store_vectors(
+                    user_id, host_id, project_slug, session_id, lines, start_sequence
+                )
+            except Exception as exc:
+                logger.error(
+                    f"Vector generation failed for session {session_id} "
+                    f"({len(lines)} messages) — transcripts stored without vectors: {exc}"
+                )
         elif embeddings is not None:
             await self._store_precomputed_vectors(
                 user_id, host_id, project_slug, session_id, lines, start_sequence, embeddings

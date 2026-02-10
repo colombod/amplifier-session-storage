@@ -662,10 +662,17 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
         )
 
         # Step 2: Generate and store vectors
+        # Embedding failures must never prevent transcript storage (step 1 already committed).
         if self.embedding_provider and embeddings is None:
-            await self._generate_and_store_vectors(
-                user_id, project_slug, session_id, lines, start_sequence
-            )
+            try:
+                await self._generate_and_store_vectors(
+                    user_id, project_slug, session_id, lines, start_sequence
+                )
+            except Exception as exc:
+                logger.error(
+                    f"Vector generation failed for session {session_id} "
+                    f"({len(lines)} messages) — transcripts stored without vectors: {exc}"
+                )
         elif embeddings is not None:
             # Pre-computed embeddings (from sync daemon) - store as single-chunk vectors
             await self._store_precomputed_vectors(

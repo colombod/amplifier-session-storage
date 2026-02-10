@@ -764,10 +764,17 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
         )
 
         # Step 2: Generate and store vectors
+        # Embedding failures must never prevent transcript storage (step 1 already committed).
         if self.embedding_provider and embeddings is None:
-            await self._generate_and_store_vectors(
-                user_id, project_slug, session_id, lines, start_sequence
-            )
+            try:
+                await self._generate_and_store_vectors(
+                    user_id, project_slug, session_id, lines, start_sequence
+                )
+            except Exception as exc:
+                logger.error(
+                    f"Vector generation failed for session {session_id} "
+                    f"({len(lines)} messages) — transcripts stored without vectors: {exc}"
+                )
         elif embeddings is not None:
             # Pre-computed embeddings (from sync daemon) - store as single-chunk vectors
             await asyncio.to_thread(
@@ -2166,6 +2173,7 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
         Detects sessions by finding transcripts with timestamps in the date range,
         NOT by session creation date.
         """
+
         def _get_active() -> list[dict[str, Any]]:
             # Step 1: Find session_ids with transcript activity
             activity_where: list[str] = ["type = ?"]
@@ -2228,7 +2236,6 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
             return [dict(row) for row in rows]
 
         return await asyncio.to_thread(_get_active)
-
 
     # =========================================================================
     # Sequence-Based Navigation

@@ -28,6 +28,7 @@ from ..content_extraction import (
 )
 from ..embeddings import EmbeddingProvider
 from ..embeddings.mixin import EmbeddingMixin
+from ..embeddings.resilience import RetryConfig, retry_with_backoff
 from ..exceptions import AuthenticationError, StorageConnectionError, StorageIOError
 from ..search.mmr import compute_mmr
 from .base import (
@@ -573,6 +574,54 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         """Create composite partition key for transcripts/events."""
         return f"{user_id}|{project_slug}|{session_id}"
 
+    # Retry config for Cosmos write operations (429 / transient 5xx).
+    # The Cosmos SDK has its own internal retry for some cases, but it
+    # gives up quickly on 429s during sustained bursts.  This outer retry
+    # adds exponential backoff with jitter on top.
+    _write_retry_config = RetryConfig(
+        max_retries=5,
+        backoff_base=1.0,
+        backoff_max=30.0,
+        backoff_multiplier=2.0,
+        retryable_status_codes=(429, 449, 500, 503),
+        retryable_exceptions=(ConnectionError, TimeoutError, OSError),
+    )
+
+    async def _upsert_with_retry(
+        self,
+        container: ContainerProxy,
+        body: dict[str, Any],
+        *,
+        context_msg: str = "",
+    ) -> None:
+        """Upsert a single document with retry/backoff for 429 and transient errors."""
+        await retry_with_backoff(
+            container.upsert_item,
+            body=body,
+            config=self._write_retry_config,
+            context_msg=context_msg,
+        )
+
+    async def _delete_with_retry(
+        self,
+        container: ContainerProxy,
+        item: str,
+        partition_key: str,
+        *,
+        context_msg: str = "",
+    ) -> None:
+        """Delete a single document with retry/backoff for 429 and transient errors."""
+        try:
+            await retry_with_backoff(
+                container.delete_item,
+                item=item,
+                partition_key=partition_key,
+                config=self._write_retry_config,
+                context_msg=context_msg,
+            )
+        except CosmosResourceNotFoundError:
+            pass  # Already deleted
+
     # =========================================================================
     # Session Metadata Operations
     # =========================================================================
@@ -600,7 +649,7 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
             "synced_at": datetime.now(UTC).isoformat(),
         }
 
-        await container.upsert_item(body=doc)
+        await self._upsert_with_retry(container, doc, context_msg="session metadata")
 
     async def get_session_metadata(
         self,
@@ -707,11 +756,11 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
                 query="SELECT c.id FROM c WHERE c.partition_key = @pk",
                 parameters=[{"name": "@pk", "value": partition_key}],  # type: ignore
             ):
-                try:
-                    await container.delete_item(item=doc["id"], partition_key=partition_key)
-                    deleted_count += 1
-                except CosmosResourceNotFoundError:
-                    pass
+                await self._delete_with_retry(
+                    container, item=doc["id"], partition_key=partition_key,
+                    context_msg=f"delete session doc {doc['id']}",
+                )
+                deleted_count += 1
 
             return deleted_count > 0
         except CosmosResourceNotFoundError:
@@ -848,11 +897,11 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         ]
         deleted = 0
         async for doc in container.query_items(query=del_query, parameters=del_params):  # type: ignore
-            try:
-                await container.delete_item(item=doc["id"], partition_key=partition_key)
-                deleted += 1
-            except CosmosResourceNotFoundError:
-                pass
+            await self._delete_with_retry(
+                container, item=doc["id"], partition_key=partition_key,
+                context_msg=f"rebuild delete vector {doc['id']}",
+            )
+            deleted += 1
         if deleted:
             logger.info(
                 "rebuild_vectors: deleted %d vector docs for session %s", deleted, session_id
@@ -875,7 +924,9 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
             try:
                 full_doc = await container.read_item(item=item["id"], partition_key=partition_key)
                 full_doc["has_vectors"] = False
-                await container.upsert_item(body=full_doc)
+                await self._upsert_with_retry(
+                    container, full_doc, context_msg=f"reset has_vectors {item['id']}"
+                )
             except Exception:
                 logger.warning("Failed to reset has_vectors for transcript %s", item["id"])
             all_transcripts.append(item)
@@ -1068,7 +1119,7 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
                     len(json.dumps(original_content).encode("utf-8")) if original_content else 0
                 )
 
-            await container.upsert_item(body=doc)
+            await self._upsert_with_retry(container, doc, context_msg=f"transcript {doc_id}")
             synced += 1
 
         return synced
@@ -1230,7 +1281,9 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         stored_parent_ids: set[str] = set()
         for record in records:
             if record.get("vector") is not None:
-                await container.upsert_item(body=record)
+                await self._upsert_with_retry(
+                    container, record, context_msg=f"vector {record['id']}"
+                )
                 stored_parent_ids.add(record["parent_id"])
 
         # Mark parent transcripts as having vectors
@@ -1239,7 +1292,9 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
             try:
                 doc = await container.read_item(item=pid, partition_key=pk)
                 doc["has_vectors"] = True
-                await container.upsert_item(body=doc)
+                await self._upsert_with_retry(
+                    container, doc, context_msg=f"has_vectors {pid}"
+                )
             except Exception:
                 logger.warning("Failed to set has_vectors=True for transcript %s", pid)
 
@@ -1258,10 +1313,10 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
             doc_ids.append(item["id"])
 
         for doc_id in doc_ids:
-            try:
-                await container.delete_item(item=doc_id, partition_key=partition_key)
-            except CosmosResourceNotFoundError:
-                pass  # Already deleted
+            await self._delete_with_retry(
+                container, item=doc_id, partition_key=partition_key,
+                context_msg=f"delete vector {doc_id}",
+            )
 
     async def get_transcript_lines(
         self,
@@ -1868,7 +1923,9 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
                     "synced_at": datetime.now(UTC).isoformat(),
                 }
 
-            await container.upsert_item(body=doc)
+            await self._upsert_with_retry(
+                container, doc, context_msg=f"event {doc_id}"
+            )
             synced += 1
 
         return synced
@@ -2108,7 +2165,9 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
                 "embedding_model": emb.get("metadata", {}).get("model", "unknown"),
             }
 
-            await container.upsert_item(body=vector_doc)
+            await self._upsert_with_retry(
+                container, vector_doc, context_msg=f"precomputed vector {vector_doc['id']}"
+            )
             updated += 1
 
         return updated

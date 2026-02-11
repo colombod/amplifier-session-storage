@@ -181,6 +181,21 @@ class SessionSyncStats:
 
 
 @dataclass
+class SyncGapResult:
+    """Result of comparing expected vs stored sequences.
+
+    Used to identify exactly which transcript messages and events
+    are missing from a backend, enabling surgical re-upload
+    instead of full re-sync.
+    """
+
+    transcript_stored_count: int
+    transcript_missing_sequences: list[int]
+    event_stored_count: int
+    event_missing_sequences: list[int]
+
+
+@dataclass
 class EmbeddingOperationResult:
     """Result of a backfill or rebuild embedding operation.
 
@@ -781,6 +796,34 @@ class StorageAdmin(_StorageLifecycle):
 
         Returns:
             EmbeddingOperationResult with counts and any errors
+        """
+        ...
+
+    @abstractmethod
+    async def get_stored_transcript_ids(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> list[str]:
+        """Return all stored transcript document IDs for a session.
+
+        Lightweight query -- fetches only the id field, no content.
+        IDs follow the format: {session_id}_msg_{sequence}
+        """
+        ...
+
+    @abstractmethod
+    async def get_stored_event_ids(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> list[str]:
+        """Return all stored event document IDs for a session.
+
+        Lightweight query -- fetches only the id field, no content.
+        IDs follow the format: {session_id}_evt_{sequence}
         """
         ...
 

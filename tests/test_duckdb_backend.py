@@ -820,3 +820,79 @@ class TestDuckDBBackfillRebuild:
             ["bf-session-7"],
         ).fetchone()[0]
         assert vec_count == 0
+
+
+class TestDuckDBStoredIds:
+    """Tests for get_stored_transcript_ids and get_stored_event_ids."""
+
+    @pytest.mark.asyncio
+    async def test_empty_session_transcript(self, duckdb_storage_no_embeddings):
+        ids = await duckdb_storage_no_embeddings.get_stored_transcript_ids(
+            "user1", "proj1", "nonexistent"
+        )
+        assert ids == []
+
+    @pytest.mark.asyncio
+    async def test_empty_session_events(self, duckdb_storage_no_embeddings):
+        ids = await duckdb_storage_no_embeddings.get_stored_event_ids(
+            "user1", "proj1", "nonexistent"
+        )
+        assert ids == []
+
+    @pytest.mark.asyncio
+    async def test_transcript_ids_after_sync(self, duckdb_storage_no_embeddings):
+        lines = [
+            {"role": "user", "content": "hello", "ts": "2025-01-01T00:00:00Z"},
+            {"role": "assistant", "content": "hi", "ts": "2025-01-01T00:00:01Z"},
+        ]
+        await duckdb_storage_no_embeddings.sync_transcript_lines(
+            "user1", "host1", "proj1", "sess1", lines, start_sequence=1
+        )
+        ids = await duckdb_storage_no_embeddings.get_stored_transcript_ids(
+            "user1", "proj1", "sess1"
+        )
+        assert sorted(ids) == ["sess1_msg_1", "sess1_msg_2"]
+
+    @pytest.mark.asyncio
+    async def test_event_ids_after_sync(self, duckdb_storage_no_embeddings):
+        events = [
+            {
+                "ts": "2025-01-01T00:00:00Z",
+                "lvl": "INFO",
+                "event": "session:start",
+                "session_id": "sess1",
+            },
+            {
+                "ts": "2025-01-01T00:00:01Z",
+                "lvl": "INFO",
+                "event": "llm:request",
+                "session_id": "sess1",
+            },
+        ]
+        await duckdb_storage_no_embeddings.sync_event_lines(
+            "user1", "host1", "proj1", "sess1", events, start_sequence=1
+        )
+        ids = await duckdb_storage_no_embeddings.get_stored_event_ids("user1", "proj1", "sess1")
+        assert sorted(ids) == ["sess1_evt_1", "sess1_evt_2"]
+
+    @pytest.mark.asyncio
+    async def test_session_isolation(self, duckdb_storage_no_embeddings):
+        lines1 = [{"role": "user", "content": "a", "ts": "2025-01-01T00:00:00Z"}]
+        lines2 = [
+            {"role": "user", "content": "b", "ts": "2025-01-01T00:00:00Z"},
+            {"role": "assistant", "content": "c", "ts": "2025-01-01T00:00:01Z"},
+        ]
+        await duckdb_storage_no_embeddings.sync_transcript_lines(
+            "user1", "host1", "proj1", "sess1", lines1, start_sequence=1
+        )
+        await duckdb_storage_no_embeddings.sync_transcript_lines(
+            "user1", "host1", "proj1", "sess2", lines2, start_sequence=1
+        )
+        ids1 = await duckdb_storage_no_embeddings.get_stored_transcript_ids(
+            "user1", "proj1", "sess1"
+        )
+        ids2 = await duckdb_storage_no_embeddings.get_stored_transcript_ids(
+            "user1", "proj1", "sess2"
+        )
+        assert len(ids1) == 1
+        assert len(ids2) == 2

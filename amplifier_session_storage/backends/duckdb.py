@@ -2256,6 +2256,50 @@ class DuckDBBackend(EmbeddingMixin, StorageBackend):
 
         return await asyncio.to_thread(_query)
 
+    async def get_stored_transcript_ids(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> list[str]:
+        """Return all stored transcript document IDs for a session."""
+
+        def _query() -> list[str]:
+            if self.conn is None:
+                raise StorageIOError(
+                    "get_stored_transcript_ids",
+                    cause=RuntimeError("Not initialized"),
+                )
+            rows = self.conn.execute(
+                "SELECT id FROM transcripts WHERE user_id = ? AND session_id = ?",
+                [user_id, session_id],
+            ).fetchall()
+            return [row[0] for row in rows]
+
+        return await asyncio.to_thread(_query)
+
+    async def get_stored_event_ids(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> list[str]:
+        """Return all stored event document IDs for a session."""
+
+        def _query() -> list[str]:
+            if self.conn is None:
+                raise StorageIOError(
+                    "get_stored_event_ids",
+                    cause=RuntimeError("Not initialized"),
+                )
+            rows = self.conn.execute(
+                "SELECT id FROM events WHERE user_id = ? AND session_id = ?",
+                [user_id, session_id],
+            ).fetchall()
+            return [row[0] for row in rows]
+
+        return await asyncio.to_thread(_query)
+
     # =========================================================================
     # Discovery APIs
     # =========================================================================

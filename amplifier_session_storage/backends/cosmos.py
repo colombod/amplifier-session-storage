@@ -757,7 +757,9 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
                 parameters=[{"name": "@pk", "value": partition_key}],  # type: ignore
             ):
                 await self._delete_with_retry(
-                    container, item=doc["id"], partition_key=partition_key,
+                    container,
+                    item=doc["id"],
+                    partition_key=partition_key,
                     context_msg=f"delete session doc {doc['id']}",
                 )
                 deleted_count += 1
@@ -898,7 +900,9 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
         deleted = 0
         async for doc in container.query_items(query=del_query, parameters=del_params):  # type: ignore
             await self._delete_with_retry(
-                container, item=doc["id"], partition_key=partition_key,
+                container,
+                item=doc["id"],
+                partition_key=partition_key,
                 context_msg=f"rebuild delete vector {doc['id']}",
             )
             deleted += 1
@@ -1292,9 +1296,7 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
             try:
                 doc = await container.read_item(item=pid, partition_key=pk)
                 doc["has_vectors"] = True
-                await self._upsert_with_retry(
-                    container, doc, context_msg=f"has_vectors {pid}"
-                )
+                await self._upsert_with_retry(container, doc, context_msg=f"has_vectors {pid}")
             except Exception:
                 logger.warning("Failed to set has_vectors=True for transcript %s", pid)
 
@@ -1314,7 +1316,9 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
 
         for doc_id in doc_ids:
             await self._delete_with_retry(
-                container, item=doc_id, partition_key=partition_key,
+                container,
+                item=doc_id,
+                partition_key=partition_key,
                 context_msg=f"delete vector {doc_id}",
             )
 
@@ -1923,9 +1927,7 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
                     "synced_at": datetime.now(UTC).isoformat(),
                 }
 
-            await self._upsert_with_retry(
-                container, doc, context_msg=f"event {doc_id}"
-            )
+            await self._upsert_with_retry(container, doc, context_msg=f"event {doc_id}")
             synced += 1
 
         return synced
@@ -2423,6 +2425,44 @@ class CosmosBackend(EmbeddingMixin, StorageBackend):
             event_ts_range=(event_earliest, event_latest),
             transcript_ts_range=(transcript_earliest, transcript_latest),
         )
+
+    async def get_stored_transcript_ids(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> list[str]:
+        """Return all stored transcript document IDs for a session."""
+        container = self._get_container(CONTAINER_NAME)
+        partition_key = self.make_partition_key(user_id, project_slug, session_id)
+        query = "SELECT VALUE c.id FROM c WHERE c.partition_key = @pk AND c.type = @type"
+        params: list[dict[str, object]] = [
+            {"name": "@pk", "value": partition_key},
+            {"name": "@type", "value": DOC_TYPE_TRANSCRIPT},
+        ]
+        results: list[str] = []
+        async for item in container.query_items(query=query, parameters=params):
+            results.append(item)
+        return results
+
+    async def get_stored_event_ids(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> list[str]:
+        """Return all stored event document IDs for a session."""
+        container = self._get_container(CONTAINER_NAME)
+        partition_key = self.make_partition_key(user_id, project_slug, session_id)
+        query = "SELECT VALUE c.id FROM c WHERE c.partition_key = @pk AND c.type = @type"
+        params: list[dict[str, object]] = [
+            {"name": "@pk", "value": partition_key},
+            {"name": "@type", "value": DOC_TYPE_EVENT},
+        ]
+        results: list[str] = []
+        async for item in container.query_items(query=query, parameters=params):
+            results.append(item)
+        return results
 
     # =========================================================================
     # Discovery APIs

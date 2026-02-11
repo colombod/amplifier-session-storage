@@ -2134,6 +2134,44 @@ class SQLiteBackend(EmbeddingMixin, StorageBackend):
             transcript_ts_range=(transcript_earliest, transcript_latest),
         )
 
+    async def get_stored_transcript_ids(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> list[str]:
+        """Return all stored transcript document IDs for a session."""
+        if self.conn is None:
+            raise StorageIOError(
+                "get_stored_transcript_ids",
+                cause=RuntimeError("Not initialized"),
+            )
+        async with self.conn.execute(
+            "SELECT id FROM transcripts WHERE user_id = ? AND session_id = ?",
+            (user_id, session_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+    async def get_stored_event_ids(
+        self,
+        user_id: str,
+        project_slug: str,
+        session_id: str,
+    ) -> list[str]:
+        """Return all stored event document IDs for a session."""
+        if self.conn is None:
+            raise StorageIOError(
+                "get_stored_event_ids",
+                cause=RuntimeError("Not initialized"),
+            )
+        async with self.conn.execute(
+            "SELECT id FROM events WHERE user_id = ? AND session_id = ?",
+            (user_id, session_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
     # =========================================================================
     # Discovery APIs
     # =========================================================================

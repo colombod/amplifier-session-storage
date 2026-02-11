@@ -61,6 +61,16 @@ from .backends import (
     TranscriptSearchOptions,
 )
 
+# Sync gap detection
+from .backends.base import SyncGapResult
+from .id_utils import (
+    event_id,
+    find_missing_sequences,
+    parse_event_sequence,
+    parse_transcript_sequence,
+    transcript_id,
+)
+
 # Embedding providers
 from .embeddings import EmbeddingCache, EmbeddingProvider
 
@@ -131,6 +141,13 @@ __all__ = [
     "SearchResult",
     "TranscriptSearchOptions",
     "EventSearchOptions",
+    # Sync gap detection
+    "SyncGapResult",
+    "transcript_id",
+    "event_id",
+    "parse_transcript_sequence",
+    "parse_event_sequence",
+    "find_missing_sequences",
     # Embeddings
     "EmbeddingProvider",
     "EmbeddingCache",

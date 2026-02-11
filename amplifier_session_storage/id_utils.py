@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """ID generation and parsing utilities for session storage.
 
 Centralizes the ID format knowledge so callers never need to
@@ -11,12 +9,14 @@ Event IDs: {session_id}_evt_{sequence}
 Sequences are 1-indexed, matching line numbers in the source JSONL files.
 """
 
+from __future__ import annotations
+
 from typing import TYPE_CHECKING
+
+from amplifier_session_storage.backends.base import SyncGapResult
 
 if TYPE_CHECKING:
     from amplifier_session_storage.backends.base import StorageAdmin
-
-from amplifier_session_storage.backends.base import SyncGapResult
 
 
 def transcript_id(session_id: str, sequence: int) -> str:
@@ -87,31 +87,25 @@ async def find_missing_sequences(
 
     if transcript_line_count is not None:
         stored_ids = await backend.get_stored_transcript_ids(
-            user_id, project_slug, session_id,
+            user_id,
+            project_slug,
+            session_id,
         )
         transcript_stored_count = len(stored_ids)
-        expected = {
-            transcript_id(session_id, seq)
-            for seq in range(1, transcript_line_count + 1)
-        }
+        expected = {transcript_id(session_id, seq) for seq in range(1, transcript_line_count + 1)}
         missing_ids = expected - set(stored_ids)
-        transcript_missing = sorted(
-            parse_transcript_sequence(mid) for mid in missing_ids
-        )
+        transcript_missing = sorted(parse_transcript_sequence(mid) for mid in missing_ids)
 
     if event_line_count is not None:
         stored_ids = await backend.get_stored_event_ids(
-            user_id, project_slug, session_id,
+            user_id,
+            project_slug,
+            session_id,
         )
         event_stored_count = len(stored_ids)
-        expected = {
-            event_id(session_id, seq)
-            for seq in range(1, event_line_count + 1)
-        }
+        expected = {event_id(session_id, seq) for seq in range(1, event_line_count + 1)}
         missing_ids = expected - set(stored_ids)
-        event_missing = sorted(
-            parse_event_sequence(mid) for mid in missing_ids
-        )
+        event_missing = sorted(parse_event_sequence(mid) for mid in missing_ids)
 
     return SyncGapResult(
         transcript_stored_count=transcript_stored_count,

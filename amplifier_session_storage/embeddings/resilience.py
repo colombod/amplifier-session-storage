@@ -179,7 +179,7 @@ async def retry_with_backoff(
     for attempt in range(cfg.max_retries + 1):
         # Circuit breaker check
         if circuit and not circuit.allow_request():
-            raise CircuitOpenError(f"Circuit breaker is OPEN — embedding service unavailable{ctx}")
+            raise CircuitOpenError(f"Circuit breaker is OPEN — service unavailable{ctx}")
 
         try:
             result = await fn(*args, **kwargs)
@@ -197,8 +197,13 @@ async def retry_with_backoff(
 
             if not is_retryable or attempt >= cfg.max_retries:
                 logger.error(
-                    f"Embedding call failed (attempt {attempt + 1}/{cfg.max_retries + 1}, "
-                    f"status={status_code}, retryable={is_retryable}){ctx}: {exc}"
+                    "RETRY_EXHAUSTED: attempt=%d/%d status=%s retryable=%s%s: %s",
+                    attempt + 1,
+                    cfg.max_retries + 1,
+                    status_code,
+                    is_retryable,
+                    ctx,
+                    exc,
                 )
                 raise
 
@@ -212,12 +217,38 @@ async def retry_with_backoff(
                     cfg.backoff_max,
                 )
 
-            logger.warning(
-                f"Embedding call failed (attempt {attempt + 1}/{cfg.max_retries + 1}, "
-                f"status={status_code}), retrying in {delay:.1f}s{ctx}: {exc}"
-            )
+            # Log throttling (429) distinctly from other transient errors
+            if status_code == 429:
+                logger.warning(
+                    "THROTTLED: 429 Too Many Requests, attempt=%d/%d, retry_after=%.1fs%s: %s",
+                    attempt + 1,
+                    cfg.max_retries + 1,
+                    delay,
+                    ctx,
+                    exc,
+                )
+            else:
+                logger.warning(
+                    "RETRYING: attempt=%d/%d status=%s delay=%.1fs%s: %s",
+                    attempt + 1,
+                    cfg.max_retries + 1,
+                    status_code,
+                    delay,
+                    ctx,
+                    exc,
+                )
             await asyncio.sleep(delay)
         else:
+            if attempt > 0:
+                # Succeeded after retries — log recovery so operators know
+                # throttling happened but was handled
+                logger.warning(
+                    "RETRY_RECOVERED: succeeded on attempt %d/%d after %d retries%s",
+                    attempt + 1,
+                    cfg.max_retries + 1,
+                    attempt,
+                    ctx,
+                )
             if circuit:
                 circuit.record_success()
             return result

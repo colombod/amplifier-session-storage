@@ -601,3 +601,67 @@ class TestCosmosVectorSearch:
 
         assert isinstance(results, list)
         assert len(results) > 0, "Hybrid search returned no results"
+
+
+@pytest.mark.integration
+class TestCosmosStoredIds:
+    """Tests for get_stored_transcript_ids and get_stored_event_ids."""
+
+    @pytest.mark.asyncio
+    async def test_empty_session(self, cosmos_storage):
+        ids = await cosmos_storage.get_stored_transcript_ids(
+            "test-user", "test-project", "nonexistent-session"
+        )
+        assert ids == []
+        ids = await cosmos_storage.get_stored_event_ids(
+            "test-user", "test-project", "nonexistent-session"
+        )
+        assert ids == []
+
+    @pytest.mark.asyncio
+    async def test_transcript_ids_after_sync(self, cosmos_storage):
+        test_session_id = f"test-ids-t-{datetime.now(UTC).timestamp()}"
+        lines = [
+            {"role": "user", "content": "hello", "ts": datetime.now(UTC).isoformat()},
+            {"role": "assistant", "content": "hi", "ts": datetime.now(UTC).isoformat()},
+        ]
+        await cosmos_storage.sync_transcript_lines(
+            "test-user", "test-host", "test-project", test_session_id, lines, start_sequence=1
+        )
+        ids = await cosmos_storage.get_stored_transcript_ids(
+            "test-user", "test-project", test_session_id
+        )
+        assert sorted(ids) == [
+            f"{test_session_id}_msg_1",
+            f"{test_session_id}_msg_2",
+        ]
+        await cosmos_storage.delete_session("test-user", "test-project", test_session_id)
+
+    @pytest.mark.asyncio
+    async def test_event_ids_after_sync(self, cosmos_storage):
+        test_session_id = f"test-ids-e-{datetime.now(UTC).timestamp()}"
+        events = [
+            {
+                "ts": datetime.now(UTC).isoformat(),
+                "lvl": "INFO",
+                "event": "session:start",
+                "session_id": test_session_id,
+            },
+            {
+                "ts": datetime.now(UTC).isoformat(),
+                "lvl": "INFO",
+                "event": "llm:request",
+                "session_id": test_session_id,
+            },
+        ]
+        await cosmos_storage.sync_event_lines(
+            "test-user", "test-host", "test-project", test_session_id, events, start_sequence=1
+        )
+        ids = await cosmos_storage.get_stored_event_ids(
+            "test-user", "test-project", test_session_id
+        )
+        assert sorted(ids) == [
+            f"{test_session_id}_evt_1",
+            f"{test_session_id}_evt_2",
+        ]
+        await cosmos_storage.delete_session("test-user", "test-project", test_session_id)

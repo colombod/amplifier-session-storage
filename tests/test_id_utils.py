@@ -132,3 +132,23 @@ class TestFindMissingSequences:
         assert result.transcript_missing_sequences == []
         assert result.transcript_stored_count == 0
         backend.get_stored_transcript_ids.assert_not_called()
+
+
+class TestPublicExports:
+    def test_sync_gap_result_importable(self):
+        from amplifier_session_storage import SyncGapResult
+        assert SyncGapResult is not None
+
+    def test_id_utils_importable(self):
+        from amplifier_session_storage import (
+            transcript_id,
+            event_id,
+            parse_transcript_sequence,
+            parse_event_sequence,
+            find_missing_sequences,
+        )
+        assert callable(transcript_id)
+        assert callable(event_id)
+        assert callable(parse_transcript_sequence)
+        assert callable(parse_event_sequence)
+        assert callable(find_missing_sequences)

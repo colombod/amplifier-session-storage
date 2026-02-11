@@ -6,7 +6,7 @@ construct or parse document IDs directly.
 Transcript IDs: {session_id}_msg_{sequence}
 Event IDs: {session_id}_evt_{sequence}
 
-Sequences are 0-indexed, matching the start_sequence used by the upload API.
+Transcript sequences are 0-indexed (msg_0, msg_1, ...). Event sequences are 1-indexed (evt_1, evt_2, ...).
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ async def find_missing_sequences(
             session_id,
         )
         event_stored_count = len(stored_ids)
-        expected = {event_id(session_id, seq) for seq in range(0, event_line_count)}
+        expected = {event_id(session_id, seq) for seq in range(1, event_line_count + 1)}
         missing_ids = expected - set(stored_ids)
         event_missing = sorted(parse_event_sequence(mid) for mid in missing_ids)
 

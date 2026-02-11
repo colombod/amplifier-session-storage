@@ -6,7 +6,7 @@ construct or parse document IDs directly.
 Transcript IDs: {session_id}_msg_{sequence}
 Event IDs: {session_id}_evt_{sequence}
 
-Sequences are 1-indexed, matching line numbers in the source JSONL files.
+Sequences are 0-indexed, matching the start_sequence used by the upload API.
 """
 
 from __future__ import annotations
@@ -72,9 +72,9 @@ async def find_missing_sequences(
         user_id: User identifier.
         project_slug: Project slug.
         session_id: Session identifier.
-        transcript_line_count: Number of lines in local transcript.jsonl (1-indexed).
+        transcript_line_count: Number of lines in local transcript.jsonl.
             If None, transcript comparison is skipped.
-        event_line_count: Number of lines in local events.jsonl (1-indexed).
+        event_line_count: Number of lines in local events.jsonl.
             If None, event comparison is skipped.
 
     Returns:
@@ -92,7 +92,7 @@ async def find_missing_sequences(
             session_id,
         )
         transcript_stored_count = len(stored_ids)
-        expected = {transcript_id(session_id, seq) for seq in range(1, transcript_line_count + 1)}
+        expected = {transcript_id(session_id, seq) for seq in range(0, transcript_line_count)}
         missing_ids = expected - set(stored_ids)
         transcript_missing = sorted(parse_transcript_sequence(mid) for mid in missing_ids)
 
@@ -103,7 +103,7 @@ async def find_missing_sequences(
             session_id,
         )
         event_stored_count = len(stored_ids)
-        expected = {event_id(session_id, seq) for seq in range(1, event_line_count + 1)}
+        expected = {event_id(session_id, seq) for seq in range(0, event_line_count)}
         missing_ids = expected - set(stored_ids)
         event_missing = sorted(parse_event_sequence(mid) for mid in missing_ids)
 

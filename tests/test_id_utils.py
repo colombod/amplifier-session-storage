@@ -57,8 +57,8 @@ class TestFindMissingSequences:
     @pytest.mark.asyncio
     async def test_no_gaps(self):
         backend = AsyncMock()
-        backend.get_stored_transcript_ids.return_value = ["s1_msg_1", "s1_msg_2", "s1_msg_3"]
-        backend.get_stored_event_ids.return_value = ["s1_evt_1", "s1_evt_2"]
+        backend.get_stored_transcript_ids.return_value = ["s1_msg_0", "s1_msg_1", "s1_msg_2"]
+        backend.get_stored_event_ids.return_value = ["s1_evt_0", "s1_evt_1"]
         result = await find_missing_sequences(
             backend, "u1", "p1", "s1",
             transcript_line_count=3, event_line_count=2,
@@ -71,21 +71,21 @@ class TestFindMissingSequences:
     @pytest.mark.asyncio
     async def test_transcript_gaps(self):
         backend = AsyncMock()
-        backend.get_stored_transcript_ids.return_value = ["s1_msg_1", "s1_msg_3"]
+        backend.get_stored_transcript_ids.return_value = ["s1_msg_0", "s1_msg_2"]
         result = await find_missing_sequences(
             backend, "u1", "p1", "s1", transcript_line_count=3,
         )
-        assert result.transcript_missing_sequences == [2]
+        assert result.transcript_missing_sequences == [1]
         assert result.transcript_stored_count == 2
 
     @pytest.mark.asyncio
     async def test_event_gaps(self):
         backend = AsyncMock()
-        backend.get_stored_event_ids.return_value = ["s1_evt_1"]
+        backend.get_stored_event_ids.return_value = ["s1_evt_0"]
         result = await find_missing_sequences(
             backend, "u1", "p1", "s1", event_line_count=3,
         )
-        assert result.event_missing_sequences == [2, 3]
+        assert result.event_missing_sequences == [1, 2]
         assert result.event_stored_count == 1
 
     @pytest.mark.asyncio
@@ -106,17 +106,17 @@ class TestFindMissingSequences:
         result = await find_missing_sequences(
             backend, "u1", "p1", "s1", transcript_line_count=3,
         )
-        assert result.transcript_missing_sequences == [1, 2, 3]
+        assert result.transcript_missing_sequences == [0, 1, 2]
         assert result.transcript_stored_count == 0
 
     @pytest.mark.asyncio
     async def test_only_transcript_count(self):
         backend = AsyncMock()
-        backend.get_stored_transcript_ids.return_value = ["s1_msg_1"]
+        backend.get_stored_transcript_ids.return_value = ["s1_msg_0"]
         result = await find_missing_sequences(
             backend, "u1", "p1", "s1", transcript_line_count=2,
         )
-        assert result.transcript_missing_sequences == [2]
+        assert result.transcript_missing_sequences == [1]
         assert result.event_missing_sequences == []
         assert result.event_stored_count == 0
         backend.get_stored_event_ids.assert_not_called()
@@ -124,11 +124,11 @@ class TestFindMissingSequences:
     @pytest.mark.asyncio
     async def test_only_event_count(self):
         backend = AsyncMock()
-        backend.get_stored_event_ids.return_value = ["s1_evt_1"]
+        backend.get_stored_event_ids.return_value = ["s1_evt_0"]
         result = await find_missing_sequences(
             backend, "u1", "p1", "s1", event_line_count=2,
         )
-        assert result.event_missing_sequences == [2]
+        assert result.event_missing_sequences == [1]
         assert result.transcript_missing_sequences == []
         assert result.transcript_stored_count == 0
         backend.get_stored_transcript_ids.assert_not_called()
